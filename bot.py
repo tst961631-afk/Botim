@@ -11,8 +11,8 @@ from openai import OpenAI
 
 
 # دریافت اطلاعات از Railway Variables
-TELEGRAM_TOKEN = os.getenv("BOT_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+TELEGRAM_TOKEN = os.getenv("8975007734:AAFGsTyR56CLHJnr7ZFgz8DMAs2INlg1Qfc")
+OPENAI_API_KEY = os.getenv("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")
 
 if not TELEGRAM_TOKEN:
     raise ValueError("❌ BOT_TOKEN در Railway تنظیم نشده!")
