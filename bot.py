@@ -19,6 +19,7 @@ ADMIN_ID = 7530457395
 DATA = "zombie_data.json"
 TZ = ZoneInfo("Asia/Tehran")
 STATE_TTL = 120
+PENDING_CLAN = {}  # uid -> True waiting name
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("zombie")
@@ -103,10 +104,29 @@ def eu(d, user):
     return d["users"][u]
 
 def find_user(d, query):
-    q = query.lstrip("@").lower()
+    q = (query or "").strip().lstrip("@").lower()
+    if not q:
+        return None
     for u in d["users"].values():
         if u.get("username") == q or str(u.get("id")) == q:
             return u
+    # اگر فقط آیدی عددی بود و هنوز استارت نزده
+    if q.isdigit():
+        uid = q
+        if uid not in d["users"]:
+            d["users"][uid] = {
+                "id": int(uid), "name": uid, "username": "",
+                "wallet": 0, "bank": 0, "level": 1, "xp": 0,
+                "hp": 100, "hp_max": 100, "energy": 100, "hunger": 50, "thirst": 50,
+                "backpack": {"guns": [], "ammo": 0, "water": 0, "food": 0, "medkits": [], "grenades": 0, "vest": None},
+                "storage": {"guns": [], "ammo": 0, "water": 0, "food": 0, "medkits": [], "grenades": 0},
+                "active_gun": None,
+                "shelter": {"name": "پناهگاه کوچک", "capacity": 20},
+                "region": None, "clan": None, "last_zombie": 0,
+                "mission": {"kill": 0, "need": 3, "done": False, "day": ""},
+                "last_bank_interest_day": "",
+            }
+        return d["users"][uid]
     return None
 
 # ---------------- helpers ----------------
@@ -136,6 +156,61 @@ def btn(text, data, style=None):
     except TypeError:
         kw.pop("style", None)
         return InlineKeyboardButton(**kw)
+
+
+async def panel_edit(q, text, reply_markup=None, parse_mode="HTML", photo=None):
+    """همیشه همان پیام را ادیت کن — در صورت عکس از media استفاده می‌شود"""
+    chat_id = q.message.chat_id
+    mid = q.message.message_id
+    bot = q.get_bot() if hasattr(q, "get_bot") else None
+    try:
+        bot = q.message.get_bot()
+    except Exception:
+        pass
+    from telegram import InputMediaPhoto
+    if photo:
+        try:
+            await q.edit_message_media(
+                media=InputMediaPhoto(media=photo, caption=text, parse_mode=parse_mode),
+                reply_markup=reply_markup,
+            )
+            return
+        except Exception:
+            try:
+                await bot.edit_message_media(
+                    chat_id=chat_id, message_id=mid,
+                    media=InputMediaPhoto(media=photo, caption=text, parse_mode=parse_mode),
+                    reply_markup=reply_markup,
+                )
+                return
+            except Exception:
+                pass
+    # متن
+    try:
+        await q.edit_message_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
+        return
+    except Exception:
+        pass
+    try:
+        await q.edit_message_caption(caption=text, parse_mode=parse_mode, reply_markup=reply_markup)
+        return
+    except Exception:
+        pass
+    # اگر پیام عکس بود و می‌خواهیم لیست متنی: caption را عوض کن
+    try:
+        await bot.edit_message_caption(
+            chat_id=chat_id, message_id=mid, caption=text, parse_mode=parse_mode, reply_markup=reply_markup,
+        )
+        return
+    except Exception:
+        pass
+    try:
+        await bot.edit_message_text(
+            chat_id=chat_id, message_id=mid, text=text, parse_mode=parse_mode, reply_markup=reply_markup,
+        )
+    except Exception as e:
+        log.warning("panel_edit fail: %s", e)
+
 
 def own(action, owner_id, *parts):
     base = f"{action}:{owner_id}"
@@ -488,13 +563,51 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
     # admin give points state already handled
     # storage deposit via reply to bot prompt
+    # انجمن: اگر منتظر اسم هستیم
+    if u.effective_user.id in PENDING_CLAN or (get_st(c) and (get_st(c) or {}).get("kind") == "clan_name"):
+        if u.effective_chat.type != ChatType.PRIVATE:
+            await finish_clan_create(u, c, d, p, text)
+            return
+
     st = get_st(c)
-    if st and st.get("kind") in ("bank_dep", "bank_wd", "casino_amt", "cas_join_wait", "store_in", "store_out", "a_give_amt", "a_give_user"):
-        if is_admin(user.id) or st["kind"].startswith("bank") or st["kind"].startswith("casino") or st["kind"].startswith("store") or st["kind"].startswith("cas"):
+    if st:
+        k = st.get("kind") or ""
+        if k == "clan_name":
+            await finish_clan_create(u, c, d, p, text)
+            return
+        if k in ("bank_dep", "bank_wd", "casino_amt", "cas_join_wait", "store_in", "store_out", "a_give_amt", "a_give_user"):
             await player_state(u, c, d, p, text, st)
             return
 
     save(d)
+
+
+async def finish_clan_create(u, c, d, p, text):
+    clear_st(c)
+    PENDING_CLAN.pop(u.effective_user.id, None)
+    if u.effective_chat.type == ChatType.PRIVATE:
+        await u.message.reply_text("ساخت انجمن فقط در گپ.")
+        return
+    gid = str(u.effective_chat.id)
+    clans = d.setdefault("clans", {}).setdefault(gid, [])
+    if len(clans) >= 3:
+        await u.message.reply_text("حداکثر ۳ کلن در این گپ")
+        return
+    name = (text or "").strip()[:32]
+    if not name or name.lower() in ("انجمن", "کلن", "clan"):
+        await u.message.reply_text("اسم نامعتبر — یک اسم دیگر بفرست")
+        PENDING_CLAN[u.effective_user.id] = gid
+        set_st(c, "clan_name")
+        return
+    for cl in clans:
+        if uid_s(u.effective_user.id) in cl.get("members", []) or cl.get("leader") == uid_s(u.effective_user.id):
+            await u.message.reply_text("قبلاً در انجمن هستی.")
+            return
+    cl = {"name": name, "leader": uid_s(u.effective_user.id), "members": [uid_s(u.effective_user.id)]}
+    clans.append(cl)
+    p["clan"] = name
+    save(d)
+    await u.message.reply_text(f"✅ انجمن «{name}» ساخته شد. تو لیدر هستی.\nدوباره «انجمن» بزن.")
 
 async def player_state(u, c, d, p, text, st):
     kind = st["kind"]
@@ -511,7 +624,11 @@ async def player_state(u, c, d, p, text, st):
         p["wallet"] -= amt
         p["bank"] = p.get("bank", 0) + amt
         save(d)
-        await u.message.reply_text(f"✅ واریز {amt}\nبانک: {p['bank']} | کیف: {p['wallet']}")
+        await u.message.reply_text(
+            f"✅ واریز {amt}\n🏦 بانک: <b>{p['bank']}</b>\n💼 کیف: {p['wallet']}\nسود روزانه: ۵٪",
+            parse_mode="HTML",
+            reply_markup=kb_bank(oid),
+        )
         return
     if kind == "bank_wd":
         amt = parse_amount(text)
@@ -525,7 +642,11 @@ async def player_state(u, c, d, p, text, st):
         p["bank"] -= amt
         p["wallet"] = p.get("wallet", 0) + amt
         save(d)
-        await u.message.reply_text(f"✅ برداشت {amt}\nبانک: {p['bank']} | کیف: {p['wallet']}")
+        await u.message.reply_text(
+            f"✅ برداشت {amt}\n🏦 بانک: <b>{p['bank']}</b>\n💼 کیف: {p['wallet']}\nسود روزانه: ۵٪",
+            parse_mode="HTML",
+            reply_markup=kb_bank(oid),
+        )
         return
     if kind == "casino_amt":
         extra = st.get("extra") or {}
@@ -925,10 +1046,7 @@ async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await q.answer()
 
     if action == "close":
-        try:
-            await q.edit_message_text("بسته شد.")
-        except Exception:
-            pass
+        await panel_edit(q, "بسته شد.")
         return
 
     if action == "bank_dep":
@@ -941,40 +1059,40 @@ async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
         return
 
     if action == "shop":
-        await q.edit_message_text("🛒 بخش‌ها:", reply_markup=kb_shop_sections(d, user.id))
+        await panel_edit(q, "🛒 فروشگاه — بخش را انتخاب کن:", reply_markup=kb_shop_sections(d, user.id))
         return
     if action == "shop_sec":
         sid = rest[0] if rest else ""
         sec = d.get("shop_sections", {}).get(sid)
         if not sec:
             await q.answer("نیست", show_alert=True); return
-        await q.edit_message_text(f"📁 {sec.get('name')}", reply_markup=kb_shop_items(sec, user.id, sid))
+        await panel_edit(q, f"📁 <b>{sec.get('name')}</b>", reply_markup=kb_shop_items(sec, user.id, sid))
         return
     if action == "shop_item":
         sid, iid = (rest + ["", ""])[:2]
         sec = d.get("shop_sections", {}).get(sid, {})
-        it = next((x for x in sec.get("items", []) if x.get("id") == iid), None)
+        it = next((x for x in sec.get("items", []) if str(x.get("id")) == str(iid)), None)
         if not it:
-            await q.answer("نیست", show_alert=True); return
+            await q.answer("نیست", show_alert=True)
+            return
         cap = (
-            f"🛍 <b>{it.get('name')}</b>\n{it.get('desc','')}\n"
-            f"نوع: {it.get('type')}\nقیمت: {it.get('price')}\n"
-            f"اثر: {it.get('effect_label','-')}\nکیف تو: {p.get('wallet',0)}"
+            f"🛍 <b>{it.get('name')}</b>\n"
+            f"{it.get('desc','')}\n"
+            f"نوع: {it.get('type')}\n"
+            f"قیمت: <b>{it.get('price')}</b>\n"
+            f"اثر: {it.get('effect_label','-')}\n"
+            f"کیف تو: {p.get('wallet',0)}"
         )
-        if it.get("file_id"):
-            try:
-                await q.message.reply_photo(it["file_id"], caption=cap, parse_mode="HTML", reply_markup=kb_item_buy(user.id, sid, iid))
-                return
-            except Exception:
-                pass
-        await q.edit_message_text(cap, parse_mode="HTML", reply_markup=kb_item_buy(user.id, sid, iid))
+        await panel_edit(q, cap, reply_markup=kb_item_buy(user.id, sid, iid), photo=it.get("file_id"))
         return
+
     if action == "shop_buy":
         sid, iid = (rest + ["", ""])[:2]
         sec = d.get("shop_sections", {}).get(sid, {})
-        it = next((x for x in sec.get("items", []) if x.get("id") == iid), None)
+        it = next((x for x in sec.get("items", []) if str(x.get("id")) == str(iid)), None)
         if not it:
-            await q.answer("نیست", show_alert=True); return
+            await q.answer("نیست", show_alert=True)
+            return
         price = int(it.get("price", 0))
         if p.get("wallet", 0) < price:
             await q.answer(f"پوینت کافی ندارید. موجودی: {p.get('wallet',0)}", show_alert=True)
@@ -982,10 +1100,12 @@ async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
         p["wallet"] -= price
         apply_item(p, it)
         save(d)
-        try:
-            await q.edit_message_caption(caption=f"✅ خرید شد: {it.get('name')}\nکیف: {p['wallet']}")
-        except Exception:
-            await q.edit_message_text(f"✅ خرید شد: {it.get('name')}\nکیف: {p['wallet']}")
+        done = f"✅ خریده شد: <b>{it.get('name')}</b>\nکیف: {p['wallet']}"
+        kb = InlineKeyboardMarkup([
+            [btn("🔙 لیست بخش", own("shop_sec", user.id, sid), "primary")],
+            [btn("🛒 فروشگاه", own("shop", user.id), "success")],
+        ])
+        await panel_edit(q, done, reply_markup=kb)
         return
 
     if action == "st_in":
@@ -1067,7 +1187,8 @@ async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
             await q.answer("در گپ", show_alert=True); return
         # handled via message - set state
         set_st(c, "clan_name")
-        await q.edit_message_text("اسم انجمن را بفرست:")
+        PENDING_CLAN[user.id] = str(q.message.chat_id)
+        await q.edit_message_text("🏛 اسم انجمن را در گپ بفرست (همین‌جا تایپ کن):")
         return
     if action == "clan_leave":
         gid = str(q.message.chat_id)
@@ -1098,23 +1219,25 @@ async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
             p["region"] = r.get("name")
             save(d)
             cap = f"📍 {r.get('name')}\n{r.get('desc','')}\nخطر: {r.get('danger','-')}\nپاداش: {r.get('reward','-')}"
-            if r.get("file_id"):
-                try:
-                    await q.message.reply_photo(r["file_id"], caption=cap)
-                    return
-                except Exception:
-                    pass
-            await q.edit_message_text(cap)
+            await panel_edit(q, cap, photo=r.get("file_id"))
         return
 
     if action == "map":
         reg = p.get("region")
+        if not reg:
+            await q.answer("اول با دستور «منطقه» یک منطقه انتخاب کن", show_alert=True)
+            return
         r = next((x for x in d.get("regions", []) if x.get("name") == reg), None)
-        if r and r.get("file_id"):
-            await q.message.reply_photo(r["file_id"], caption=f"نقشه: {reg}")
-        else:
-            await q.answer("عکس منطقه نیست", show_alert=True)
+        if not r:
+            await q.answer("منطقه پیدا نشد", show_alert=True)
+            return
+        cap = "🗺️ <b>%s</b>\n%s\nخطر: %s\nپاداش: %s" % (
+            r.get("name"), r.get("desc", ""), r.get("danger", "-"), r.get("reward", "-"),
+        )
+        kb = InlineKeyboardMarkup([[btn("🔙 بستن", own("close", user.id), "primary")]])
+        await panel_edit(q, cap, reply_markup=kb, photo=r.get("file_id"))
         return
+
 
 def apply_item(p, it):
     t = it.get("type")
@@ -1182,7 +1305,7 @@ async def admin_cb(q, c, d, data):
         return
     if data == "a_give":
         set_st(c, "a_give_user")
-        await q.edit_message_text("یوزرنیم کاربر (بدون @):")
+        await q.edit_message_text("یوزرنیم یا آیدی عددی کاربر را بفرست:")
         return
     if data == "a_herd":
         set_st(c, "a_herd_chat")
