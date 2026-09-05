@@ -3,7 +3,7 @@ import json
 import time
 import threading
 import os
-from datetime import datetime, timedelta
+from datetime import datetime
 
 # ==============================
 # تنظیمات
@@ -27,21 +27,7 @@ settings = {
     "end_time": None
 }
 
-# ==============================
-# کاربران
-# ==============================
-
 users = {}
-
-# ساختار:
-#
-# {
-#   "123456789": {
-#       "username": "Kian",
-#       "first_name": "Kian",
-#       "last_seen": 1234567890
-#   }
-# }
 
 # ==============================
 # بارگذاری تنظیمات
@@ -54,21 +40,11 @@ def load_settings():
     if os.path.exists(DATA_FILE):
 
         try:
-
-            with open(
-                DATA_FILE,
-                "r",
-                encoding="utf-8"
-            ) as f:
-
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
                 settings = json.load(f)
 
         except Exception as e:
-
-            print(
-                "Settings load error:",
-                e
-            )
+            print("Settings error:", e)
 
 
 # ==============================
@@ -77,11 +53,7 @@ def load_settings():
 
 def save_settings():
 
-    with open(
-        DATA_FILE,
-        "w",
-        encoding="utf-8"
-    ) as f:
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
 
         json.dump(
             settings,
@@ -113,11 +85,7 @@ def load_users():
 
         except Exception as e:
 
-            print(
-                "Users load error:",
-                e
-            )
-
+            print("Users error:", e)
             users = {}
 
 
@@ -145,10 +113,7 @@ def save_users():
 # Telegram API
 # ==============================
 
-def api(
-    method,
-    data=None
-):
+def api(method, data=None):
 
     try:
 
@@ -162,11 +127,7 @@ def api(
 
     except Exception as e:
 
-        print(
-            "API Error:",
-            e
-        )
-
+        print("API Error:", e)
         return None
 
 
@@ -176,22 +137,29 @@ def api(
 
 def send_message(
     chat_id,
-    text
+    text,
+    reply_markup=None
 ):
+
+    data = {
+        "chat_id": chat_id,
+        "text": text
+    }
+
+    if reply_markup:
+        data["reply_markup"] = json.dumps(
+            reply_markup,
+            ensure_ascii=False
+        )
 
     result = api(
         "sendMessage",
-        {
-            "chat_id": chat_id,
-            "text": text
-        }
+        data
     )
 
     if result and result.get("ok"):
 
-        return result[
-            "result"
-        ]["message_id"]
+        return result["result"]["message_id"]
 
     return None
 
@@ -222,34 +190,20 @@ def edit_message(
 
 def register_user(message):
 
-    user = message.get(
-        "from",
-        {}
-    )
+    user = message.get("from", {})
 
-    user_id = user.get(
-        "id"
-    )
+    user_id = user.get("id")
 
     if not user_id:
         return
 
-    username = user.get(
-        "username"
-    )
-
-    first_name = user.get(
-        "first_name",
-        ""
-    )
+    username = user.get("username")
+    first_name = user.get("first_name", "")
 
     users[str(user_id)] = {
-
         "username": username,
-
         "first_name": first_name,
-
-        "last_seen": time.time()
+        "started_at": time.time()
     }
 
     save_users()
@@ -259,168 +213,21 @@ def register_user(message):
 # نام کاربر
 # ==============================
 
-def get_user_name(user_data):
+def get_user_name(data):
 
-    username = user_data.get(
-        "username"
-    )
-
-    first_name = user_data.get(
-        "first_name",
-        "بدون نام"
-    )
+    username = data.get("username")
 
     if username:
-
         return f"@{username}"
 
-    return first_name
-
-
-# ==============================
-# آمار کاربران
-# ==============================
-
-def get_user_stats():
-
-    now = time.time()
-
-    # 24 ساعت
-    day_ago = now - 86400
-
-    # 30 روز
-    month_ago = now - (30 * 86400)
-
-    today_count = 0
-    month_count = 0
-
-    for user in users.values():
-
-        last_seen = user.get(
-            "last_seen",
-            0
-        )
-
-        if last_seen >= day_ago:
-
-            today_count += 1
-
-        if last_seen >= month_ago:
-
-            month_count += 1
-
-    total_count = len(users)
-
-    return (
-        total_count,
-        month_count,
-        today_count
+    return data.get(
+        "first_name",
+        "بدون یوزرنیم"
     )
 
 
 # ==============================
-# ارسال آمار
-# ==============================
-
-def send_stats(chat_id):
-
-    total, monthly, today = (
-        get_user_stats()
-    )
-
-    text = (
-        "📊 آمار ربات\n\n"
-
-        f"👥 کل کاربران: {total}\n"
-
-        f"📅 کاربران ماهانه: {monthly}\n"
-
-        f"🟢 کاربران ۲۴ ساعت اخیر: {today}"
-    )
-
-    send_message(
-        chat_id,
-        text
-    )
-
-
-# ==============================
-# ارسال لیست کاربران
-# ==============================
-
-def send_users_list(chat_id):
-
-    if not users:
-
-        send_message(
-            chat_id,
-            "👥 هنوز هیچ کاربری ربات را استارت نکرده است."
-        )
-
-        return
-
-    user_list = list(
-        users.items()
-    )
-
-    # جدیدترین کاربران اول
-    user_list.sort(
-        key=lambda item:
-        item[1].get(
-            "last_seen",
-            0
-        ),
-        reverse=True
-    )
-
-    lines = []
-
-    for index, (
-        user_id,
-        user_data
-    ) in enumerate(
-        user_list,
-        start=1
-    ):
-
-        name = get_user_name(
-            user_data
-        )
-
-        lines.append(
-            f"{index}. {name}"
-        )
-
-    # تلگرام محدودیت طول پیام دارد
-    chunk = ""
-
-    for line in lines:
-
-        if len(
-            chunk
-        ) + len(line) + 1 > 3500:
-
-            send_message(
-                chat_id,
-                "👥 لیست کاربران:\n\n"
-                + chunk
-            )
-
-            chunk = ""
-
-        chunk += line + "\n"
-
-    if chunk:
-
-        send_message(
-            chat_id,
-            "👥 لیست کاربران:\n\n"
-            + chunk
-        )
-
-
-# ==============================
-# ساخت نوار پیشرفت
+# نوار پیشرفت
 # ==============================
 
 def progress_bar(
@@ -430,19 +237,14 @@ def progress_bar(
 
     percent = max(
         0,
-        min(
-            100,
-            percent
-        )
+        min(100, percent)
     )
 
     filled = int(
         size * percent / 100
     )
 
-    empty = (
-        size - filled
-    )
+    empty = size - filled
 
     return (
         "█" * filled
@@ -452,34 +254,68 @@ def progress_bar(
 
 
 # ==============================
-# زمان باقی مانده
+# زمان باقی‌مانده
 # ==============================
 
 def get_time_left():
 
-    if not settings.get(
-        "end_time"
-    ):
+    end = settings.get("end_time")
 
+    if not end:
         return None
 
-    end = datetime.fromtimestamp(
-        settings["end_time"]
+    return int(
+        end - time.time()
     )
-
-    now = datetime.now()
-
-    seconds = int(
-        (
-            end - now
-        ).total_seconds()
-    )
-
-    return seconds
 
 
 # ==============================
-# ساخت متن اصلی
+# فرمت زمان
+# ==============================
+
+def format_time(seconds):
+
+    seconds = max(
+        0,
+        int(seconds)
+    )
+
+    days = seconds // 86400
+    seconds %= 86400
+
+    hours = seconds // 3600
+    seconds %= 3600
+
+    minutes = seconds // 60
+    seconds %= 60
+
+    result = []
+
+    if days:
+        result.append(
+            f"{days} روز"
+        )
+
+    if hours:
+        result.append(
+            f"{hours} ساعت"
+        )
+
+    if minutes:
+        result.append(
+            f"{minutes} دقیقه"
+        )
+
+    if seconds or not result:
+        result.append(
+            f"{seconds} ثانیه"
+        )
+
+    return " و ".join(result)
+
+
+# ==============================
+# متن اصلی
 # ==============================
 
 def make_text():
@@ -497,10 +333,7 @@ def make_text():
         ""
     )
 
-    # ==========================
     # زمان تنظیم نشده
-    # ==========================
-
     if not end:
 
         return (
@@ -510,10 +343,7 @@ def make_text():
 
     now = time.time()
 
-    # ==========================
     # قبل از شروع
-    # ==========================
-
     if start and now < start:
 
         remaining = int(
@@ -522,35 +352,24 @@ def make_text():
 
         return (
             f"{custom_text}\n\n"
-            "⏳ زمان شروع:\n"
+            "⏳ شروع بازی:\n"
             f"{format_time(remaining)}"
         )
 
-    # ==========================
     # پایان
-    # ==========================
-
     if now >= end:
 
         return (
             f"{custom_text}\n\n"
-            "✅ زمان به پایان رسید!\n\n"
+            "🧟‍♂️ بازی شروع شد!\n\n"
             "████████████████████ 100%"
         )
 
-    # ==========================
     # درصد
-    # ==========================
-
     if start:
 
-        total = (
-            end - start
-        )
-
-        passed = (
-            now - start
-        )
+        total = end - start
+        passed = now - start
 
         percent = (
             passed / total
@@ -577,69 +396,8 @@ def make_text():
 
 
 # ==============================
-# فرمت زمان
-# ==============================
-
-def format_time(
-    seconds
-):
-
-    seconds = max(
-        0,
-        int(seconds)
-    )
-
-    days = (
-        seconds // 86400
-    )
-
-    seconds %= 86400
-
-    hours = (
-        seconds // 3600
-    )
-
-    seconds %= 3600
-
-    minutes = (
-        seconds // 60
-    )
-
-    seconds %= 60
-
-    result = []
-
-    if days:
-
-        result.append(
-            f"{days} روز"
-        )
-
-    if hours:
-
-        result.append(
-            f"{hours} ساعت"
-        )
-
-    if minutes:
-
-        result.append(
-            f"{minutes} دقیقه"
-        )
-
-    if seconds or not result:
-
-        result.append(
-            f"{seconds} ثانیه"
-        )
-
-    return " و ".join(
-        result
-    )
-
-
-# ==============================
 # شمارش معکوس
+# هر دقیقه آپدیت می‌شود
 # ==============================
 
 def countdown(
@@ -657,9 +415,7 @@ def countdown(
             text
         )
 
-        remaining = (
-            get_time_left()
-        )
+        remaining = get_time_left()
 
         if (
             remaining is not None
@@ -668,45 +424,335 @@ def countdown(
 
             break
 
-        time.sleep(1)
+        # 60 ثانیه
+        time.sleep(60)
 
 
 # ==============================
-# راهنمای ادمین
+# دکمه‌های پنل ادمین
 # ==============================
 
-def admin_help(chat_id):
+def admin_keyboard():
+
+    return {
+
+        "inline_keyboard": [
+
+            [
+                {
+                    "text": "📝 تغییر متن",
+                    "callback_data": "set_text",
+                    "style": "success"
+                },
+
+                {
+                    "text": "⏰ تنظیم زمان",
+                    "callback_data": "set_time",
+                    "style": "success"
+                }
+            ],
+
+            [
+                {
+                    "text": "▶️ شروع شمارش",
+                    "callback_data": "start_time",
+                    "style": "success"
+                },
+
+                {
+                    "text": "⚙️ تنظیمات",
+                    "callback_data": "settings",
+                    "style": "success"
+                }
+            ],
+
+            [
+                {
+                    "text": "👥 کاربران",
+                    "callback_data": "users",
+                    "style": "success"
+                },
+
+                {
+                    "text": "🗑 پاک کردن زمان",
+                    "callback_data": "clear",
+                    "style": "danger"
+                }
+            ]
+
+        ]
+    }
+
+
+# ==============================
+# پنل ادمین
+# ==============================
+
+def show_admin_panel(chat_id):
+
+    text = (
+        "⚙️ پنل مدیریت ربات\n\n"
+        "از دکمه‌های زیر برای تنظیم ربات استفاده کن:"
+    )
+
+    send_message(
+        chat_id,
+        text,
+        admin_keyboard()
+    )
+
+
+# ==============================
+# پاسخ به Callback
+# ==============================
+
+def answer_callback(callback_id):
+
+    api(
+        "answerCallbackQuery",
+        {
+            "callback_query_id": callback_id
+        }
+    )
+
+
+# ==============================
+# پردازش دکمه‌ها
+# ==============================
+
+def handle_callback(callback):
+
+    callback_id = callback["id"]
+
+    message = callback.get(
+        "message",
+        {}
+    )
+
+    chat_id = message.get(
+        "chat",
+        {}
+    ).get(
+        "id"
+    )
+
+    data = callback.get(
+        "data"
+    )
+
+    answer_callback(
+        callback_id
+    )
+
+    if chat_id != ADMIN_ID:
+        return
+
+    # تغییر متن
+    if data == "set_text":
+
+        send_message(
+            chat_id,
+            "📝 برای تغییر متن، این دستور را بفرست:\n\n"
+            "/text متن دلخواه"
+        )
+
+        return
+
+    # تنظیم زمان
+    if data == "set_time":
+
+        send_message(
+            chat_id,
+            "⏰ زمان پایان را این‌طور وارد کن:\n\n"
+            "/time YYYY-MM-DD HH:MM\n\n"
+            "مثال:\n"
+            "/time 2026-09-06 20:00"
+        )
+
+        return
+
+    # شروع شمارش
+    if data == "start_time":
+
+        if not settings.get(
+            "end_time"
+        ):
+
+            send_message(
+                chat_id,
+                "❌ اول زمان پایان را تنظیم کن."
+            )
+
+            return
+
+        settings["start_time"] = time.time()
+
+        save_settings()
+
+        send_message(
+            chat_id,
+            "▶️ شمارش از همین لحظه شروع شد."
+        )
+
+        return
+
+    # تنظیمات
+    if data == "settings":
+
+        show_settings(
+            chat_id
+        )
+
+        return
+
+    # کاربران
+    if data == "users":
+
+        send_users_list(
+            chat_id
+        )
+
+        return
+
+    # پاک کردن
+    if data == "clear":
+
+        settings["start_time"] = None
+        settings["end_time"] = None
+
+        save_settings()
+
+        send_message(
+            chat_id,
+            "🗑 زمان با موفقیت پاک شد."
+        )
+
+        return
+
+
+# ==============================
+# نمایش تنظیمات
+# ==============================
+
+def show_settings(chat_id):
+
+    start = settings.get(
+        "start_time"
+    )
+
+    end = settings.get(
+        "end_time"
+    )
+
+    if start:
+
+        start_text = datetime.fromtimestamp(
+            start
+        ).strftime(
+            "%Y-%m-%d %H:%M"
+        )
+
+    else:
+
+        start_text = "تنظیم نشده"
+
+    if end:
+
+        end_text = datetime.fromtimestamp(
+            end
+        ).strftime(
+            "%Y-%m-%d %H:%M"
+        )
+
+    else:
+
+        end_text = "تنظیم نشده"
 
     send_message(
 
         chat_id,
 
-        "⚙️ پنل تنظیمات ادمین\n\n"
+        "⚙️ تنظیمات فعلی\n\n"
 
-        "📝 تغییر متن:\n"
-        "/text متن دلخواه\n\n"
+        f"📝 متن:\n"
+        f"{settings['text']}\n\n"
 
-        "⏰ تنظیم زمان:\n"
-        "/time YYYY-MM-DD HH:MM\n\n"
+        f"▶️ شروع:\n"
+        f"{start_text}\n\n"
 
-        "مثال:\n"
-        "/time 2026-09-10 20:30\n\n"
+        f"🏁 پایان:\n"
+        f"{end_text}\n\n"
 
-        "▶️ شروع شمارش از همین لحظه:\n"
-        "/starttime\n\n"
-
-        "📌 مشاهده تنظیمات:\n"
-        "/settings\n\n"
-
-        "📊 آمار کاربران:\n"
-        "/stats\n\n"
-
-        "👥 لیست کاربران:\n"
-        "/users\n\n"
-
-        "❌ پاک کردن زمان:\n"
-        "/clear"
+        f"👥 کاربران ثبت‌شده:\n"
+        f"{len(users)}"
     )
+
+
+# ==============================
+# لیست کاربران
+# ==============================
+
+def send_users_list(chat_id):
+
+    if not users:
+
+        send_message(
+            chat_id,
+            "👥 هنوز کسی ربات را استارت نکرده است."
+        )
+
+        return
+
+    user_list = list(
+        users.items()
+    )
+
+    user_list.sort(
+        key=lambda x:
+        x[1].get(
+            "started_at",
+            0
+        ),
+        reverse=True
+    )
+
+    text = (
+        f"👥 کاربران استارت‌کننده\n\n"
+        f"📊 تعداد: {len(user_list)}\n\n"
+    )
+
+    for index, (
+        user_id,
+        data
+    ) in enumerate(
+        user_list,
+        start=1
+    ):
+
+        name = get_user_name(
+            data
+        )
+
+        text += (
+            f"{index}. {name}\n"
+        )
+
+        # جلوگیری از رد شدن محدودیت تلگرام
+        if len(text) > 3500:
+
+            send_message(
+                chat_id,
+                text
+            )
+
+            text = ""
+
+    if text:
+
+        send_message(
+            chat_id,
+            text
+        )
 
 
 # ==============================
@@ -725,11 +771,10 @@ def handle_message(message):
     ).strip()
 
     if not text:
-
         return
 
     # ==========================
-    # ثبت کاربر هنگام START
+    # START
     # ==========================
 
     if text == "/start":
@@ -763,37 +808,30 @@ def handle_message(message):
     # ==========================
 
     if chat_id != ADMIN_ID:
-
         return
 
-    # ==========================
-    # پنل ادمین
-    # ==========================
-
+    # پنل
     if text == "/admin":
 
-        admin_help(
+        show_admin_panel(
             chat_id
         )
 
         return
 
-    # ==========================
-    # آمار
-    # ==========================
-
+    # آمار/تعداد کاربران
     if text == "/stats":
 
-        send_stats(
-            chat_id
+        send_message(
+            chat_id,
+
+            "📊 آمار ربات\n\n"
+            f"👥 کل کاربران استارت‌کننده: {len(users)}"
         )
 
         return
 
-    # ==========================
     # لیست کاربران
-    # ==========================
-
     if text == "/users":
 
         send_users_list(
@@ -810,9 +848,7 @@ def handle_message(message):
         "/text "
     ):
 
-        new_text = text[
-            6:
-        ].strip()
+        new_text = text[6:].strip()
 
         if not new_text:
 
@@ -823,9 +859,7 @@ def handle_message(message):
 
             return
 
-        settings[
-            "text"
-        ] = new_text
+        settings["text"] = new_text
 
         save_settings()
 
@@ -837,16 +871,14 @@ def handle_message(message):
         return
 
     # ==========================
-    # تنظیم زمان
+    # زمان
     # ==========================
 
     if text.startswith(
         "/time "
     ):
 
-        value = text[
-            6:
-        ].strip()
+        value = text[6:].strip()
 
         try:
 
@@ -855,14 +887,13 @@ def handle_message(message):
                 "%Y-%m-%d %H:%M"
             )
 
-            settings[
-                "end_time"
-            ] = dt.timestamp()
+            settings["end_time"] = (
+                dt.timestamp()
+            )
 
             save_settings()
 
             send_message(
-
                 chat_id,
 
                 "✅ زمان پایان تنظیم شد.\n\n"
@@ -872,12 +903,11 @@ def handle_message(message):
         except:
 
             send_message(
-
                 chat_id,
 
                 "❌ فرمت اشتباه است.\n\n"
                 "مثال:\n"
-                "/time 2026-09-10 20:30"
+                "/time 2026-09-06 20:00"
             )
 
         return
@@ -899,15 +929,13 @@ def handle_message(message):
 
             return
 
-        settings[
-            "start_time"
-        ] = time.time()
+        settings["start_time"] = time.time()
 
         save_settings()
 
         send_message(
             chat_id,
-            "▶️ شمارش معکوس از همین لحظه شروع شد."
+            "▶️ شمارش از همین لحظه شروع شد."
         )
 
         return
@@ -918,77 +946,26 @@ def handle_message(message):
 
     if text == "/settings":
 
-        start = settings.get(
-            "start_time"
-        )
-
-        end = settings.get(
-            "end_time"
-        )
-
-        start_text = (
-
-            datetime.fromtimestamp(
-                start
-            ).strftime(
-                "%Y-%m-%d %H:%M"
-            )
-
-            if start
-
-            else "تنظیم نشده"
-        )
-
-        end_text = (
-
-            datetime.fromtimestamp(
-                end
-            ).strftime(
-                "%Y-%m-%d %H:%M"
-            )
-
-            if end
-
-            else "تنظیم نشده"
-        )
-
-        send_message(
-
-            chat_id,
-
-            "⚙️ تنظیمات فعلی:\n\n"
-
-            f"📝 متن:\n"
-            f"{settings['text']}\n\n"
-
-            f"▶️ شروع:\n"
-            f"{start_text}\n\n"
-
-            f"🏁 پایان:\n"
-            f"{end_text}"
+        show_settings(
+            chat_id
         )
 
         return
 
     # ==========================
-    # پاک کردن زمان
+    # پاک کردن
     # ==========================
 
     if text == "/clear":
 
-        settings[
-            "start_time"
-        ] = None
-
-        settings[
-            "end_time"
-        ] = None
+        settings["start_time"] = None
+        settings["end_time"] = None
 
         save_settings()
 
         send_message(
             chat_id,
-            "🗑 تنظیمات زمان پاک شد."
+            "🗑 زمان پاک شد."
         )
 
         return
@@ -998,19 +975,19 @@ def handle_message(message):
 # دریافت آپدیت
 # ==============================
 
-def get_updates(
-    offset=None
-):
+def get_updates(offset=None):
 
     data = {
-        "timeout": 30
+        "timeout": 30,
+        "allowed_updates": json.dumps([
+            "message",
+            "callback_query"
+        ])
     }
 
     if offset is not None:
 
-        data[
-            "offset"
-        ] = offset
+        data["offset"] = offset
 
     return api(
         "getUpdates",
@@ -1025,13 +1002,9 @@ def get_updates(
 def main():
 
     load_settings()
-
     load_users()
 
-    print(
-        "🤖 Bot Started"
-    )
-
+    print("🤖 Bot Started")
     print(
         f"👥 Users: {len(users)}"
     )
@@ -1049,7 +1022,6 @@ def main():
             if not result:
 
                 time.sleep(2)
-
                 continue
 
             if not result.get(
@@ -1057,7 +1029,6 @@ def main():
             ):
 
                 time.sleep(3)
-
                 continue
 
             for update in result.get(
@@ -1066,25 +1037,38 @@ def main():
             ):
 
                 offset = (
-                    update[
-                        "update_id"
-                    ] + 1
+                    update["update_id"] + 1
                 )
 
+                # پیام
                 if "message" in update:
 
                     try:
 
                         handle_message(
-                            update[
-                                "message"
-                            ]
+                            update["message"]
                         )
 
                     except Exception as e:
 
                         print(
                             "Message error:",
+                            e
+                        )
+
+                # دکمه
+                if "callback_query" in update:
+
+                    try:
+
+                        handle_callback(
+                            update["callback_query"]
+                        )
+
+                    except Exception as e:
+
+                        print(
+                            "Callback error:",
                             e
                         )
 
