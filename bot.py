@@ -179,37 +179,11 @@ async def copy_to_chat(bot, message, chat_id, reply_to=None):
 
 
 async def forward_group_msg_to_admin(bot, message, d):
-    user = message.from_user
-    chat = message.chat
-    name = user.full_name if user else "?"
-    un = f"@{user.username}" if user and user.username else str(user.id if user else "?")
-    if message.sticker:
-        kind = "استیکر"
-    elif message.animation:
-        kind = "گیف"
-    elif message.photo:
-        kind = "عکس"
-    elif message.voice:
-        kind = "ویس"
-    elif message.video:
-        kind = "ویدیو"
-    elif message.text:
-        kind = "متن"
-    else:
-        kind = "پیام"
-    header = (
-        f"💬 {kind} | {chat.title or chat.id}\n"
-        f"👤 {name} ({un})\n"
-        f"— ریپلای = جواب در گپ | ریکشن 🤣 = ری‌اکشن —"
-    )
+    """فقط فوروارد خام پیام — بدون هدر اضافه؛ اسم فرد از تلگرام مشخص است"""
     last = None
     for aid in admin_ids(d):
         try:
-            await bot.send_message(aid, header)
-        except Exception:
-            pass
-        try:
-            sent = await bot.copy_message(
+            sent = await bot.forward_message(
                 chat_id=aid,
                 from_chat_id=message.chat_id,
                 message_id=message.message_id,
@@ -218,14 +192,22 @@ async def forward_group_msg_to_admin(bot, message, d):
             last = sent
         except Exception as e:
             log.error("fwd %s: %s", aid, e)
+            # اگر فوروارد بسته بود، کپی + یک خط کوتاه
             try:
-                sent = await bot.send_message(aid, f"{header}\n[کپی نشد]")
+                user = message.from_user
+                name = user.full_name if user else "?"
+                sent = await bot.copy_message(
+                    chat_id=aid,
+                    from_chat_id=message.chat_id,
+                    message_id=message.message_id,
+                )
                 bridge_put(d, sent.message_id, message.chat_id, message.message_id)
                 last = sent
-            except Exception:
-                pass
+            except Exception as e2:
+                log.error("copy fallback %s: %s", aid, e2)
     save(d)
     return last
+
 
 
 def push_recent(d, message):
