@@ -17,7 +17,7 @@ from telegram.ext import (
 from telegram.constants import ChatType, ChatMemberStatus
 
 BOT_TOKEN = "8975007734:AAECUtykIq5YSt0Wc3YpFKtgOKSAs-muOoY"
-ADMIN_ID = 8918154552,7530457395
+ADMIN_ID = 8918154552
 DATA = "relay_data.json"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
