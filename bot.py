@@ -17,7 +17,7 @@ from telegram.ext import (
 )
 from telegram.constants import ChatType, ChatMemberStatus
 
-BOT_TOKEN = "8860156956:AAHL310qkBuT0XvQMjoCJEJ_GcE64Q7XqIk"
+BOT_TOKEN = "8727762178:AAGrdb5XFjhkcdoOEIFy1s8U71idRpN0DX8"
 ADMIN_ID = 7530457395
 DATA = "media_bank.json"
 
