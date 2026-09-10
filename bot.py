@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-ربات: پست روزانه کانال + پیام «ناشناس» به کیان
-- زمان تهران، تاریخ شمسی و میلادی، ثانیه دقیق
-- جبران ارسال از‌دست‌رفته هنگام روشن شدن
-- کاربر فکر می‌کند ناشناس است؛ برای ادمین فوروارد واقعی می‌آید
+ربات دسته رسانه + تشخیص هوشمند + همگانی
+- دسته با کلید (مثلاً عکس بده) + آپلود عکس/ویدیو/متن
+- رندوم بدون تکرار تا ته دور
+- تشخیص: عکس بفرست ≈ عکس بده ؛ اگر «عکس دختر بده» هم باشد، «عکس بفرست» → عکس بده
+- همگانی به همه گپ‌ها (متن/عکس/ویدیو با کپشن)
 """
 from __future__ import annotations
-import json, os, logging, re
-from datetime import datetime, timedelta, time as dtime
-from zoneinfo import ZoneInfo
+import json, os, re, random, logging, time
+from difflib import SequenceMatcher
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -17,28 +17,19 @@ from telegram.ext import (
 )
 from telegram.constants import ChatType, ChatMemberStatus
 
-BOT_TOKEN = "8975007734:AAEkghW4tK0DeG9uOKw87Lgep8XUWlMiiLY"
+BOT_TOKEN = "8860156956:AAHL310qkBuT0XvQMjoCJEJ_GcE64Q7XqIk"
 ADMIN_ID = 7530457395
-DATA = "kian_bot_data.json"
-TZ = ZoneInfo("Asia/Tehran")
+DATA = "media_bank.json"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("kianbot")
+log = logging.getLogger("mediabank")
 
 
 def D():
     return {
-        "channel_id": None,
-        "channel_title": "",
-        "post_text": "سلام! پست روزانه.",
-        "post_hour": 22,
-        "post_minute": 0,
-        "post_enabled": False,
-        "last_sent_day": "",  # YYYY-MM-DD Tehran
-        # map: admin_msg_id -> user_id (for reply bridge)
-        "bridges": {},
-        # user_id -> last admin reply text (optional inbox)
-        "user_replies": {},
+        "admins": [ADMIN_ID],
+        "groups": [],  # chat ids as int
+        "categories": {},  # id -> {name, trigger, items:[{type,file_id,text}], cursor_ids:[]}
     }
 
 
@@ -47,9 +38,11 @@ def load():
         try:
             with open(DATA, "r", encoding="utf-8") as f:
                 d = json.load(f)
-            base = D()
-            for k, v in base.items():
+            b = D()
+            for k, v in b.items():
                 d.setdefault(k, v)
+            if ADMIN_ID not in [int(x) for x in d.get("admins", [])]:
+                d.setdefault("admins", []).insert(0, ADMIN_ID)
             return d
         except Exception as e:
             log.error(e)
@@ -62,6 +55,11 @@ def save(d):
 
 
 def is_admin(uid):
+    d = load()
+    return int(uid) in {int(x) for x in d.get("admins", [ADMIN_ID])}
+
+
+def is_main(uid):
     return int(uid) == ADMIN_ID
 
 
@@ -77,176 +75,141 @@ def btn(text, data, style=None):
 
 
 def set_st(c, kind, extra=None):
-    c.user_data["st"] = {"kind": kind, "extra": extra or {}}
+    c.user_data["st"] = {"kind": kind, "extra": extra or {}, "ts": time.time()}
 
 
 def get_st(c):
-    return c.user_data.get("st")
+    st = c.user_data.get("st")
+    if not st:
+        return None
+    if time.time() - st.get("ts", 0) > 600:
+        c.user_data.pop("st", None)
+        return None
+    return st
 
 
 def clear_st(c):
     c.user_data.pop("st", None)
 
 
-# ---------- Jalali ----------
-def gregorian_to_jalali(gy, gm, gd):
-    g_d_m = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]
-    if gy > 1600:
-        jy = 979
-        gy -= 1600
-    else:
-        jy = 0
-        gy -= 621
-    gy2 = gy + 1 if gm > 2 else gy
-    days = (365 * gy) + (gy2 // 4) - (gy2 // 100) + (gy2 // 400) - 80 + gd + g_d_m[gm - 1]
-    jy += 33 * (days // 12053)
-    days %= 12053
-    jy += 4 * (days // 1461)
-    days %= 1461
-    if days > 365:
-        jy += (days - 1) // 365
-        days = (days - 1) % 365
-    if days < 186:
-        jm = 1 + days // 31
-        jd = 1 + days % 31
-    else:
-        jm = 7 + (days - 186) // 30
-        jd = 1 + (days - 186) % 30
-    return jy, jm, jd
+def new_id():
+    return f"c{int(time.time())}{random.randint(10,99)}"
 
 
-def format_footer(now: datetime) -> str:
-    jy, jm, jd = gregorian_to_jalali(now.year, now.month, now.day)
-    return (
-        f"\n\n⏱ ارسال: {now.strftime('%H:%M:%S')}\n"
-        f"📅 شمسی: {jy:04d}/{jm:02d}/{jd:02d}\n"
-        f"📅 میلادی: {now.strftime('%Y-%m-%d')}"
-    )
+# ---------- smart match ----------
+def normalize(text: str) -> str:
+    t = (text or "").strip().lower()
+    t = t.replace("‌", " ")
+    # unify request verbs
+    reps = {
+        "بفرست": "بده",
+        "بفرستید": "بده",
+        "بفرستین": "بده",
+        "میخوام": "",
+        "می‌خوام": "",
+        "می خواهم": "",
+        "لطفا": "",
+        "لطفاً": "",
+        "یه": "",
+        "یک": "",
+        "رو": "",
+        "را": "",
+    }
+    for a, b in reps.items():
+        t = t.replace(a, b)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
 
 
-# ---------- channel post ----------
-async def send_daily_post(bot, d, force=False):
-    if not d.get("channel_id"):
-        return False, "کانال ثبت نشده"
-    if not d.get("post_enabled") and not force:
-        return False, "پست خاموش است"
-    now = datetime.now(TZ)
-    day_key = now.strftime("%Y-%m-%d")
-    if not force and d.get("last_sent_day") == day_key:
-        return False, "امروز قبلاً ارسال شده"
-
-    text = (d.get("post_text") or "").strip() or "—"
-    body = text + format_footer(now)
-    try:
-        await bot.send_message(int(d["channel_id"]), body)
-        d["last_sent_day"] = day_key
-        save(d)
-        return True, "ok"
-    except Exception as e:
-        log.error("post: %s", e)
-        return False, str(e)
+def tokens(text: str):
+    return [w for w in normalize(text).split() if w]
 
 
-async def job_daily(context: ContextTypes.DEFAULT_TYPE):
-    d = load()
-    ok, msg = await send_daily_post(context.bot, d)
-    if ok:
-        log.info("daily post sent")
-    else:
-        log.info("daily skip: %s", msg)
+def match_score(user_text: str, trigger: str) -> float:
+    """
+    امتیاز بالاتر = تطبیق بهتر.
+    اگر کاربر کلمات اضافهٔ دستهٔ خاص‌تر را نگفته باشد، دستهٔ کلی‌تر برنده می‌شود.
+    """
+    u = normalize(user_text)
+    tr = normalize(trigger)
+    if not u or not tr:
+        return 0.0
+    ut, tt = set(tokens(u)), set(tokens(tr))
+    if not tt:
+        return 0.0
+    # همه کلمات کلیدی تریگر در پیام باشد؟
+    overlap = len(ut & tt) / len(tt)
+    # شباهت رشته
+    ratio = SequenceMatcher(None, u, tr).ratio()
+    # جریمه: کلمات تریگر که در پیام کاربر نیست (دسته خاص‌تر بدون ذکر آن کلمه)
+    missing = len(tt - ut)
+    penalty = missing * 0.35
+    # پاداش پوشش
+    score = overlap * 0.7 + ratio * 0.3 - penalty
+    # اگر هیچ همپوشانی کلمه‌ای نباشد صفر
+    if len(ut & tt) == 0 and ratio < 0.55:
+        return 0.0
+    return score
 
 
-async def catchup_on_start(app: Application):
-    """اگر امروز هنوز پست نرفته و از ساعت مقرر گذشته، الان بفرست"""
-    d = load()
-    if not d.get("post_enabled") or not d.get("channel_id"):
-        return
-    now = datetime.now(TZ)
-    day_key = now.strftime("%Y-%m-%d")
-    if d.get("last_sent_day") == day_key:
-        return
-    target = now.replace(
-        hour=int(d.get("post_hour", 22)),
-        minute=int(d.get("post_minute", 0)),
-        second=0,
-        microsecond=0,
-    )
-    if now >= target:
-        ok, msg = await send_daily_post(app.bot, d)
-        log.info("catchup: %s %s", ok, msg)
-        try:
-            await app.bot.send_message(
-                ADMIN_ID,
-                f"⏱ جبران پست امروز: {'✅ ارسال شد' if ok else '❌ ' + msg}",
-            )
-        except Exception:
-            pass
+def find_best_category(d, user_text: str):
+    best_id, best_score = None, 0.0
+    for cid, cat in d.get("categories", {}).items():
+        sc = match_score(user_text, cat.get("trigger") or cat.get("name") or "")
+        if sc > best_score:
+            best_score = sc
+            best_id = cid
+    # آستانه
+    if best_score < 0.35:
+        return None, 0.0
+    return best_id, best_score
 
 
-def reschedule(app: Application, d: dict):
-    if not app.job_queue:
-        log.warning("job-queue missing")
-        return
-    for j in app.job_queue.get_jobs_by_name("daily_post"):
-        j.schedule_removal()
-    h = int(d.get("post_hour", 22))
-    m = int(d.get("post_minute", 0))
-    app.job_queue.run_daily(
-        job_daily,
-        time=dtime(hour=h, minute=m, second=0, tzinfo=TZ),
-        name="daily_post",
-    )
-    log.info("scheduled daily at %02d:%02d Tehran", h, m)
+def pick_item(cat: dict):
+    """رندوم بدون تکرار تا ته دور"""
+    items = cat.get("items") or []
+    if not items:
+        return None
+    used = set(cat.get("used_ids") or [])
+    pool = [it for it in items if it.get("id") not in used]
+    if not pool:
+        cat["used_ids"] = []
+        pool = list(items)
+    it = random.choice(pool)
+    used = set(cat.get("used_ids") or [])
+    used.add(it["id"])
+    cat["used_ids"] = list(used)
+    return it
 
 
 # ---------- keyboards ----------
-def admin_kb(d=None):
-    d = d or load()
-    ch = d.get("channel_title") or d.get("channel_id") or "-"
+def admin_kb():
     return InlineKeyboardMarkup([
-        [btn(f"📢 کانال: {str(ch)[:20]}", "a_ch", "primary")],
-        [btn("📝 متن پست", "a_text", "primary")],
-        [btn(f"⏰ ساعت: {d.get('post_hour', 22):02d}:{d.get('post_minute', 0):02d}", "a_time", "primary")],
-        [
-            btn("🟢 روشن", "a_on", "success") if not d.get("post_enabled") else btn("🔴 خاموش", "a_off", "danger"),
-        ],
-        [btn("📤 ارسال الان", "a_now", "success")],
-        [btn("📬 پیام‌های ناشناس", "a_inbox", "primary")],
-        [btn("❌ بستن", "a_close", "danger")],
+        [btn("📁 دسته‌ها", "cats", "primary")],
+        [btn("➕ دسته جدید", "cat_new", "success")],
+        [btn("📢 پیام همگانی", "bcast", "success")],
+        [btn("👤 ادمین‌ها", "admins", "primary")],
+        [btn("❌ بستن", "close", "danger")],
     ])
 
 
-def user_start_kb():
-    return InlineKeyboardMarkup([
-        [btn("✉️ ارسال پیام ناشناس به کیانی", "u_anon", "success")],
-    ])
-
-
-def user_after_send_kb():
-    return InlineKeyboardMarkup([
-        [btn("✉️ پیام جدید", "u_anon", "success")],
-        [btn("📥 جواب‌های کیان", "u_inbox", "primary")],
-    ])
-
-
-def user_got_reply_kb():
-    return InlineKeyboardMarkup([
-        [btn("👁 دیدن جواب", "u_inbox", "primary")],
-        [btn("✉️ پیام جدید به کیان", "u_anon", "success")],
-    ])
+def cat_list_kb(d):
+    rows = []
+    for cid, cat in d.get("categories", {}).items():
+        n = len(cat.get("items") or [])
+        rows.append([btn(f"{cat.get('trigger', cid)} ({n})", f"cat:{cid}", "primary")])
+    rows.append([btn("🔙", "home", "danger")])
+    return InlineKeyboardMarkup(rows)
 
 
 # ---------- handlers ----------
 async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    clear_st(c)
-    if is_admin(u.effective_user.id) and u.effective_chat.type == ChatType.PRIVATE:
+    if u.effective_chat.type == ChatType.PRIVATE and is_admin(u.effective_user.id):
+        clear_st(c)
         await u.message.reply_text("🎛 پنل ادمین", reply_markup=admin_kb())
         return
     if u.effective_chat.type == ChatType.PRIVATE:
-        await u.message.reply_text(
-            "سلام 👋\nمی‌تونی برای کیان پیام ناشناس بفرستی.",
-            reply_markup=user_start_kb(),
-        )
+        await u.message.reply_text("سلام. یکی از کلیدها را بفرست (مثلاً عکس بده).")
 
 
 async def cmd_admin(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -259,274 +222,314 @@ async def cmd_admin(u: Update, c: ContextTypes.DEFAULT_TYPE):
 async def on_my_member(u: Update, c: ContextTypes.DEFAULT_TYPE):
     r = u.my_chat_member
     chat = r.chat
-    if chat.type != ChatType.CHANNEL:
-        return
-    if r.new_chat_member.status != ChatMemberStatus.ADMINISTRATOR:
+    if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         return
     d = load()
-    d["channel_id"] = chat.id
-    d["channel_title"] = chat.title or str(chat.id)
-    save(d)
-    try:
-        await c.bot.send_message(
-            ADMIN_ID,
-            f"✅ کانال ثبت شد: {chat.title}\n<code>{chat.id}</code>",
-            parse_mode="HTML",
-            reply_markup=admin_kb(d),
-        )
-    except Exception:
-        pass
+    cid = chat.id
+    if r.new_chat_member.status in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR):
+        if cid not in d.get("groups", []):
+            d.setdefault("groups", []).append(cid)
+            save(d)
+    elif r.new_chat_member.status in (ChatMemberStatus.LEFT, ChatMemberStatus.KICKED):
+        d["groups"] = [g for g in d.get("groups", []) if g != cid]
+        save(d)
+
+
+async def send_item(bot, chat_id, item, reply_to=None):
+    kw = {"chat_id": chat_id}
+    if reply_to:
+        kw["reply_to_message_id"] = reply_to
+    t = item.get("type")
+    if t == "photo":
+        await bot.send_photo(photo=item["file_id"], caption=item.get("caption") or None, **kw)
+    elif t == "video":
+        await bot.send_video(video=item["file_id"], caption=item.get("caption") or None, **kw)
+    elif t == "animation":
+        await bot.send_animation(animation=item["file_id"], caption=item.get("caption") or None, **kw)
+    elif t == "document":
+        await bot.send_document(document=item["file_id"], caption=item.get("caption") or None, **kw)
+    else:
+        await bot.send_message(text=item.get("text") or "—", **kw)
 
 
 async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
     q = u.callback_query
     data = q.data or ""
-    d = load()
-    user = q.from_user
+    if not is_admin(q.from_user.id):
+        await q.answer("فقط ادمین", show_alert=True)
+        return
     await q.answer()
+    d = load()
 
-    # user callbacks
-    if data == "u_anon":
-        set_st(c, "anon")
-        await q.edit_message_text(
-            "پیام ناشناس خودت را برای کیان بفرست\n(متن، عکس، ویس، ...)",
-            reply_markup=InlineKeyboardMarkup([[btn("انصراف", "u_cancel", "danger")]]),
-        )
-        return
-    if data == "u_cancel":
-        clear_st(c)
-        await q.edit_message_text("لغو شد.", reply_markup=user_start_kb())
-        return
-    if data == "u_inbox":
-        items = d.get("user_replies", {}).get(str(user.id), [])
-        if not items:
-            await q.edit_message_text(
-                "هنوز جوابی نیست.",
-                reply_markup=user_after_send_kb(),
-            )
-            return
-        # show last 5
-        lines = ["📥 جواب‌های کیان:\n"]
-        for it in items[-5:]:
-            lines.append(f"• {it.get('text', '')[:200]}")
-            lines.append(f"  _{it.get('at', '')}_")
-        await q.edit_message_text(
-            "\n".join(lines),
-            reply_markup=user_after_send_kb(),
-        )
-        return
-
-    # admin only
-    if not is_admin(user.id):
-        return
-
-    if data == "a_close":
+    if data == "close":
         await q.edit_message_text("بسته شد.")
         return
-    if data == "a_home":
+    if data == "home":
         clear_st(c)
-        await q.edit_message_text("🎛 پنل ادمین", reply_markup=admin_kb(d))
+        await q.edit_message_text("🎛 پنل ادمین", reply_markup=admin_kb())
         return
-    if data == "a_ch":
+
+    if data == "cats":
+        if not d.get("categories"):
+            await q.edit_message_text("دسته‌ای نیست.", reply_markup=admin_kb())
+            return
+        await q.edit_message_text("دسته‌ها:", reply_markup=cat_list_kb(d))
+        return
+
+    if data == "cat_new":
+        set_st(c, "new_trigger")
         await q.edit_message_text(
-            f"کانال فعلی: {d.get('channel_title')}\n<code>{d.get('channel_id')}</code>\n\n"
-            f"بات را ادمین کانال کن تا خودکار ثبت شود.",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[btn("🔙", "a_home", "primary")]]),
-        )
-        return
-    if data == "a_text":
-        set_st(c, "set_text")
-        await q.edit_message_text(
-            f"متن فعلی:\n{d.get('post_text')}\n\nمتن جدید را بفرست:",
-            reply_markup=InlineKeyboardMarkup([[btn("انصراف", "a_home", "danger")]]),
-        )
-        return
-    if data == "a_time":
-        set_st(c, "set_time")
-        await q.edit_message_text(
-            "ساعت را بفرست مثل 22:30 (وقت تهران):",
-            reply_markup=InlineKeyboardMarkup([[btn("انصراف", "a_home", "danger")]]),
-        )
-        return
-    if data == "a_on":
-        d["post_enabled"] = True
-        save(d)
-        reschedule(c.application, d)
-        await q.edit_message_text("🟢 پست روزانه روشن شد.", reply_markup=admin_kb(d))
-        return
-    if data == "a_off":
-        d["post_enabled"] = False
-        save(d)
-        await q.edit_message_text("🔴 پست روزانه خاموش شد.", reply_markup=admin_kb(d))
-        return
-    if data == "a_now":
-        ok, msg = await send_daily_post(c.bot, d, force=True)
-        await q.edit_message_text(
-            "✅ ارسال شد." if ok else f"❌ {msg}",
-            reply_markup=admin_kb(load()),
-        )
-        return
-    if data == "a_inbox":
-        n = len(d.get("bridges", {}))
-        await q.edit_message_text(
-            f"📬 پیام‌های ناشناس\n"
-            f"پل‌های فعال (برای ریپلای): حدودی در حافظه\n"
-            f"پیام‌های جدید به‌صورت فوروارد برایت می‌آیند.\n"
-            f"روی فوروارد ریپلای کن تا جواب به کاربر برود.",
-            reply_markup=InlineKeyboardMarkup([[btn("🔙", "a_home", "primary")]]),
+            "کلید دسته را بفرست (مثلاً: عکس بده)",
+            reply_markup=InlineKeyboardMarkup([[btn("انصراف", "home", "danger")]]),
         )
         return
 
+    if data.startswith("cat:"):
+        cid = data.split(":", 1)[1]
+        cat = d.get("categories", {}).get(cid)
+        if not cat:
+            await q.answer("نیست", show_alert=True)
+            return
+        n = len(cat.get("items") or [])
+        txt = (
+            f"📁 <b>{cat.get('trigger')}</b>\n"
+            f"تعداد رسانه: {n}\n"
+            f"آیدی: <code>{cid}</code>"
+        )
+        kb = InlineKeyboardMarkup([
+            [btn("➕ افزودن رسانه", f"addm:{cid}", "success")],
+            [btn("🔄 ریست دور رندوم", f"reset:{cid}", "primary")],
+            [btn("🗑 حذف دسته", f"delc:{cid}", "danger")],
+            [btn("🔙", "cats", "primary")],
+        ])
+        await q.edit_message_text(txt, parse_mode="HTML", reply_markup=kb)
+        return
 
-async def on_private(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    if data.startswith("addm:"):
+        cid = data.split(":", 1)[1]
+        set_st(c, "add_media", {"cid": cid})
+        await q.edit_message_text(
+            "عکس / ویدیو / گیف / متن را بفرست.\nچندتا پشت‌سرهم می‌توانی.\nوقتی تمام شد /panel بزن.",
+            reply_markup=InlineKeyboardMarkup([[btn("تمام", "home", "success")]]),
+        )
+        return
+
+    if data.startswith("reset:"):
+        cid = data.split(":", 1)[1]
+        if cid in d.get("categories", {}):
+            d["categories"][cid]["used_ids"] = []
+            save(d)
+        await q.answer("دور رندوم از نو")
+        await q.edit_message_text("ریست شد.", reply_markup=admin_kb())
+        return
+
+    if data.startswith("delc:"):
+        cid = data.split(":", 1)[1]
+        d.get("categories", {}).pop(cid, None)
+        save(d)
+        await q.edit_message_text("دسته حذف شد.", reply_markup=admin_kb())
+        return
+
+    if data == "bcast":
+        set_st(c, "bcast")
+        await q.edit_message_text(
+            "پیام همگانی را بفرست (متن / عکس / ویدیو با کپشن).\nبه همه گپ‌هایی که بات عضو است می‌رود.",
+            reply_markup=InlineKeyboardMarkup([[btn("انصراف", "home", "danger")]]),
+        )
+        return
+
+    if data == "admins":
+        lines = ["👤 ادمین‌ها\n"]
+        rows = []
+        for a in d.get("admins", []):
+            tag = " (اصلی)" if int(a) == ADMIN_ID else ""
+            lines.append(f"• <code>{a}</code>{tag}")
+            if int(a) != ADMIN_ID and is_main(q.from_user.id):
+                rows.append([btn(f"🗑 {a}", f"adel:{a}", "danger")])
+        if is_main(q.from_user.id):
+            rows.insert(0, [btn("➕ افزودن", "aadd", "success")])
+        rows.append([btn("🔙", "home", "primary")])
+        await q.edit_message_text("\n".join(lines), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+        return
+
+    if data == "aadd":
+        if not is_main(q.from_user.id):
+            await q.answer("فقط ادمین اصلی", show_alert=True)
+            return
+        set_st(c, "add_admin")
+        await q.edit_message_text("آیدی عددی ادمین:")
+        return
+
+    if data.startswith("adel:"):
+        if not is_main(q.from_user.id):
+            return
+        aid = int(data.split(":")[1])
+        d["admins"] = [x for x in d.get("admins", []) if int(x) != aid]
+        save(d)
+        await q.edit_message_text("حذف شد.", reply_markup=admin_kb())
+        return
+
+
+async def on_private_admin(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """پیوی: پنل ادمین یا درخواست کاربر"""
     if not u.message or u.effective_chat.type != ChatType.PRIVATE:
         return
     user = u.effective_user
     d = load()
-    text = (u.message.text or "").strip()
+    text = (u.message.text or u.message.caption or "").strip()
 
-    # admin reply to forwarded anon message
-    if is_admin(user.id) and u.message.reply_to_message:
-        rp = u.message.reply_to_message
-        # bridge by replied message id
-        b = d.get("bridges", {}).get(str(rp.message_id))
-        # also try forward origin
-        target_uid = None
-        if b:
-            target_uid = int(b["user_id"])
-        elif rp.forward_from:
-            target_uid = rp.forward_from.id
-        elif getattr(rp, "forward_origin", None):
-            fo = rp.forward_origin
-            if hasattr(fo, "sender_user") and fo.sender_user:
-                target_uid = fo.sender_user.id
-
-        if target_uid:
-            reply_text = u.message.text or u.message.caption or ""
-            try:
-                # deliver to user
-                if u.message.text:
-                    await c.bot.send_message(
-                        target_uid,
-                        "💬 کیان جوابت داد:\n\n" + u.message.text,
-                        reply_markup=user_got_reply_kb(),
-                    )
-                else:
-                    await c.bot.send_message(
-                        target_uid,
-                        "💬 کیان جوابت داد:",
-                        reply_markup=user_got_reply_kb(),
-                    )
-                    await c.bot.copy_message(target_uid, u.message.chat_id, u.message.message_id)
-                # store in user inbox
-                key = str(target_uid)
-                d.setdefault("user_replies", {}).setdefault(key, []).append({
-                    "text": reply_text or "[رسانه]",
-                    "at": datetime.now(TZ).strftime("%Y-%m-%d %H:%M"),
-                })
-                d["user_replies"][key] = d["user_replies"][key][-20:]
-                save(d)
-                await u.message.reply_text("✅ جواب برای کاربر ارسال شد.")
-            except Exception as e:
-                await u.message.reply_text(f"خطا: {e}")
-            return
-
-    # admin states
     if is_admin(user.id):
         st = get_st(c)
-        if st and st.get("kind") == "set_text":
+        if text in ("/panel", "/admin", "پنل"):
+            clear_st(c)
+            await u.message.reply_text("🎛 پنل", reply_markup=admin_kb())
+            return
+
+        if st and st.get("kind") == "new_trigger":
             if not text:
-                await u.message.reply_text("متن بفرست")
+                await u.message.reply_text("متن کلید را بفرست")
                 return
-            d["post_text"] = text
-            save(d)
-            clear_st(c)
-            await u.message.reply_text("✅ متن پست ذخیره شد.", reply_markup=admin_kb(d))
-            return
-        if st and st.get("kind") == "set_time":
-            m = re.match(r"^(\d{1,2}):(\d{2})$", text)
-            if not m:
-                await u.message.reply_text("فرمت: 22:30")
-                return
-            h, mi = int(m.group(1)), int(m.group(2))
-            if not (0 <= h <= 23 and 0 <= mi <= 59):
-                await u.message.reply_text("ساعت نامعتبر")
-                return
-            d["post_hour"], d["post_minute"] = h, mi
-            save(d)
-            clear_st(c)
-            reschedule(c.application, d)
-            await u.message.reply_text(f"✅ ساعت {h:02d}:{mi:02d} تهران", reply_markup=admin_kb(d))
-            return
-        if text in ("پنل", "/admin", "/panel"):
-            clear_st(c)
-            await u.message.reply_text("🎛 پنل", reply_markup=admin_kb(d))
-            return
-
-    # user anon flow
-    st = get_st(c)
-    if st and st.get("kind") == "anon":
-        clear_st(c)
-        # notify admin with REAL forward (admin sees identity)
-        try:
-            header = await c.bot.send_message(
-                ADMIN_ID,
-                f"📬 پیام «ناشناس» جدید\nاز: {user.full_name}\nآیدی: <code>{user.id}</code>\n"
-                f"@{user.username or '—'}\nریپلای روی پیام بعدی = جواب",
-                parse_mode="HTML",
-            )
-        except Exception:
-            header = None
-        try:
-            # forward so admin sees real user
-            sent = await c.bot.forward_message(
-                chat_id=ADMIN_ID,
-                from_chat_id=u.message.chat_id,
-                message_id=u.message.message_id,
-            )
-            d.setdefault("bridges", {})[str(sent.message_id)] = {
-                "user_id": user.id,
-                "ts": datetime.now(TZ).isoformat(),
+            cid = new_id()
+            d.setdefault("categories", {})[cid] = {
+                "trigger": text,
+                "name": text,
+                "items": [],
+                "used_ids": [],
             }
-            # cleanup old bridges
-            if len(d["bridges"]) > 500:
-                keys = list(d["bridges"].keys())[:-400]
-                for k in keys:
-                    d["bridges"].pop(k, None)
             save(d)
-        except Exception as e:
-            await u.message.reply_text(f"ارسال نشد: {e}")
+            clear_st(c)
+            set_st(c, "add_media", {"cid": cid})
+            await u.message.reply_text(
+                f"✅ دسته «{text}» ساخته شد.\nالان رسانه بفرست (عکس/ویدیو/متن).",
+                reply_markup=InlineKeyboardMarkup([[btn("تمام", "home", "success")]]),
+            )
             return
 
-        await u.message.reply_text(
-            "✅ پیام ناشناس به کیان ارسال شد.",
-            reply_markup=user_after_send_kb(),
-        )
+        if st and st.get("kind") == "add_media":
+            cid = (st.get("extra") or {}).get("cid")
+            cat = d.get("categories", {}).get(cid)
+            if not cat:
+                clear_st(c)
+                await u.message.reply_text("دسته نیست", reply_markup=admin_kb())
+                return
+            item = media_from_message(u.message)
+            if not item:
+                await u.message.reply_text("عکس/ویدیو/گیف/متن بفرست")
+                return
+            cat.setdefault("items", []).append(item)
+            save(d)
+            await u.message.reply_text(f"✅ اضافه شد. جمع: {len(cat['items'])}")
+            return
+
+        if st and st.get("kind") == "bcast":
+            clear_st(c)
+            groups = d.get("groups") or []
+            # also try known from get_chat? only stored groups
+            if not groups:
+                await u.message.reply_text("گپی ثبت نشده. بات را به گپ‌ها اضافه کن.", reply_markup=admin_kb())
+                return
+            ok, fail = 0, 0
+            for gid in list(groups):
+                try:
+                    await broadcast_one(c.bot, gid, u.message)
+                    ok += 1
+                except Exception as e:
+                    log.error("bcast %s: %s", gid, e)
+                    fail += 1
+            await u.message.reply_text(f"همگانی: ✅{ok} ❌{fail}", reply_markup=admin_kb())
+            return
+
+        if st and st.get("kind") == "add_admin" and text:
+            if not text.lstrip("-").isdigit():
+                await u.message.reply_text("آیدی عددی")
+                return
+            aid = int(text)
+            if aid not in [int(x) for x in d.get("admins", [])]:
+                d.setdefault("admins", []).append(aid)
+                save(d)
+            clear_st(c)
+            await u.message.reply_text(f"✅ ادمین {aid}", reply_markup=admin_kb())
+            return
+
+    # user or admin trigger in PM
+    if text:
+        await try_serve(u, c, d, text)
+
+
+async def on_group(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    if not u.message:
         return
-
-
-async def post_init(app: Application):
+    chat = u.effective_chat
+    if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return
     d = load()
-    reschedule(app, d)
-    await catchup_on_start(app)
+    # track group
+    if chat.id not in d.get("groups", []):
+        d.setdefault("groups", []).append(chat.id)
+        save(d)
+    text = (u.message.text or u.message.caption or "").strip()
+    if not text:
+        return
+    await try_serve(u, c, d, text)
+
+
+async def try_serve(u, c, d, text):
+    cid, score = find_best_category(d, text)
+    if not cid:
+        return
+    cat = d["categories"][cid]
+    item = pick_item(cat)
+    if not item:
+        await u.message.reply_text("این دسته هنوز رسانه ندارد.")
+        return
+    save(d)
+    try:
+        await send_item(c.bot, u.effective_chat.id, item, reply_to=u.message.message_id)
+    except Exception as e:
+        log.error(e)
+        await u.message.reply_text(f"خطا در ارسال: {e}")
+
+
+def media_from_message(msg):
+    iid = f"i{int(time.time()*1000)}{random.randint(10,99)}"
+    if msg.photo:
+        return {"id": iid, "type": "photo", "file_id": msg.photo[-1].file_id, "caption": msg.caption or ""}
+    if msg.video:
+        return {"id": iid, "type": "video", "file_id": msg.video.file_id, "caption": msg.caption or ""}
+    if msg.animation:
+        return {"id": iid, "type": "animation", "file_id": msg.animation.file_id, "caption": msg.caption or ""}
+    if msg.document:
+        return {"id": iid, "type": "document", "file_id": msg.document.file_id, "caption": msg.caption or ""}
+    if msg.text:
+        return {"id": iid, "type": "text", "text": msg.text}
+    return None
+
+
+async def broadcast_one(bot, chat_id, message):
+    if message.photo:
+        await bot.send_photo(chat_id, message.photo[-1].file_id, caption=message.caption or None)
+    elif message.video:
+        await bot.send_video(chat_id, message.video.file_id, caption=message.caption or None)
+    elif message.animation:
+        await bot.send_animation(chat_id, message.animation.file_id, caption=message.caption or None)
+    elif message.document:
+        await bot.send_document(chat_id, message.document.file_id, caption=message.caption or None)
+    elif message.text:
+        await bot.send_message(chat_id, message.text)
+    else:
+        await bot.copy_message(chat_id, message.chat_id, message.message_id)
 
 
 def main():
-    app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .post_init(post_init)
-        .build()
-    )
+    app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("admin", cmd_admin))
     app.add_handler(CommandHandler("panel", cmd_admin))
     app.add_handler(ChatMemberHandler(on_my_member, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(CallbackQueryHandler(on_cb))
-    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, on_private))
-    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.COMMAND, on_private))
-    log.info("kian bot started")
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE, on_private_admin))
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT, on_group))
+    log.info("media bank bot up")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
