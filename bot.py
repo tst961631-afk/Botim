@@ -5,13 +5,8 @@ import re
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 from telegram.constants import MessageEntityType, ParseMode
-from telegram.request import HTTPXRequest
 
 BOT_TOKEN = "8727762178:AAGrdb5XFjhkcdoOEIFy1s8U71idRpN0DX8"
-
-# اگر پروکسی داری، مثلاً:
-# PROXY = "http://127.0.0.1:10809"
-PROXY = None
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("premium_emoji")
@@ -20,7 +15,8 @@ log = logging.getLogger("premium_emoji")
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "آیدی عددی ایموجی پرمیوم را بفرست\n"
-        "یا یک پیام حاوی ایموجی پرمیوم بفرست."
+        "یا یک پیام حاوی ایموجی پرمیوم بفرست.\n\n"
+        "مثال:\n5368324170671202286"
     )
 
 
@@ -48,6 +44,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = (msg.text or "").strip()
+
     if text.startswith("/"):
         return
 
@@ -73,5 +70,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     if not BOT_TOKEN or BOT_TOKEN == "TOKEN_HERE":
         raise SystemExit("توکن را در BOT_TOKEN بگذار")
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(MessageHandler(filters.TEXT, on_text))
+    log.info("premium emoji bot up")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
-    request = HTTPX
+
+if __name__ == "__main__":
+    main()
