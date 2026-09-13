@@ -1,4 +1,14 @@
 # -*- coding: utf-8 -*-
+"""
+خروجی شبیه ربات ریافت آیدی ریکشن پرمیوم:
+بدون فوروارد پست
+برای هر ریکشن سفارشی:
+  فایل webp
+  کپشن:
+    Premium Emoji
+    Count: N
+    https://t.me/channel/msg/emoji_id
+"""
 import json
 import os
 import re
@@ -22,10 +32,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("creact")
 
 
-def D():
-    return {"posts": {}}
-
-
 def load():
     if os.path.exists(DATA):
         try:
@@ -33,9 +39,9 @@ def load():
                 d = json.load(f)
             d.setdefault("posts", {})
             return d
-        except Exception as e:
-            log.error(e)
-    return D()
+        except Exception:
+            pass
+    return {"posts": {}}
 
 
 def save(d):
@@ -60,87 +66,73 @@ def parse_link(text):
     part = m.group(2)
     msg_id = int(m.group(3))
     if private:
-        return {
-            "chat_id": int("-100" + part),
-            "username": None,
-            "message_id": msg_id,
-            "raw": text,
-        }
-    return {
-        "chat_id": None,
-        "username": part,
-        "message_id": msg_id,
-        "raw": text,
-    }
+        return {"chat_id": int("-100" + part), "username": None, "message_id": msg_id, "raw": text}
+    return {"chat_id": None, "username": part, "message_id": msg_id, "raw": text}
 
 
-def build_emoji_link(username, chat_id, msg_id, custom_emoji_id):
+def build_link(username, chat_id, msg_id, emoji_id):
     if username:
-        return "https://t.me/%s/%s/%s" % (username, msg_id, custom_emoji_id)
+        return "https://t.me/%s/%s/%s" % (username, msg_id, emoji_id)
     cid = str(chat_id).replace("-100", "")
-    return "https://t.me/c/%s/%s/%s" % (cid, msg_id, custom_emoji_id)
+    return "https://t.me/c/%s/%s/%s" % (cid, msg_id, emoji_id)
 
 
-async def send_one_custom(bot, admin_id, username, chat_id, msg_id, custom_emoji_id):
-    link = build_emoji_link(username, chat_id, msg_id, custom_emoji_id)
+async def send_premium_item(bot, admin_id, username, chat_id, msg_id, emoji_id, count):
+    link = build_link(username, chat_id, msg_id, emoji_id)
+    caption = (
+        "🎭 Premium Emoji\n"
+        "📊 Count: %s\n\n"
+        "%s" % (count if count is not None else "?", link)
+    )
+
+    stickers = []
     try:
-        stickers = await bot.get_custom_emoji_stickers(
-            custom_emoji_ids=[str(custom_emoji_id)]
-        )
+        stickers = await bot.get_custom_emoji_stickers(custom_emoji_ids=[str(emoji_id)])
     except Exception as e:
-        await bot.send_message(
-            admin_id,
-            "آیدی: <code>%s</code>\n%s\n(استیکر گرفته نشد: %s)"
-            % (custom_emoji_id, link, e),
-            parse_mode="HTML",
-        )
+        await bot.send_message(admin_id, caption + "\n\n(استیکر: %s)" % e)
         return
 
     if not stickers:
-        await bot.send_message(
-            admin_id,
-            "آیدی: <code>%s</code>\n%s\n(استیکری برنگشت)" % (custom_emoji_id, link),
-            parse_mode="HTML",
-        )
+        await bot.send_message(admin_id, caption + "\n\n(فایلی برنگشت)")
         return
 
     st = stickers[0]
+    # تلاش: فایل webp با اسم آیدی
     try:
-        await bot.send_sticker(admin_id, sticker=st.file_id)
+        f = await bot.get_file(st.file_id)
+        path = "/tmp/%s.webp" % emoji_id
+        await f.download_to_drive(path)
+        with open(path, "rb") as fp:
+            await bot.send_document(
+                admin_id,
+                document=fp,
+                filename="%s.webp" % emoji_id,
+                caption=caption,
+            )
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+        return
     except Exception:
         pass
-    await bot.send_message(admin_id, link)
 
-
-async def flush_customs(bot, post, custom_ids):
-    username = post.get("username")
-    chat_id = post.get("chat_id")
-    msg_id = post.get("message_id")
-    sent = set(post.get("sent_ids") or [])
-    new_ids = [str(i) for i in custom_ids if str(i) not in sent]
-    if not new_ids:
-        return
-
-    await bot.send_message(
-        ADMIN_ID,
-        "یافت شد %d ریکشن سفارشی برای پست %s" % (len(new_ids), post.get("link") or ""),
-    )
-    for cid in new_ids:
-        await send_one_custom(bot, ADMIN_ID, username, chat_id, msg_id, cid)
-        sent.add(str(cid))
-        post["sent_ids"] = list(sent)
-        time.sleep(0.3)
+    # فال‌بک: استیکر
+    try:
+        await bot.send_sticker(admin_id, sticker=st.file_id)
+        await bot.send_message(admin_id, caption)
+    except Exception as e:
+        await bot.send_message(admin_id, caption + "\n\n" + str(e))
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not is_admin(update.effective_user.id):
         return
     await update.message.reply_text(
-        "بات را ادمین کانال کن، بعد لینک پست را بفرست.\n"
-        "مثال:\nhttps://t.me/v8xnem/81\n\n"
-        "برای هر ریکشن سفارشی:\n"
-        "• تصویر ریکشن\n"
-        "• لینک t.me/کانال/پست/آیدی‌ایموجی"
+        "لینک پست کانال را بفرست (بات ادمین باشد).\n"
+        "مثال: https://t.me/v8xnem/81\n\n"
+        "برای هر ریکشن سفارشی می‌فرستد:\n"
+        "فایل webp + Count + لینک آیدی"
     )
 
 
@@ -164,19 +156,16 @@ async def on_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             chat = await bot.get_chat(chat_id)
             title = chat.title or str(chat_id)
-            username = chat.username
+            username = getattr(chat, "username", None)
     except Exception as e:
         await update.message.reply_text("کانال در دسترس نیست:\n%s" % e)
         return
 
+    # فقط چک دسترسی — پست را برای کاربر فوروارد نکن
     try:
-        await bot.forward_message(
-            chat_id=update.effective_chat.id,
-            from_chat_id=chat_id,
-            message_id=msg_id,
-        )
+        await bot.get_chat(chat_id)
     except Exception as e:
-        await update.message.reply_text("پست خوانده نشد (ادمین؟):\n%s" % e)
+        await update.message.reply_text("دسترسی ندارم:\n%s" % e)
         return
 
     d = load()
@@ -188,15 +177,16 @@ async def on_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "username": username,
         "title": title,
         "link": parsed["raw"],
-        "customs": {},
         "sent_ids": prev.get("sent_ids") or [],
         "added_at": time.time(),
     }
     save(d)
 
     await update.message.reply_text(
-        "✅ پست ثبت شد: %s\n<code>%s</code>\n\n"
-        "با تغییر ریکشن سفارشی، عکس + لینک می‌آید."
+        "✅ ثبت شد (بدون فوروارد پست)\n"
+        "کانال: %s\n"
+        "<code>%s</code>\n\n"
+        "با تغییر ریکشن سفارشی، webp + Count + لینک می‌آید."
         % (title, key),
         parse_mode="HTML",
     )
@@ -213,25 +203,32 @@ async def on_reaction_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not post:
         return
 
-    custom_ids = []
+    sent = set(post.get("sent_ids") or [])
+    username = post.get("username")
+    chat_id = post.get("chat_id")
+    msg_id = post.get("message_id")
+
     for rc in mrc.reactions or []:
         rt = rc.type
         kind = str(getattr(rt, "type", "") or "")
-        if kind == "custom_emoji":
-            cid = str(rt.custom_emoji_id)
-            custom_ids.append(cid)
-            post.setdefault("customs", {})[cid] = {
-                "id": cid,
-                "count": getattr(rc, "total_count", None),
-                "ts": time.time(),
-            }
-
-    if not custom_ids:
+        if kind != "custom_emoji":
+            continue
+        cid = str(rt.custom_emoji_id)
+        count = getattr(rc, "total_count", None)
+        # هر بار با count به‌روز بفرست؛ برای جلوگیری از اسپم فقط اگر جدید یا count عوض
+        prev_map = post.get("last_counts") or {}
+        if cid in sent and prev_map.get(cid) == count:
+            continue
+        await send_premium_item(
+            context.bot, ADMIN_ID, username, chat_id, msg_id, cid, count
+        )
+        sent.add(cid)
+        prev_map[cid] = count
+        post["sent_ids"] = list(sent)
+        post["last_counts"] = prev_map
         save(d)
-        return
+        time.sleep(0.25)
 
-    save(d)
-    await flush_customs(context.bot, post, custom_ids)
     save(d)
 
 
@@ -239,14 +236,12 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex("t\\.me/"), on_link))
-
     try:
         from telegram.ext import MessageReactionCountHandler
         app.add_handler(MessageReactionCountHandler(on_reaction_count))
     except Exception as e:
-        log.error("MessageReactionCountHandler: %s", e)
-
-    log.info("channel custom reaction bot up")
+        log.error("no MessageReactionCountHandler: %s", e)
+    log.info("up")
     app.run_polling(allowed_updates=["message", "message_reaction_count"])
 
 
