@@ -27,7 +27,7 @@ from telegram.ext import (
 )
 from telegram.constants import ReactionTypeType
 
-BOT_TOKEN = "TOKEN_HERE"
+BOT_TOKEN = "8727762178:AAGrdb5XFjhkcdoOEIFy1s8U71idRpN0DX8"
 ADMIN_ID = 7530457395
 DATA = "channel_react_emoji.json"
 
