@@ -677,7 +677,6 @@ def main():
     app.add_handler(CommandHandler("admin", cmd_admin))
     app.add_handler(CommandHandler("panel", cmd_admin))
     app.add_handler(CommandHandler("game", cmd_game))
-    app.add_handler(CommandHandler("بازی", cmd_game))
     app.add_handler(CallbackQueryHandler(on_cb))
     # همه متن‌ها (گپ و پیوی) — بدون ~ که روی بعضی محیط‌ها خراب می‌شود
     app.add_handler(MessageHandler(filters.TEXT, on_text))
