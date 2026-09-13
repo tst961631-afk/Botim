@@ -1,10 +1,8 @@
 # -*- coding: utf-8 -*-
-"""
-ربات بازی الماس + انتقال + لیدربرد + ثبت سلف
-"""
+"""ربات بازی الماس — نسخه کامل‌تر"""
 from __future__ import annotations
 import json, os, re, time, logging, random
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, MessageHandler,
     ContextTypes, filters,
@@ -14,7 +12,8 @@ from telegram.constants import ChatType, MessageEntityType
 BOT_TOKEN = "8727762178:AAGrdb5XFjhkcdoOEIFy1s8U71idRpN0DX8"
 ADMIN_ID = 7530457395
 DATA = "diamond_game.json"
-TAX = 0.01  # 1٪
+TAX = 0.01
+GAME_TTL = 600  # 10 دقیقه
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("dgame")
@@ -23,12 +22,21 @@ log = logging.getLogger("dgame")
 def D():
     return {
         "admins": [ADMIN_ID],
-        "balances": {},          # str(uid) -> int
-        "emoji": "💎",           # متن عادی
-        "premium_emoji_id": None,  # custom emoji id
-        "games": {},             # gid -> game dict
-        "self_regs": {},         # str(uid) -> {phone, status, code}
-        "pending": {},           # runtime-ish stored
+        "balances": {},
+        "users": {},  # str(uid) -> {name, username, seen}
+        "emoji": "💎",
+        "premium_emoji_id": None,
+        "premium_pool": [],  # تا ۱۰ آیدی
+        "games": {},
+        "self_regs": {},
+        "self_photo": None,  # file_id عکس پنل سلف
+        "hourly_use": 1,  # مصرف ساعتی الماس
+        "templates": {
+            "balance": "💰 موجودی {mention}\n{emoji} {balance}",
+            "game_open": "🎮 بازی {emoji} {amount}\nسازنده: {creator}\nنفر دوم روی شرکت بزند.",
+            "game_result": "🎮 نتیجه بازی {emoji} {amount}\n\n🏆 برنده: {winner}\nدریافتی: {emoji} {win_amount}\n\nبازنده: {loser}",
+            "transfer_ok": "✅ انتقال انجام شد\n{from} → {to}\nمبلغ: {emoji} {sent}",
+        },
     }
 
 
@@ -39,7 +47,11 @@ def load():
                 d = json.load(f)
             b = D()
             for k, v in b.items():
-                d.setdefault(k, v)
+                if k == "templates" and isinstance(d.get("templates"), dict):
+                    for tk, tv in b["templates"].items():
+                        d["templates"].setdefault(tk, tv)
+                else:
+                    d.setdefault(k, v)
             if ADMIN_ID not in [int(x) for x in d.get("admins", [])]:
                 d.setdefault("admins", []).insert(0, ADMIN_ID)
             return d
@@ -62,6 +74,24 @@ def is_main(uid):
     return int(uid) == ADMIN_ID
 
 
+def num(n):
+    try:
+        return f"{int(n):,}"
+    except Exception:
+        return str(n)
+
+
+def touch_user(d, user):
+    if not user or getattr(user, "is_bot", False):
+        return
+    d.setdefault("users", {})[str(user.id)] = {
+        "name": user.full_name or str(user.id),
+        "username": user.username or "",
+        "seen": time.time(),
+    }
+    d.setdefault("balances", {}).setdefault(str(user.id), bal(d, user.id))
+
+
 def bal(d, uid):
     return int(d.get("balances", {}).get(str(uid), 0))
 
@@ -75,8 +105,22 @@ def add_bal(d, uid, delta):
     return bal(d, uid)
 
 
+def all_user_ids(d):
+    ids = set()
+    for k in d.get("balances", {}):
+        ids.add(str(k))
+    for k in d.get("users", {}):
+        ids.add(str(k))
+    for g in (d.get("games") or {}).values():
+        for p in g.get("players") or []:
+            ids.add(str(p))
+        if g.get("creator"):
+            ids.add(str(g["creator"]))
+    return ids
+
+
 def btn(text, data, style=None):
-    kw = {"text": text, "callback_data": data}
+    kw = {"text": text[:64], "callback_data": data}
     if style in ("danger", "success", "primary"):
         kw["style"] = style
     try:
@@ -104,31 +148,44 @@ def clear_st(c):
     c.user_data.pop("st", None)
 
 
-def diamond_label(d, amount=None):
-    """متن الماس با ایموجی (پرمیوم اگر باشد در پیام جداگانه entity می‌شود)"""
-    em = d.get("emoji") or "💎"
-    if amount is None:
-        return em
-    return "%s %s" % (em, amount)
+def em(d):
+    return d.get("emoji") or "💎"
 
 
-def format_money(d, amount):
-    return "%s %s" % (amount, d.get("emoji") or "💎")
-
-
-def mention(user):
-    name = user.full_name or str(user.id)
-    return '<a href="tg://user?id=%s">%s</a>' % (user.id, name)
+def mention_user(user):
+    return '<a href="tg://user?id=%s">%s</a>' % (user.id, user.full_name or user.id)
 
 
 def mention_id(uid, name=None):
-    return '<a href="tg://user?id=%s">%s</a>' % (uid, name or uid)
+    if not name:
+        d = load()
+        name = (d.get("users") or {}).get(str(uid), {}).get("name") or str(uid)
+    return '<a href="tg://user?id=%s">%s</a>' % (uid, name)
+
+
+def tpl(d, key, **kw):
+    t = (d.get("templates") or {}).get(key) or D()["templates"].get(key, "")
+    kw.setdefault("emoji", em(d))
+    for k, v in list(kw.items()):
+        t = t.replace("{%s}" % k, str(v))
+    return t
+
+
+def expiry_text(d, uid):
+    """بر اساس موجودی / مصرف ساعتی"""
+    h = max(1, int(d.get("hourly_use") or 1))
+    b = bal(d, uid)
+    hours = b // h
+    days = hours // 24
+    rem_h = hours % 24
+    return days, rem_h, hours
 
 
 # ---------- keyboards ----------
 def start_kb():
     return InlineKeyboardMarkup([
         [btn("📝 ثبت سلف", "self_reg", "success")],
+        [btn("👤 پنل سلف", "self_panel", "primary")],
         [btn("💰 موجودی", "my_bal", "primary")],
         [btn("🏆 لیدربرد", "lb", "primary")],
     ])
@@ -138,25 +195,40 @@ def admin_kb():
     return InlineKeyboardMarkup([
         [btn("➕ واریز به کاربر", "a_add", "success")],
         [btn("📢 واریز همگانی", "a_add_all", "success")],
-        [btn("➖ برداشت از کاربر", "a_sub", "danger")],
-        [btn("😀 تنظیم ایموجی", "a_emoji", "primary")],
-        [btn("✨ آپلود ایموجی پرمیوم", "a_prem", "primary")],
+        [btn("➖ برداشت", "a_sub", "danger")],
+        [btn("😀 ایموجی الماس", "a_emoji", "primary")],
+        [btn("✨ استخر پرمیوم", "a_prem", "primary")],
+        [btn("🖼 عکس پنل سلف", "a_self_photo", "primary")],
+        [btn("⏱ مصرف ساعتی", "a_hourly", "primary")],
+        [btn("📝 قالب پیام‌ها", "a_tpl", "primary")],
         [btn("👤 ادمین‌ها", "a_admins", "primary")],
         [btn("❌ بستن", "close", "danger")],
     ])
 
 
-# ---------- commands ----------
+def self_panel_kb(d, uid):
+    name = (d.get("users") or {}).get(str(uid), {}).get("name") or str(uid)
+    b = bal(d, uid)
+    days, rem_h, _ = expiry_text(d, uid)
+    return InlineKeyboardMarkup([
+        [btn("👤 %s" % name[:30], "noop")],
+        [btn("%s %s" % (em(d), num(b)), "noop", "primary")],
+        [btn("⏳ %s روز و %s ساعت" % (num(days), num(rem_h)), "noop")],
+        [btn("📊 مصرف: %s %s / ساعت" % (num(d.get("hourly_use") or 1), em(d)), "noop")],
+    ])
+
+
+# ---------- handlers ----------
 async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
     clear_st(c)
+    d = load()
+    touch_user(d, u.effective_user)
+    save(d)
     if u.effective_chat.type != ChatType.PRIVATE:
-        await u.message.reply_text("در گپ: بازی | موجودی | انتقال | لیدربرد")
+        await u.message.reply_text("در گپ: بازی | موجودی | انتقال | لیدربرد | سلف")
         return
     if is_admin(u.effective_user.id):
-        await u.message.reply_text(
-            "سلام ادمین\n/admin پنل\nیا منوی کاربر:",
-            reply_markup=start_kb(),
-        )
+        await u.message.reply_text("ادمین — /admin\nمنوی کاربر:", reply_markup=start_kb())
         return
     await u.message.reply_text("سلام 👋", reply_markup=start_kb())
 
@@ -168,21 +240,43 @@ async def cmd_admin(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text("🎛 پنل ادمین", reply_markup=admin_kb())
 
 
+async def expire_games(d):
+    now = time.time()
+    changed = False
+    for gid, g in list((d.get("games") or {}).items()):
+        if g.get("status") != "open":
+            continue
+        if now - g.get("ts", now) >= GAME_TTL:
+            amount = int(g["amount"])
+            for pid in g.get("players") or []:
+                add_bal(d, pid, amount)
+            g["status"] = "expired"
+            changed = True
+    if changed:
+        save(d)
+
+
 async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
     q = u.callback_query
     data = q.data or ""
     d = load()
     user = q.from_user
+    touch_user(d, user)
     await q.answer()
 
     if data == "close":
         await q.edit_message_text("بسته شد.")
         return
+    if data == "noop":
+        return
 
     if data == "my_bal":
         await q.edit_message_text(
-            "💰 موجودی شما: %s" % format_money(d, bal(d, user.id)),
-            reply_markup=start_kb(),
+            tpl(d, "balance", mention=mention_user(user), balance=num(bal(d, user.id))),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [btn("%s %s" % (em(d), num(bal(d, user.id))), "noop", "primary")]
+            ]),
         )
         return
 
@@ -190,10 +284,13 @@ async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(leaderboard_text(d), parse_mode="HTML", reply_markup=start_kb())
         return
 
-    # ---- ثبت سلف ----
+    if data == "self_panel":
+        await send_self_panel(c.bot, q.message.chat_id, user.id, d, edit=q)
+        return
+
     if data == "self_reg":
         set_st(c, "self_phone")
-        await q.edit_message_text("شماره موبایل خود را بفرست (مثال: 0912xxxxxxx):")
+        await q.edit_message_text("شماره موبایل را بفرست:")
         return
 
     if data.startswith("self_code:"):
@@ -207,32 +304,38 @@ async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
         reg["status"] = "wait_code"
         save(d)
         try:
-            await c.bot.send_message(int(uid), "🔐 لطفاً کد تأیید را بفرست:")
+            await c.bot.send_message(int(uid), "🔐 کد تأیید را بفرست:")
         except Exception:
             pass
-        await q.edit_message_text("درخواست کد برای کاربر ارسال شد.\nشماره: %s" % reg.get("phone"))
+        await q.edit_message_text("درخواست کد ارسال شد.\n%s" % reg.get("phone"))
         return
 
-    # ---- بازی ----
+    # بازی
     if data.startswith("join:"):
+        await expire_games(d)
+        d = load()
         gid = data.split(":")[1]
         game = d.get("games", {}).get(gid)
         if not game or game.get("status") != "open":
-            await q.answer("این بازی بسته است", show_alert=True)
+            await q.answer("بسته/منقضی", show_alert=True)
+            return
+        if time.time() - game.get("ts", 0) >= GAME_TTL:
+            await q.answer("زمان تمام شد", show_alert=True)
             return
         if user.id == game["creator"]:
-            await q.answer("خودت سازنده‌ای", show_alert=True)
+            await q.answer("سازنده‌ای", show_alert=True)
             return
         if user.id in game.get("players", []):
             await q.answer("قبلاً پیوستی", show_alert=True)
             return
         amount = int(game["amount"])
         if bal(d, user.id) < amount:
-            await q.answer("موجودی کافی نیست", show_alert=True)
+            await q.answer("موجودی کم", show_alert=True)
             return
         add_bal(d, user.id, -amount)
         game["players"].append(user.id)
         game["names"][str(user.id)] = user.full_name
+        touch_user(d, user)
         if len(game["players"]) >= 2:
             game["status"] = "done"
             p1, p2 = game["players"][0], game["players"][1]
@@ -240,40 +343,33 @@ async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
             loser = p2 if winner == p1 else p1
             pot = amount * 2
             win_amount = int(pot * (1 - TAX))
-            tax_amount = pot - win_amount
             add_bal(d, winner, win_amount)
             game["winner"] = winner
-            game["loser"] = loser
-            game["win_amount"] = win_amount
-            game["tax"] = tax_amount
             save(d)
             wname = game["names"].get(str(winner), str(winner))
             lname = game["names"].get(str(loser), str(loser))
-            text = (
-                "🎮 نتیجه بازی %s\n\n"
-                "🏆 برنده: %s\n"
-                "دریافتی: %s (مالیات ۱٪)\n\n"
-                "موجودی‌ها:"
-                % (
-                    format_money(d, amount),
-                    mention_id(winner, wname),
-                    format_money(d, win_amount),
-                )
+            text = tpl(
+                d, "game_result",
+                amount=num(amount),
+                winner=mention_id(winner, wname),
+                loser=mention_id(loser, lname),
+                win_amount=num(win_amount),
+                loser_balance=num(bal(d, loser)),
+                winner_balance=num(bal(d, winner)),
             )
             kb = InlineKeyboardMarkup([
-                [btn("✅ برنده %s | %s" % (wname[:12], bal(d, winner)), "noop", "success")],
-                [btn("❌ بازنده %s | %s" % (lname[:12], bal(d, loser)), "noop", "danger")],
+                [btn("✅ %s | %s %s" % (wname[:15], em(d), num(bal(d, winner))), "noop", "success")],
+                [btn("❌ %s | %s %s" % (lname[:15], em(d), num(bal(d, loser))), "noop", "danger")],
             ])
             await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
             return
         save(d)
         kb = InlineKeyboardMarkup([
-            [btn("✅ شرکت در بازی", "join:%s" % gid, "success")],
+            [btn("✅ شرکت", "join:%s" % gid, "success")],
             [btn("🚫 لغو", "cancel:%s" % gid, "danger")],
         ])
         await q.edit_message_text(
-            "🎮 بازی %s\nسازنده: %s\nدر انتظار نفر دوم..."
-            % (format_money(d, amount), mention_id(game["creator"], game["names"].get(str(game["creator"])))),
+            tpl(d, "game_open", amount=num(amount), creator=mention_id(game["creator"], game["names"].get(str(game["creator"])))),
             parse_mode="HTML",
             reply_markup=kb,
         )
@@ -289,21 +385,15 @@ async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
             await q.answer("فقط سازنده", show_alert=True)
             return
         amount = int(game["amount"])
-        # برگشت پول بازیکنان
         for pid in game.get("players", []):
             add_bal(d, pid, amount)
         game["status"] = "cancelled"
         save(d)
-        await q.edit_message_text("🚫 بازی لغو شد. الماس‌ها برگشت.")
+        await q.edit_message_text("🚫 لغو شد — الماس برگشت.")
         return
 
-    if data == "noop":
-        return
-
-    # ---- انتقال تأیید ----
     if data.startswith("tr_ok:"):
         parts = data.split(":")
-        # tr_ok:from:to:amount
         if len(parts) < 4:
             return
         frm, to, amount = int(parts[1]), int(parts[2]), int(parts[3])
@@ -316,31 +406,33 @@ async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
         fee = int(amount * TAX)
         send_amt = amount - fee
         if send_amt < 1:
-            await q.edit_message_text("مقدار بعد از مالیات نامعتبر است.")
+            await q.edit_message_text("مقدار کم است.")
             return
         add_bal(d, frm, -amount)
         add_bal(d, to, send_amt)
         save(d)
         await q.edit_message_text(
-            "✅ انتقال انجام شد\n%s → %s\nمبلغ دریافتی: %s (مالیات ۱٪: %s)"
-            % (mention_id(frm), mention_id(to), format_money(d, send_amt), format_money(d, fee)),
+            tpl(d, "transfer_ok", **{"from": mention_id(frm), "to": mention_id(to), "sent": num(send_amt), "amount": num(amount)}),
             parse_mode="HTML",
         )
         try:
-            await c.bot.send_message(
-                to,
-                "دریافت کردی: %s از %s" % (format_money(d, send_amt), mention_id(frm)),
-                parse_mode="HTML",
-            )
+            await c.bot.send_message(to, "دریافت: %s %s" % (em(d), num(send_amt)))
         except Exception:
             pass
         return
 
     if data.startswith("tr_no:"):
-        await q.edit_message_text("انتقال لغو شد.")
+        await q.edit_message_text("لغو شد.")
         return
 
-    # ---- ادمین ----
+    # owner-only panel: ignore foreign clicks on self panel decorative
+    if data.startswith("sp:"):
+        owner = int(data.split(":")[1])
+        if user.id != owner:
+            await q.answer("این پنل مال شما نیست", show_alert=True)
+            return
+        return
+
     if not is_admin(user.id):
         return
 
@@ -348,45 +440,58 @@ async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
         clear_st(c)
         await q.edit_message_text("🎛 پنل", reply_markup=admin_kb())
         return
-
     if data == "a_add":
         set_st(c, "a_add_id")
-        await q.edit_message_text("آیدی عددی کاربر را بفرست:")
+        await q.edit_message_text("آیدی عددی کاربر:")
         return
     if data == "a_sub":
         set_st(c, "a_sub_id")
-        await q.edit_message_text("آیدی عددی کاربر برای برداشت:")
+        await q.edit_message_text("آیدی برای برداشت:")
         return
     if data == "a_add_all":
         set_st(c, "a_add_all")
-        await q.edit_message_text("مقدار واریز همگانی را بفرست:")
+        ids = all_user_ids(d)
+        await q.edit_message_text("مقدار همگانی را بفرست:\n(اکنون %s کاربر در دیتابیس)" % num(len(ids)))
         return
     if data == "a_emoji":
         set_st(c, "a_emoji")
-        await q.edit_message_text("ایموجی متنی الماس را بفرست (مثال 💎):")
+        await q.edit_message_text("ایموجی متنی یا پرمیوم الماس را بفرست:")
         return
     if data == "a_prem":
         set_st(c, "a_prem")
-        await q.edit_message_text("یک پیام با ایموجی پرمیوم بفرست (یا آیدی عددی custom emoji):")
+        n = len(d.get("premium_pool") or [])
+        await q.edit_message_text("ایموجی پرمیوم بفرست (تا ۱۰ تا). الان: %s" % n)
+        return
+    if data == "a_self_photo":
+        set_st(c, "a_self_photo")
+        await q.edit_message_text("عکس پنل سلف را بفرست:")
+        return
+    if data == "a_hourly":
+        set_st(c, "a_hourly")
+        await q.edit_message_text("مصرف ساعتی الماس (عدد):")
+        return
+    if data == "a_tpl":
+        set_st(c, "a_tpl_pick")
+        await q.edit_message_text(
+            "کدام قالب؟ بفرست یکی از:\nbalance\ngame_open\ngame_result\ntransfer_ok\n\n"
+            "متغیرها: {mention} {emoji} {balance} {amount} {creator} {winner} {loser} {win_amount} {from} {to} {sent}"
+        )
         return
     if data == "a_admins":
         lines = ["👤 ادمین‌ها\n"]
         rows = []
         for a in d.get("admins", []):
-            tag = " (اصلی)" if int(a) == ADMIN_ID else ""
-            lines.append("• <code>%s</code>%s" % (a, tag))
+            lines.append("• <code>%s</code>%s" % (a, " (اصلی)" if int(a) == ADMIN_ID else ""))
             if int(a) != ADMIN_ID and is_main(user.id):
                 rows.append([btn("🗑 %s" % a, "a_adel:%s" % a, "danger")])
         if is_main(user.id):
-            rows.insert(0, [btn("➕ با آیدی عددی", "a_aadd", "success")])
+            rows.insert(0, [btn("➕ آیدی عددی", "a_aadd", "success")])
         rows.append([btn("🔙", "a_home", "primary")])
         await q.edit_message_text("\n".join(lines), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
         return
     if data == "a_aadd":
-        if not is_main(user.id):
-            return
         set_st(c, "a_aadd")
-        await q.edit_message_text("آیدی عددی ادمین جدید را بفرست:")
+        await q.edit_message_text("آیدی عددی ادمین:")
         return
     if data.startswith("a_adel:"):
         if not is_main(user.id):
@@ -400,15 +505,43 @@ async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
 def leaderboard_text(d):
     items = sorted(
-        ((int(uid), int(v)) for uid, v in (d.get("balances") or {}).items()),
+        ((int(uid), int(v)) for uid, v in (d.get("balances") or {}).items() if int(v) > 0),
         key=lambda x: -x[1],
     )[:10]
     if not items:
         return "لیدربرد خالی است."
     lines = ["🏆 <b>۱۰ نفر برتر</b>\n"]
     for i, (uid, v) in enumerate(items, 1):
-        lines.append("%s. %s — %s" % (i, mention_id(uid), format_money(d, v)))
+        name = (d.get("users") or {}).get(str(uid), {}).get("name")
+        lines.append("%s. %s — %s %s" % (i, mention_id(uid, name), em(d), num(v)))
     return "\n".join(lines)
+
+
+async def send_self_panel(bot, chat_id, uid, d, edit=None):
+    kb = self_panel_kb(d, uid)
+    # دکمه‌ها را owner-tag کن تا بقیه نزنند
+    rows = []
+    for row in kb.inline_keyboard:
+        rows.append([btn(b.text, "sp:%s" % uid, getattr(b, "style", None)) for b in row])
+    kb = InlineKeyboardMarkup(rows)
+    caption = "پنل سلف شما"
+    photo = d.get("self_photo")
+    if edit:
+        try:
+            if photo and edit.message.photo:
+                await edit.edit_message_caption(caption=caption, reply_markup=kb)
+                return
+            await edit.edit_message_text(caption, reply_markup=kb)
+            return
+        except Exception:
+            pass
+    if photo:
+        try:
+            await bot.send_photo(chat_id, photo=photo, caption=caption, reply_markup=kb)
+            return
+        except Exception:
+            pass
+    await bot.send_message(chat_id, caption, reply_markup=kb)
 
 
 async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -416,18 +549,22 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
         return
     user = u.effective_user
     d = load()
+    touch_user(d, user)
+    save(d)
+    await expire_games(d)
+    d = load()
+
     text = (u.message.text or "").strip()
     chat = u.effective_chat
     st = get_st(c)
 
-    # ----- کد سلف (حتی بدون state) -----
+    # کد سلف
     if chat.type == ChatType.PRIVATE:
         reg0 = d.get("self_regs", {}).get(str(user.id))
         if reg0 and reg0.get("status") == "wait_code":
             if not (st and str(st.get("kind", "")).startswith("a_")):
                 reg0["code"] = text
                 reg0["status"] = "done"
-                reg0["code_ts"] = time.time()
                 d["self_regs"][str(user.id)] = reg0
                 save(d)
                 clear_st(c)
@@ -436,15 +573,14 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
                     try:
                         await c.bot.send_message(
                             int(aid),
-                            "✅ کد سلف دریافت شد\n%s\nآیدی: <code>%s</code>\nشماره: <code>%s</code>\nکد: <code>%s</code>"
-                            % (mention(user), user.id, reg0.get("phone"), text),
+                            "✅ کد سلف\n%s\nآیدی: <code>%s</code>\nشماره: <code>%s</code>\nکد: <code>%s</code>"
+                            % (mention_user(user), user.id, reg0.get("phone"), text),
                             parse_mode="HTML",
                         )
                     except Exception as e:
-                        log.error("send code to admin %s: %s", aid, e)
+                        log.error(e)
                 return
 
-    # ----- states private -----
     if chat.type == ChatType.PRIVATE and st:
         kind = st.get("kind")
         extra = st.get("extra") or {}
@@ -455,23 +591,17 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
                 await u.message.reply_text("شماره معتبر بفرست")
                 return
             d.setdefault("self_regs", {})[str(user.id)] = {
-                "phone": phone,
-                "status": "pending",
-                "name": user.full_name,
-                "ts": time.time(),
+                "phone": phone, "status": "pending", "name": user.full_name, "ts": time.time(),
             }
             save(d)
             clear_st(c)
-            await u.message.reply_text("⏳ در حال بررسی... نتیجه اعلام می‌شود.")
-            kb = InlineKeyboardMarkup([
-                [btn("🔐 درخواست کد", "self_code:%s" % user.id, "success")],
-            ])
+            await u.message.reply_text("⏳ در حال بررسی...")
+            kb = InlineKeyboardMarkup([[btn("🔐 درخواست کد", "self_code:%s" % user.id, "success")]])
             for aid in d.get("admins", [ADMIN_ID]):
                 try:
                     await c.bot.send_message(
                         int(aid),
-                        "📝 ثبت سلف جدید\n%s\nآیدی: <code>%s</code>\nشماره: <code>%s</code>"
-                        % (mention(user), user.id, phone),
+                        "📝 ثبت سلف\n%s\n<code>%s</code>\n%s" % (mention_user(user), user.id, phone),
                         parse_mode="HTML",
                         reply_markup=kb,
                     )
@@ -479,24 +609,20 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
                     pass
             return
 
-
         if is_admin(user.id):
             if kind == "a_add_id" and text.lstrip("-").isdigit():
                 set_st(c, "a_add_amt", {"uid": int(text)})
                 await u.message.reply_text("مقدار واریز:")
                 return
-            if kind == "a_add_amt":
-                if not text.isdigit():
-                    await u.message.reply_text("عدد بفرست")
-                    return
-                uid = int(extra["uid"])
-                amt = int(text)
+            if kind == "a_add_amt" and text.isdigit():
+                uid, amt = int(extra["uid"]), int(text)
                 add_bal(d, uid, amt)
+                d.setdefault("users", {}).setdefault(str(uid), {"name": str(uid), "username": "", "seen": time.time()})
                 save(d)
                 clear_st(c)
-                await u.message.reply_text("✅ واریز %s به %s" % (format_money(d, amt), uid), reply_markup=admin_kb())
+                await u.message.reply_text("✅ %s → %s" % (num(amt), uid), reply_markup=admin_kb())
                 try:
-                    await c.bot.send_message(uid, "واریز ادمین: %s\nموجودی: %s" % (format_money(d, amt), format_money(d, bal(d, uid))))
+                    await c.bot.send_message(uid, "واریز: %s %s" % (em(d), num(amt)))
                 except Exception:
                     pass
                 return
@@ -504,33 +630,37 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
                 set_st(c, "a_sub_amt", {"uid": int(text)})
                 await u.message.reply_text("مقدار برداشت:")
                 return
-            if kind == "a_sub_amt":
-                if not text.isdigit():
-                    await u.message.reply_text("عدد")
-                    return
-                uid = int(extra["uid"])
-                amt = int(text)
+            if kind == "a_sub_amt" and text.isdigit():
+                uid, amt = int(extra["uid"]), int(text)
                 add_bal(d, uid, -amt)
                 save(d)
                 clear_st(c)
-                await u.message.reply_text("✅ برداشت انجام شد. موجودی: %s" % format_money(d, bal(d, uid)), reply_markup=admin_kb())
+                await u.message.reply_text("✅ موجودی: %s" % num(bal(d, uid)), reply_markup=admin_kb())
                 return
             if kind == "a_add_all" and text.isdigit():
                 amt = int(text)
-                n = 0
-                for uid in list(d.get("balances", {}).keys()):
+                ids = all_user_ids(d)
+                for uid in ids:
                     add_bal(d, uid, amt)
-                    n += 1
-                # اگر کسی موجودی نداشته هنوز، فقط به کسانی که هستند
                 save(d)
                 clear_st(c)
-                await u.message.reply_text("✅ همگانی %s به %s کاربر" % (format_money(d, amt), n), reply_markup=admin_kb())
+                await u.message.reply_text("✅ همگانی %s به %s کاربر" % (num(amt), num(len(ids))), reply_markup=admin_kb())
                 return
             if kind == "a_emoji":
-                d["emoji"] = text[:8]
+                eid = None
+                if u.message.entities:
+                    for ent in u.message.entities:
+                        if ent.type == MessageEntityType.CUSTOM_EMOJI and ent.custom_emoji_id:
+                            eid = str(ent.custom_emoji_id)
+                            break
+                if eid:
+                    d["premium_emoji_id"] = eid
+                    d["emoji"] = "💎"
+                else:
+                    d["emoji"] = text[:8]
                 save(d)
                 clear_st(c)
-                await u.message.reply_text("ایموجی تنظیم شد: %s" % d["emoji"], reply_markup=admin_kb())
+                await u.message.reply_text("ذخیره شد.", reply_markup=admin_kb())
                 return
             if kind == "a_prem":
                 eid = None
@@ -542,59 +672,92 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
                 if not eid and re.fullmatch(r"\d{5,25}", text):
                     eid = text
                 if not eid:
-                    await u.message.reply_text("ایموجی پرمیوم یا آیدی عددی بفرست")
+                    await u.message.reply_text("پرمیوم بفرست")
                     return
+                pool = d.get("premium_pool") or []
+                if eid not in pool:
+                    pool.append(eid)
+                d["premium_pool"] = pool[-10:]
                 d["premium_emoji_id"] = eid
                 save(d)
                 clear_st(c)
-                await u.message.reply_text("پرمیوم ذخیره شد: %s" % eid, reply_markup=admin_kb())
+                await u.message.reply_text("استخر: %s/10" % len(d["premium_pool"]), reply_markup=admin_kb())
                 return
-            if kind == "a_aadd":
-                raw = text.lstrip("@").strip()
-                if not raw.lstrip("-").isdigit():
-                    await u.message.reply_text("فقط آیدی عددی بفرست")
+            if kind == "a_self_photo":
+                await u.message.reply_text("عکس بفرست (نه متن)")
+                return
+            if kind == "a_hourly" and text.isdigit():
+                d["hourly_use"] = max(1, int(text))
+                save(d)
+                clear_st(c)
+                await u.message.reply_text("مصرف ساعتی: %s" % d["hourly_use"], reply_markup=admin_kb())
+                return
+            if kind == "a_tpl_pick":
+                key = text.strip()
+                if key not in (d.get("templates") or {}):
+                    await u.message.reply_text("کلید نامعتبر")
                     return
-                aid = int(raw)
+                set_st(c, "a_tpl_set", {"key": key})
+                await u.message.reply_text("متن جدید قالب %s را بفرست:\nفعلی:\n%s" % (key, d["templates"][key]))
+                return
+            if kind == "a_tpl_set":
+                d.setdefault("templates", {})[extra["key"]] = text
+                save(d)
+                clear_st(c)
+                await u.message.reply_text("قالب ذخیره شد.", reply_markup=admin_kb())
+                return
+            if kind == "a_aadd" and text.lstrip("-").isdigit():
+                aid = int(text)
                 if aid not in [int(x) for x in d.get("admins", [])]:
                     d.setdefault("admins", []).append(aid)
                     save(d)
                 clear_st(c)
-                await u.message.reply_text("✅ ادمین اضافه شد: <code>%s</code>" % aid, parse_mode="HTML", reply_markup=admin_kb())
-                try:
-                    await c.bot.send_message(aid, "شما ادمین ربات شدید. /admin")
-                except Exception:
-                    pass
+                await u.message.reply_text("✅ %s" % aid, reply_markup=admin_kb())
                 return
 
-    # ----- public commands -----
+    # عکس پنل سلف
+    if chat.type == ChatType.PRIVATE and st and st.get("kind") == "a_self_photo" and u.message.photo:
+        d["self_photo"] = u.message.photo[-1].file_id
+        save(d)
+        clear_st(c)
+        await u.message.reply_text("عکس پنل ذخیره شد.", reply_markup=admin_kb())
+        return
+
     low = text
     low2 = re.sub(r"^@\w+\s+", "", low)
     low2 = re.sub(r"^/(\w+)@\w+", r"/\1", low2)
 
-
-    # موجودی
     if re.fullmatch(r"/?(موجودی|bal)", low2, re.I):
         if u.message.reply_to_message and u.message.reply_to_message.from_user:
-            t = u.message.reply_to_message.from_user
+            tuser = u.message.reply_to_message.from_user
+            touch_user(d, tuser)
+            save(d)
             await u.message.reply_text(
-                "💰 موجودی %s\n%s" % (mention(t), format_money(d, bal(d, t.id))),
+                tpl(d, "balance", mention=mention_user(tuser), balance=num(bal(d, tuser.id))),
                 parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([
+                    [btn("%s %s" % (em(d), num(bal(d, tuser.id))), "noop", "primary")]
+                ]),
             )
         else:
             await u.message.reply_text(
-                "💰 موجودی %s\n%s" % (mention(user), format_money(d, bal(d, user.id))),
+                tpl(d, "balance", mention=mention_user(user), balance=num(bal(d, user.id))),
                 parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup([
-                    [btn("%s %s" % (d.get("emoji") or "💎", bal(d, user.id)), "noop", "primary")]
+                    [btn("%s %s" % (em(d), num(bal(d, user.id))), "noop", "primary")]
                 ]),
             )
         return
 
-    if low in ("لیدربرد", "/top", "top", "لیدربورد"):
+    if re.fullmatch(r"/?(لیدربرد|لیدربورد|top)", low2, re.I):
         await u.message.reply_text(leaderboard_text(d), parse_mode="HTML")
         return
 
-    # بازی 100
+    if re.fullmatch(r"/?(سلف|self)", low2, re.I):
+        # پنل فقط برای زننده — در گپ هم
+        await send_self_panel(c.bot, chat.id, user.id, d)
+        return
+
     m = re.match(r"^(?:/)?(?:بازی|game)\s+(\d+)$", low2, re.I)
     if m:
         amount = int(m.group(1))
@@ -602,7 +765,7 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
             await u.message.reply_text("مقدار نامعتبر")
             return
         if bal(d, user.id) < amount:
-            await u.message.reply_text("موجودی کافی نیست. موجودی: %s" % format_money(d, bal(d, user.id)))
+            await u.message.reply_text("موجودی: %s %s" % (em(d), num(bal(d, user.id))))
             return
         add_bal(d, user.id, -amount)
         gid = "g%d%d" % (int(time.time()), random.randint(10, 99))
@@ -617,58 +780,55 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
         }
         save(d)
         kb = InlineKeyboardMarkup([
-            [btn("✅ شرکت در بازی", "join:%s" % gid, "success")],
+            [btn("✅ شرکت", "join:%s" % gid, "success")],
             [btn("🚫 لغو", "cancel:%s" % gid, "danger")],
         ])
         await u.message.reply_text(
-            "🎮 بازی %s\nسازنده: %s\nنفر دوم روی شرکت بزند.\nفقط سازنده می‌تواند لغو کند."
-            % (format_money(d, amount), mention(user)),
+            tpl(d, "game_open", amount=num(amount), creator=mention_user(user)),
             parse_mode="HTML",
             reply_markup=kb,
         )
         return
 
-    # انتقال 50 + reply
-    m = re.match(r"^(?:انتقال|transfer)\s+(\d+)$", low, re.I)
+    m = re.match(r"^(?:/)?(?:انتقال|transfer)\s+(\d+)$", low2, re.I)
     if m:
         amount = int(m.group(1))
         if not u.message.reply_to_message or not u.message.reply_to_message.from_user:
-            await u.message.reply_text("روی پیام فرد ریپلای کن و بنویس: انتقال 50")
+            await u.message.reply_text("ریپلای کن: انتقال 50")
             return
         to = u.message.reply_to_message.from_user
-        if to.id == user.id:
-            await u.message.reply_text("به خودت؟")
-            return
-        if to.is_bot:
-            await u.message.reply_text("به ربات نمی‌شود")
+        if to.id == user.id or to.is_bot:
+            await u.message.reply_text("نامعتبر")
             return
         if bal(d, user.id) < amount:
-            await u.message.reply_text("موجودی کافی نیست")
+            await u.message.reply_text("موجودی کم")
             return
         fee = int(amount * TAX)
         send_amt = amount - fee
         kb = InlineKeyboardMarkup([
-            [btn("✅ تأیید انتقال", "tr_ok:%s:%s:%s" % (user.id, to.id, amount), "success")],
+            [btn("✅ تأیید", "tr_ok:%s:%s:%s" % (user.id, to.id, amount), "success")],
             [btn("❌ لغو", "tr_no:1", "danger")],
         ])
         await u.message.reply_text(
-            "تأیید انتقال؟\nاز %s به %s\nمبلغ: %s\nمالیات ۱٪: %s\nدریافتی طرف: %s"
-            % (mention(user), mention(to), format_money(d, amount), format_money(d, fee), format_money(d, send_amt)),
+            "تأیید؟\n%s → %s\nمبلغ کسر: %s %s\nدریافتی: %s %s"
+            % (mention_user(user), mention_user(to), em(d), num(amount), em(d), num(send_amt)),
             parse_mode="HTML",
             reply_markup=kb,
         )
         return
 
 
-async def cmd_game(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    """ /بازی 100 یا /game 100 """
-    if not u.message:
+async def on_photo(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    if not u.message or u.effective_chat.type != ChatType.PRIVATE:
         return
-    text = (u.message.text or "").strip()
-    # نرمال برای on_text
-    text2 = re.sub(r"^/(بازی|game)(@\w+)?", "بازی", text, flags=re.I)
-    u.message.text = text2
-    await on_text(u, c)
+    st = get_st(c)
+    if not st or st.get("kind") != "a_self_photo" or not is_admin(u.effective_user.id):
+        return
+    d = load()
+    d["self_photo"] = u.message.photo[-1].file_id
+    save(d)
+    clear_st(c)
+    await u.message.reply_text("عکس پنل ذخیره شد.", reply_markup=admin_kb())
 
 
 def main():
@@ -676,9 +836,8 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("admin", cmd_admin))
     app.add_handler(CommandHandler("panel", cmd_admin))
-    app.add_handler(CommandHandler("game", cmd_game))
     app.add_handler(CallbackQueryHandler(on_cb))
-    # همه متن‌ها (گپ و پیوی) — بدون ~ که روی بعضی محیط‌ها خراب می‌شود
+    app.add_handler(MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE, on_photo))
     app.add_handler(MessageHandler(filters.TEXT, on_text))
     log.info("diamond game up")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
