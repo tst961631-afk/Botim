@@ -1,16 +1,4 @@
 # -*- coding: utf-8 -*-
-"""
-ریکشن‌های سفارشی (پرمیوم) روی پست کانال
-خروجی برای هر ریکشن سفارشی:
-  [تصویر همان ریکشن]
-  کپشن: https://t.me/username/message_id/custom_emoji_id
-
-بات باید ادمین کانال باشد.
-محدودیت تلگرام (Bot API):
-  لیست ریکشن‌های کانال فقط با آپدیت message_reaction_count می‌آید
-  (وقتی تعداد ریکشن عوض شود). متد «برو الان همه ریکشن‌های قدیم این پست را بده» وجود ندارد.
-"""
-from __future__ import annotations
 import json
 import os
 import re
@@ -25,7 +13,6 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-from telegram.constants import ReactionTypeType
 
 BOT_TOKEN = "8727762178:AAGrdb5XFjhkcdoOEIFy1s8U71idRpN0DX8"
 ADMIN_ID = 7530457395
@@ -66,7 +53,6 @@ def pkey(chat_id, msg_id):
 
 def parse_link(text):
     text = (text or "").strip()
-    # https://t.me/name/81  یا  https://t.me/c/123/81
     m = re.search(r"(?:https?://)?t\.me/(c/)?([A-Za-z0-9_]+)/(\d+)", text)
     if not m:
         return None
@@ -89,13 +75,8 @@ def parse_link(text):
 
 
 def build_emoji_link(username, chat_id, msg_id, custom_emoji_id):
-    """
-    فرمت درخواستی:
-    https://t.me/v8xnem/81/5449590964865741724
-    """
     if username:
         return "https://t.me/%s/%s/%s" % (username, msg_id, custom_emoji_id)
-    # کانال خصوصی: از chat_id عددی
     cid = str(chat_id).replace("-100", "")
     return "https://t.me/c/%s/%s/%s" % (cid, msg_id, custom_emoji_id)
 
@@ -132,11 +113,9 @@ async def send_one_custom(bot, admin_id, username, chat_id, msg_id, custom_emoji
 
 
 async def flush_customs(bot, post, custom_ids):
-    """هر آیدی سفارشی جدا: عکس ریکشن + لینک"""
     username = post.get("username")
     chat_id = post.get("chat_id")
     msg_id = post.get("message_id")
-    # تکراری نفرست
     sent = set(post.get("sent_ids") or [])
     new_ids = [str(i) for i in custom_ids if str(i) not in sent]
     if not new_ids:
@@ -159,9 +138,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "بات را ادمین کانال کن، بعد لینک پست را بفرست.\n"
         "مثال:\nhttps://t.me/v8xnem/81\n\n"
-        "برای هر ریکشن سفارشی می‌فرستد:\n"
-        "• تصویر همان ریکشن\n"
-        "• لینک: https://t.me/کانال/شماره‌پست/آیدی‌ایموجی"
+        "برای هر ریکشن سفارشی:\n"
+        "• تصویر ریکشن\n"
+        "• لینک t.me/کانال/پست/آیدی‌ایموجی"
     )
 
 
@@ -185,7 +164,7 @@ async def on_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             chat = await bot.get_chat(chat_id)
             title = chat.title or str(chat_id)
-            username = chat.username  # ممکن است None باشد
+            username = chat.username
     except Exception as e:
         await update.message.reply_text("کانال در دسترس نیست:\n%s" % e)
         return
@@ -197,11 +176,12 @@ async def on_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             message_id=msg_id,
         )
     except Exception as e:
-        await update.message.reply_text("پست خوانده نشد (ادمین بودن لازم است):\n%s" % e)
+        await update.message.reply_text("پست خوانده نشد (ادمین؟):\n%s" % e)
         return
 
     d = load()
     key = pkey(chat_id, msg_id)
+    prev = d.get("posts", {}).get(key, {})
     d["posts"][key] = {
         "chat_id": chat_id,
         "message_id": msg_id,
@@ -209,16 +189,14 @@ async def on_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "title": title,
         "link": parsed["raw"],
         "customs": {},
-        "sent_ids": d.get("posts", {}).get(key, {}).get("sent_ids") or [],
+        "sent_ids": prev.get("sent_ids") or [],
         "added_at": time.time(),
     }
     save(d)
 
     await update.message.reply_text(
         "✅ پست ثبت شد: %s\n<code>%s</code>\n\n"
-        "الان منتظر آپدیت ریکشن کانال می‌مانم.\n"
-        "به محض تغییر تعداد ریکشن‌های سفارشی، برای هرکدام تصویر + لینک می‌فرستم.\n\n"
-        "نکته تلگرام: خواندن یک‌جای ریکشن‌های قدیمی بدون تغییر جدید، در Bot API نیست."
+        "با تغییر ریکشن سفارشی، عکس + لینک می‌آید."
         % (title, key),
         parse_mode="HTML",
     )
@@ -238,8 +216,8 @@ async def on_reaction_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
     custom_ids = []
     for rc in mrc.reactions or []:
         rt = rc.type
-        kind = getattr(rt, "type", None)
-        if kind == ReactionTypeType.CUSTOM_EMOJI or kind == "custom_emoji":
+        kind = str(getattr(rt, "type", "") or "")
+        if kind == "custom_emoji":
             cid = str(rt.custom_emoji_id)
             custom_ids.append(cid)
             post.setdefault("customs", {})[cid] = {
@@ -258,16 +236,12 @@ async def on_reaction_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
-    if not BOT_TOKEN or BOT_TOKEN == "TOKEN_HERE":
-        raise SystemExit("توکن را بگذار")
-
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex("t\\.me/"), on_link))
 
     try:
         from telegram.ext import MessageReactionCountHandler
-
         app.add_handler(MessageReactionCountHandler(on_reaction_count))
     except Exception as e:
         log.error("MessageReactionCountHandler: %s", e)
