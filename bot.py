@@ -149,7 +149,12 @@ def clear_st(c):
 
 
 def em(d):
-    return d.get("emoji") or "💎"
+    """ایموجی الماس — اگر پرمیوم ست شده باشد HTML tg-emoji"""
+    pid = d.get("premium_emoji_id")
+    fallback = d.get("emoji") or "💎"
+    if pid:
+        return '<tg-emoji emoji-id="%s">%s</tg-emoji>' % (pid, fallback)
+    return fallback
 
 
 def mention_user(user):
