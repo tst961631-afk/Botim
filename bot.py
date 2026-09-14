@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""ربات بازی الماس + پنل سلف + قرعه‌کشی"""
+"""ربات بازی الماس + پنل سلف + قرعه‌ کشی"""
 from __future__ import annotations
 import json, os, re, time, logging, random
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
