@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """ربات بازی الماس — نسخه کامل + دوئل + شرط تماشاچی + همگانی تأخیری"""
 from __future__ import annotations
-import json, os, re, time, logging, random, asyncio
+import json, os, re, time, logging, random, asyncio, asyncio
 from datetime import datetime, timezone, timedelta
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -40,7 +40,11 @@ def D():
         "lottery": None,
         "known_chats": [],
         # همگانی تأخیری برای کاربران جدید
-        "grant": None,  # {amount, until_ts, claimed: [uids]}
+        "grant": None,
+        "bot_bank": 0,
+        "donations": {},
+        "top1_reward": None,
+        "chat_users": {},
         "templates": {
             "balance": "موجودی الماس\n\n{mention}\n{emoji} {balance}",
             "game_open": "بازی باز است\n\nشرط: {emoji} {amount}\nمیزبان: {creator}\nحالت: {mode}\n\nشرکت با دکمه سبز\nلغو فقط برای میزبان\nمهلت: ۱۰ دقیقه",
@@ -132,12 +136,16 @@ def touch_user(d, user):
     d.setdefault("losses", {}).setdefault(str(user.id), int(d.get("losses", {}).get(str(user.id), 0)))
 
 
-def track_chat(d, chat_id):
+def track_chat(d, chat_id, user=None):
     if not chat_id:
         return
     ks = d.setdefault("known_chats", [])
     if int(chat_id) not in [int(x) for x in ks]:
         ks.append(int(chat_id))
+    if user and not getattr(user, "is_bot", False):
+        cu = d.setdefault("chat_users", {}).setdefault(str(chat_id), [])
+        if int(user.id) not in [int(x) for x in cu]:
+            cu.append(int(user.id))
 
 
 def bal(d, uid):
@@ -318,7 +326,7 @@ def admin_kb():
         [btn("📨 پیام همگانی", "a_bcast", "primary")],
         [btn("🗑 صفر کردن همه", "a_zero", "danger")],
         [btn("🔒 قفل شرط", "a_betlock", "primary")],
-        [btn("😀 ایموجی الماس", "a_emoji", "primary"), btn("✨ استخر پرمیوم", "a_prem", "primary")],
+        [btn("😀 ایموجی الماس", "a_emoji", "primary")],
         [btn("📝 کپشن پنل سلف", "a_self_cap", "primary")],
         [btn("⏱ مصرف ساعتی", "a_hourly", "primary")],
         [btn("🎰 قرعه‌کشی", "a_lot", "success"), btn("🚫 لغو قرعه", "a_lot_cancel", "danger")],
@@ -403,6 +411,19 @@ async def send_self_panel(bot, chat_id, uid, d, message=None):
     await bot.send_message(chat_id, text, reply_markup=kb)
 
 
+async def notify_deposit(bot, uid, amount, d, broadcast=False):
+    new_b = bal(d, uid)
+    if broadcast:
+        text = "%s\nالماس از طرف ادمین برای کاربرا شارژ شد" % num(amount)
+    else:
+        text = "%s\nالماس از طرف مدیریت انتقال یافت" % num(amount)
+    kb = InlineKeyboardMarkup([[btn("%s %s" % (em_plain(d), num(new_b)), "noop", "primary")]])
+    try:
+        await bot.send_message(int(uid), text, reply_markup=kb)
+    except Exception:
+        pass
+
+
 async def expire_games(d):
     now = time.time()
     ch = False
@@ -450,7 +471,7 @@ async def finish_game(q, c, d, gid, game):
     players = list(game["players"])
     amount = int(game["amount"])
     try:
-        await q.edit_message_text("⏳ در حال پرتاب تاس...")
+        await q.edit_message_text("✨")
     except Exception:
         pass
     await asyncio.sleep(1.6)
@@ -490,7 +511,7 @@ async def finish_game(q, c, d, gid, game):
         ln = game["names"].get(str(L), str(L))
         rows.append([btn("❌ %s | %s" % (ln[:14], num(bal(d, L))), "noop", "danger")])
     await q.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
-    await announce_record(c.bot, d, winner, game.get("chat_id"))
+    pass  # no record spam
 
 
 # ---------- handlers ----------
@@ -697,11 +718,13 @@ async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
             await q.answer("بازیکن نمی‌تواند شرط ببندد", show_alert=True)
             return
         set_st(c, "sidebet_amt", {"gid": gid, "on": onp})
-        await q.answer()
         try:
-            await c.bot.send_message(user.id, "مبلغ شرط روی این بازیکن را بفرست (مثال 1k):")
+            me = await c.bot.get_me()
+            link = "https://t.me/%s?start=sb_%s_%s" % (me.username, gid, onp)
+            await c.bot.send_message(user.id, "مبلغ شرط را بفرست (مثال 1k):\n%s" % link)
+            await q.answer("پیوی ربات را چک کن", show_alert=True)
         except Exception:
-            await q.answer("اول پیوی ربات را استارت کن", show_alert=True)
+            await q.answer("اول ربات را استارت کن", show_alert=True)
         return
 
     if data.startswith("tr_ok:"):
@@ -728,7 +751,7 @@ async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
             await c.bot.send_message(to, "دریافت: %s %s" % (em(d), num(send_amt)), parse_mode="HTML")
         except Exception:
             pass
-        await announce_record(c.bot, d, to)
+        pass
         return
 
     if data.startswith("tr_no:"):
@@ -851,46 +874,76 @@ async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
 def leaderboard_text(d, viewer_id=None):
     items = sorted(((int(u), int(v)) for u, v in (d.get("balances") or {}).items() if int(v) > 0), key=lambda x: -x[1])
-    top = items[:10]
+    top = items[:5]
     if not top:
         return "لیدربرد خالی است."
-    lines = ["🏆 <b>۱۰ نفر برتر</b>\n"]
+    out = ["🏆 <b>۵ نفر برتر</b>", ""]
     for i, (uid, v) in enumerate(top, 1):
         name = (d.get("users") or {}).get(str(uid), {}).get("name") or str(uid)
-        lines.append("%s: %s → %s" % (i, mention_id(uid, name), short_num(v)))
+        out.append("%s: %s  ➡️  %s" % (i, mention_id(uid, name), short_num(v)))
+        if i < len(top):
+            out.append("")
+            out.append("────────────")
+            out.append("")
     if viewer_id is not None:
         r = rank_in(d.get("balances") or {}, viewer_id)
-        lines.append("\nرتبه شما\n%s" % (r if r else "—"))
-    return "\n".join(lines)
+        out.append("")
+        out.append("رتبه شما")
+        out.append(str(r if r else "—"))
+    return "\n".join(out)
 
 
 def wins_text(d, viewer_id=None):
-    items = sorted(((int(u), int(v)) for u, v in (d.get("wins") or {}).items() if int(v) > 0), key=lambda x: -x[1])[:10]
+    items = sorted(((int(u), int(v)) for u, v in (d.get("wins") or {}).items() if int(v) > 0), key=lambda x: -x[1])[:5]
     if not items:
         return "هنوز بردی ثبت نشده."
-    lines = ["🏆 <b>وینرها</b>\n"]
+    out = ["🏆 <b>وینرها</b>", ""]
     for i, (uid, v) in enumerate(items, 1):
         name = (d.get("users") or {}).get(str(uid), {}).get("name") or str(uid)
-        lines.append("%s: %s → %s برد" % (i, mention_id(uid, name), num(v)))
+        out.append("%s: %s  ➡️  %s برد" % (i, mention_id(uid, name), num(v)))
+        if i < len(items):
+            out.append("")
+            out.append("────────────")
+            out.append("")
     if viewer_id is not None:
         r = rank_in(d.get("wins") or {}, viewer_id)
-        lines.append("\nرتبه شما\n%s" % (r if r else "—"))
-    return "\n".join(lines)
+        out.append("")
+        out.append("رتبه شما")
+        out.append(str(r if r else "—"))
+    return "\n".join(out)
 
 
 def losses_text(d, viewer_id=None):
-    items = sorted(((int(u), int(v)) for u, v in (d.get("losses") or {}).items() if int(v) > 0), key=lambda x: -x[1])[:10]
+    items = sorted(((int(u), int(v)) for u, v in (d.get("losses") or {}).items() if int(v) > 0), key=lambda x: -x[1])[:5]
     if not items:
         return "هنوز باختی ثبت نشده."
-    lines = ["💀 <b>لوزرها</b>\n"]
+    out = ["💀 <b>لوزرها</b>", ""]
     for i, (uid, v) in enumerate(items, 1):
         name = (d.get("users") or {}).get(str(uid), {}).get("name") or str(uid)
-        lines.append("%s: %s → %s باخت" % (i, mention_id(uid, name), num(v)))
+        out.append("%s: %s  ➡️  %s باخت" % (i, mention_id(uid, name), num(v)))
+        if i < len(items):
+            out.append("")
+            out.append("────────────")
+            out.append("")
     if viewer_id is not None:
         r = rank_in(d.get("losses") or {}, viewer_id)
-        lines.append("\nرتبه شما\n%s" % (r if r else "—"))
-    return "\n".join(lines)
+        out.append("")
+        out.append("رتبه شما")
+        out.append(str(r if r else "—"))
+    return "\n".join(out)
 
+
+
+def help_text():
+    return (
+        "📖 <b>راهنما</b>\n\n"
+        "• <b>بازی 1k</b> — ۲ یا ۳ نفره\n"
+        "• <b>دعوت 5k</b> + ریپلای — دوئل\n"
+        "• <b>موجودی / انتقال / لیدربرد</b>\n"
+        "• <b>وینرها / لوزرها / سلف</b>\n"
+        "• <b>دونیت بات 1k</b> — بانک بات\n"
+        "• <b>بانک بات</b>\n"
+    )
 
 async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not u.message:
@@ -907,6 +960,28 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
     text = (u.message.text or "").strip()
     chat = u.effective_chat
     st = get_st(c)
+
+    if u.message.reply_to_message and u.message.reply_to_message.from_user and u.message.reply_to_message.from_user.is_bot:
+        if re.fullmatch(r"/?(موجودی|bal)", text, re.I):
+            await u.message.reply_text("من خودم الماسم 😎 میخوای چیو ببینی؟")
+            return
+
+    # ادمین: ریپلای + ایدی
+    if is_admin(user.id) and chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+        if text.strip() in ("ایدی", "آیدی", "id", "ID") and u.message.reply_to_message and u.message.reply_to_message.from_user:
+            tu = u.message.reply_to_message.from_user
+            touch_user(d, tu)
+            save(d)
+            un = ("@" + tu.username) if tu.username else "—"
+            msg = "اطلاعات کاربر\nاسم: %s\nیوزرنیم: %s\nآیدی: <code>%s</code>" % (tu.full_name, un, tu.id)
+            for aid in d.get("admins", [ADMIN_ID]):
+                try:
+                    await c.bot.send_message(int(aid), msg, parse_mode="HTML")
+                except Exception:
+                    pass
+            await u.message.reply_text("به پیوی ادمین ارسال شد.")
+            return
+
 
     if gamt and chat.type == ChatType.PRIVATE:
         await u.message.reply_text("🎁 همگانی: +%s %s" % (num(gamt), em(d)), parse_mode="HTML")
@@ -963,11 +1038,7 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
             save(d)
             clear_st(c)
             await u.message.reply_text("✅ %s → %s" % (num(amt), uid), reply_markup=admin_kb())
-            try:
-                await c.bot.send_message(uid, "واریز: %s %s" % (em(d), num(amt)), parse_mode="HTML")
-            except Exception:
-                pass
-            await announce_record(c.bot, d, uid)
+            await notify_deposit(c.bot, uid, amt, d, False)
             return
         if kind == "a_sub_id" and text.lstrip("-").isdigit():
             set_st(c, "a_sub_amt", {"uid": int(text)})
@@ -1172,6 +1243,10 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
     low2 = re.sub(r"^@\w+\s+", "", text)
     low2 = re.sub(r"^/(\w+)@\w+", r"/\1", low2)
+
+    if re.fullmatch(r"/?(راهنما|help)", low2, re.I):
+        await u.message.reply_text(help_text(), parse_mode="HTML")
+        return
 
     if re.fullmatch(r"/?(موجودی|bal)", low2, re.I):
         if u.message.reply_to_message and u.message.reply_to_message.from_user:
