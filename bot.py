@@ -324,6 +324,9 @@ def admin_kb():
         [btn("➕ واریز (آیدی)", "a_add", "success"), btn("➖ کم (آیدی)", "a_sub", "danger")],
         [btn("📢 واریز همگانی", "a_add_all", "success")],
         [btn("📨 پیام همگانی", "a_bcast", "primary")],
+        [btn("🔍 اسکن افراد گپ", "a_scan", "primary")],
+        [btn("🏦 بانک بات", "a_bank", "success")],
+        [btn("👑 جایزه تاپ‌۱", "a_top1", "primary")],
         [btn("🗑 صفر کردن همه", "a_zero", "danger")],
         [btn("🔒 قفل شرط", "a_betlock", "primary")],
         [btn("😀 ایموجی الماس", "a_emoji", "primary")],
@@ -441,6 +444,36 @@ async def expire_games(d):
         save(d)
 
 
+async def maybe_top1_reward(bot, d):
+    cfg = d.get("top1_reward")
+    if not cfg:
+        return
+    hours = float(cfg.get("hours") or 0)
+    amount = int(cfg.get("amount") or 0)
+    if hours <= 0 or amount <= 0:
+        return
+    t1 = top1_uid(d)
+    if t1 is None:
+        return
+    last_pay = float(cfg.get("last_pay") or 0)
+    last_uid = cfg.get("last_uid")
+    now = time.time()
+    if last_uid is not None and int(last_uid) == int(t1) and now - last_pay >= hours * 3600:
+        add_bal(d, t1, amount)
+        cfg["last_pay"] = now
+        d["top1_reward"] = cfg
+        save(d)
+        try:
+            await bot.send_message(int(t1), "👑 جایزه ماندن در رتبه ۱\n+%s" % num(amount))
+        except Exception:
+            pass
+    elif last_uid is None or int(last_uid) != int(t1):
+        cfg["last_uid"] = int(t1)
+        cfg["last_pay"] = now
+        d["top1_reward"] = cfg
+        save(d)
+
+
 async def maybe_finish_lottery(bot, d):
     lot = d.get("lottery")
     if not lot or lot.get("status") != "open":
@@ -548,6 +581,7 @@ async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
     save(d)
     await expire_games(d)
     await maybe_finish_lottery(c.bot, d)
+    await maybe_top1_reward(c.bot, d)
     d = load()
 
     if data.startswith("sp:"):
@@ -764,12 +798,98 @@ async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("لغو شد.")
         return
 
+
+    if data == "a_bank" and is_admin(user.id):
+        bank = int(d.get("bot_bank") or 0)
+        items = sorted(((int(u), int(v)) for u, v in (d.get("donations") or {}).items() if int(v) > 0), key=lambda x: -x[1])[:3]
+        lines = ["🏦 <b>بانک بات</b>", "", "موجودی: %s" % num(bank), "", "⭐ دونیت‌کننده‌ها:"]
+        if not items:
+            lines.append("—")
+        for i, (uid, v) in enumerate(items, 1):
+            name = (d.get("users") or {}).get(str(uid), {}).get("name") or str(uid)
+            lines.append("%s. %s — %s" % (i, mention_id(uid, name), num(v)))
+        kb = InlineKeyboardMarkup([
+            [btn("📢 پخش همگانی بانک", "bank_spread", "success")],
+            [btn("📥 به حساب ادمین", "bank_to_admin", "primary")],
+            [btn("🗑 صفر بانک", "bank_zero", "danger")],
+            [btn("🔙", "a_home", "primary")],
+        ])
+        await q.edit_message_text("\n".join(lines), parse_mode="HTML", reply_markup=kb)
+        return
+    if data == "bank_spread" and is_admin(user.id):
+        bank = int(d.get("bot_bank") or 0)
+        ids = list(all_user_ids(d))
+        if bank < 1 or not ids:
+            await q.answer("خالی است", show_alert=True)
+            return
+        each = bank // len(ids)
+        if each < 1:
+            await q.answer("کمتر از تعداد کاربران", show_alert=True)
+            return
+        for uid in ids:
+            add_bal(d, uid, each)
+            await notify_deposit(c.bot, uid, each, d, True)
+        d["bot_bank"] = bank - each * len(ids)
+        save(d)
+        await q.edit_message_text("پخش شد — هر نفر %s" % num(each), reply_markup=admin_kb())
+        return
+    if data == "bank_to_admin" and is_admin(user.id):
+        bank = int(d.get("bot_bank") or 0)
+        add_bal(d, user.id, bank)
+        d["bot_bank"] = 0
+        save(d)
+        await q.edit_message_text("به ادمین منتقل شد: %s" % num(bank), reply_markup=admin_kb())
+        return
+    if data == "bank_zero" and is_admin(user.id):
+        d["bot_bank"] = 0
+        save(d)
+        await q.edit_message_text("بانک صفر شد.", reply_markup=admin_kb())
+        return
+    if data.startswith("scan:") and is_admin(user.id):
+        cid = int(data.split(":")[1])
+        added = 0
+        try:
+            for a in await c.bot.get_chat_administrators(cid):
+                touch_user(d, a.user)
+                track_chat(d, cid, a.user if hasattr(a, "user") else None)
+                added += 1
+        except Exception as e:
+            await q.edit_message_text("اسکن ناموفق (بات باید ادمین گپ باشد):\n%s" % e)
+            return
+        for uid in d.get("chat_users", {}).get(str(cid), []):
+            d.setdefault("balances", {}).setdefault(str(uid), bal(d, uid))
+            added += 1
+        save(d)
+        await q.edit_message_text("ثبت شد (~%s)" % added, reply_markup=admin_kb())
+        return
+
     if not is_admin(user.id):
         return
 
     if data == "a_home":
         clear_st(c)
         await q.edit_message_text("🎛 پنل", reply_markup=admin_kb())
+        return
+    if data == "a_scan":
+        chats = d.get("known_chats") or []
+        if not chats:
+            await q.edit_message_text("گپی ثبت نشده.", reply_markup=admin_kb())
+            return
+        rows = []
+        for cid in chats[:30]:
+            title = str(cid)
+            try:
+                ch = await c.bot.get_chat(int(cid))
+                title = (ch.title or ch.username or str(cid))[:40]
+            except Exception:
+                pass
+            rows.append([btn(title, "scan:%s" % cid, "primary")])
+        rows.append([btn("🔙", "a_home", "danger")])
+        await q.edit_message_text("گپ را برای اسکن انتخاب کن:", reply_markup=InlineKeyboardMarkup(rows))
+        return
+    if data == "a_top1":
+        set_st(c, "a_top1_amt")
+        await q.edit_message_text("مبلغ جایزه برای ماندن در رتبه ۱:")
         return
     if data == "a_add":
         set_st(c, "a_add_id")
@@ -798,10 +918,6 @@ async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if data == "a_emoji":
         set_st(c, "a_emoji")
         await q.edit_message_text("ایموجی پرمیوم یا متنی:")
-        return
-    if data == "a_prem":
-        set_st(c, "a_prem")
-        await q.edit_message_text("پرمیوم بفرست")
         return
     if data == "a_self_cap":
         set_st(c, "a_self_cap")
@@ -956,6 +1072,7 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
     save(d)
     await expire_games(d)
     await maybe_finish_lottery(c.bot, d)
+    await maybe_top1_reward(c.bot, d)
     d = load()
     text = (u.message.text or "").strip()
     chat = u.effective_chat
@@ -1072,6 +1189,7 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
             ids = all_user_ids(d)
             for uid in ids:
                 add_bal(d, uid, amt)
+                await notify_deposit(c.bot, uid, amt, d, True)
             if days > 0:
                 d["grant"] = {
                     "amount": amt,
@@ -1158,18 +1276,6 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
             clear_st(c)
             await u.message.reply_text("ذخیره شد.", reply_markup=admin_kb())
             return
-        if kind == "a_prem":
-            eid = None
-            if u.message.entities:
-                for ent in u.message.entities:
-                    if ent.type == MessageEntityType.CUSTOM_EMOJI and ent.custom_emoji_id:
-                        eid = str(ent.custom_emoji_id)
-                        break
-            if not eid and re.fullmatch(r"\d{5,25}", text):
-                eid = text
-            if not eid:
-                await u.message.reply_text("پرمیوم بفرست")
-                return
             pool = d.get("premium_pool") or []
             if eid not in pool:
                 pool.append(eid)
@@ -1190,6 +1296,25 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
             save(d)
             clear_st(c)
             await u.message.reply_text("OK", reply_markup=admin_kb())
+            return
+        if kind == "a_top1_amt":
+            amt = parse_amount(text)
+            if not amt:
+                await u.message.reply_text("نامعتبر")
+                return
+            set_st(c, "a_top1_hours", {"amount": amt})
+            await u.message.reply_text("هر چند ساعت یک‌بار؟ (مثال 10)")
+            return
+        if kind == "a_top1_hours" and text.replace(".", "", 1).isdigit():
+            d["top1_reward"] = {
+                "amount": int(extra["amount"]),
+                "hours": float(text),
+                "last_pay": time.time(),
+                "last_uid": top1_uid(d),
+            }
+            save(d)
+            clear_st(c)
+            await u.message.reply_text("جایزه تاپ‌۱ فعال شد.", reply_markup=admin_kb())
             return
         if kind == "a_lot_prize":
             amt = parse_amount(text)
@@ -1285,6 +1410,35 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
             info = user_info(d, uid)
             lines.append("• %s\n  <code>%s</code> | %s" % (info["name"], uid, num(bal(d, uid))))
         await u.message.reply_text("\n".join(lines), parse_mode="HTML")
+        return
+
+
+    if re.fullmatch(r"/?(بانک بات|bank)", low2, re.I):
+        bank = int(d.get("bot_bank") or 0)
+        items = sorted(((int(u), int(v)) for u, v in (d.get("donations") or {}).items() if int(v) > 0), key=lambda x: -x[1])[:3]
+        lines = ["🏦 <b>بانک بات</b>", "", "موجودی بانک: %s" % num(bank), "", "⭐ برترین دونیت‌کننده‌ها:"]
+        if not items:
+            lines.append("—")
+        for i, (uid, v) in enumerate(items, 1):
+            name = (d.get("users") or {}).get(str(uid), {}).get("name") or str(uid)
+            lines.append("%s. %s — %s" % (i, mention_id(uid, name), num(v)))
+        await u.message.reply_text("\n".join(lines), parse_mode="HTML")
+        return
+
+    m = re.match(r"^(?:/)?(?:دونیت بات|donate)\s+(.+)$", low2, re.I)
+    if m:
+        amt = parse_amount(m.group(1))
+        if not amt or amt < 1:
+            await u.message.reply_text("مثال: دونیت بات 1k")
+            return
+        if bal(d, user.id) < amt:
+            await u.message.reply_text("موجودی کم")
+            return
+        add_bal(d, user.id, -amt)
+        d["bot_bank"] = int(d.get("bot_bank") or 0) + amt
+        d.setdefault("donations", {})[str(user.id)] = int(d.get("donations", {}).get(str(user.id), 0)) + amt
+        save(d)
+        await u.message.reply_text("✅ %s به بانک بات اضافه شد\nبانک: %s" % (num(amt), num(d["bot_bank"])))
         return
 
     # دوئل خصوصی: دعوت 5k + reply
