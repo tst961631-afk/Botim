@@ -1,400 +1,269 @@
 # -*- coding: utf-8 -*-
 """
-🦝 رِیو (Rivo) — بازی اقتصادی تلگرامی با محوریت راکون و ویلو
-یک فایل کامل: SQLite + پنل ادمین + شهر + غارت مکانی + مارکت شهردار
-دستورات بدون / (مثال: پروفایل | ویلو | شهر)
+MeowPoint — بازی اقتصادی/مدیریتی تلگرام
+ارز: MeowPoint (MP) | تعامل اصلی: میو
 """
 from __future__ import annotations
-import json, os, re, time, logging, random, asyncio, sqlite3, threading
+import json, os, re, time, logging, random, asyncio, sqlite3, threading, secrets
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters,
+    Application, CommandHandler, CallbackQueryHandler, MessageHandler,
+    ContextTypes, filters,
 )
 from telegram.constants import ChatType
+from telegram.request import HTTPXRequest
 
-BOT_TOKEN = "8727762178:AAGrdb5XFjhkcdoOEIFy1s8U71idRpN0DX8"
+BOT_TOKEN = "8975007734:AAEkghW4tK0DeG9uOKw87Lgep8XUWlMiiLY"
 ADMIN_ID = 7530457395
-# اگر اینترنت به api.telegram.org وصل نمی‌شود، پروکسی بگذار (مثال):
-# PROXY_URL = "http://127.0.0.1:10809"
-# PROXY_URL = "socks5://127.0.0.1:1080"
+DB_PATH = "meowpoint.db"
+TZ = timezone(timedelta(hours=3, minutes=30))
 PROXY_URL = None
-DB_PATH = "rivo_game.db"
-TZ = timezone(timedelta(hours=3, minutes=30))  # تهران
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("rivo")
-
+log = logging.getLogger("meowpoint")
 _lock = threading.RLock()
 
-# ───────────────────────── DB ─────────────────────────
-def db():
-    conn = sqlite3.connect(DB_PATH, timeout=60, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    return conn
-
+# ═══════════════ DB ═══════════════
+def connect():
+    c = sqlite3.connect(DB_PATH, timeout=60, check_same_thread=False)
+    c.row_factory = sqlite3.Row
+    c.execute("PRAGMA journal_mode=WAL")
+    return c
 
 @contextmanager
 def tx():
     with _lock:
-        conn = db()
+        c = connect()
         try:
-            yield conn
-            conn.commit()
+            yield c
+            c.commit()
         except Exception:
-            conn.rollback()
+            c.rollback()
             raise
         finally:
-            conn.close()
-
+            c.close()
 
 def init_db():
     with tx() as c:
-        c.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY,
-                username TEXT,
-                name TEXT,
-                willow INTEGER DEFAULT 0,
-                bank INTEGER DEFAULT 0,
-                level INTEGER DEFAULT 1,
-                xp INTEGER DEFAULT 0,
-                willow_collected INTEGER DEFAULT 0,
-                ops_ok INTEGER DEFAULT 0,
-                ops_fail INTEGER DEFAULT 0,
-                invites INTEGER DEFAULT 0,
-                missions_done INTEGER DEFAULT 0,
-                raccoon_count INTEGER DEFAULT 1,
-                status TEXT DEFAULT 'active',
-                joined_at REAL,
-                last_active REAL,
-                last_willow REAL DEFAULT 0,
-                last_gather REAL DEFAULT 0,
-                last_raid REAL DEFAULT 0,
-                jail_until REAL DEFAULT 0,
-                referred_by INTEGER,
-                street_rescues INTEGER DEFAULT 0,
-                inv TEXT DEFAULT '{}'
-            );
-            CREATE TABLE IF NOT EXISTS raccoons (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                owner_id INTEGER,
-                species TEXT DEFAULT 'خاکستری',
-                rarity TEXT DEFAULT 'معمولی',
-                level INTEGER DEFAULT 1,
-                xp INTEGER DEFAULT 0,
-                power INTEGER DEFAULT 10,
-                speed INTEGER DEFAULT 10,
-                luck INTEGER DEFAULT 10,
-                capacity INTEGER DEFAULT 10,
-                value INTEGER DEFAULT 1000,
-                is_main INTEGER DEFAULT 1,
-                photo_file_id TEXT,
-                FOREIGN KEY(owner_id) REFERENCES users(id)
-            );
-            CREATE TABLE IF NOT EXISTS cities (
-                chat_id INTEGER PRIMARY KEY,
-                title TEXT,
-                level INTEGER DEFAULT 1,
-                xp INTEGER DEFAULT 0,
-                treasury INTEGER DEFAULT 0,
-                mayor_id INTEGER,
-                willow_users TEXT DEFAULT '[]',
-                market TEXT DEFAULT '[]'
-            );
-            CREATE TABLE IF NOT EXISTS factories (
-                user_id INTEGER PRIMARY KEY,
-                level INTEGER DEFAULT 1,
-                busy_until REAL DEFAULT 0,
-                ready INTEGER DEFAULT 0,
-                reward INTEGER DEFAULT 0,
-                FOREIGN KEY(user_id) REFERENCES users(id)
-            );
-            CREATE TABLE IF NOT EXISTS transactions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                kind TEXT,
-                amount INTEGER,
-                meta TEXT,
-                ts REAL
-            );
-            CREATE TABLE IF NOT EXISTS gift_codes (
-                code TEXT PRIMARY KEY,
-                amount INTEGER,
-                uses_left INTEGER,
-                max_per_user INTEGER DEFAULT 1,
-                expires_at REAL,
-                active INTEGER DEFAULT 1
-            );
-            CREATE TABLE IF NOT EXISTS gift_uses (
-                code TEXT,
-                user_id INTEGER,
-                ts REAL,
-                PRIMARY KEY(code, user_id)
-            );
-            CREATE TABLE IF NOT EXISTS raid_places (
-                id TEXT PRIMARY KEY,
-                name TEXT,
-                min_level INTEGER DEFAULT 1,
-                pool INTEGER DEFAULT 100000,
-                stages INTEGER DEFAULT 3,
-                fail_chance REAL DEFAULT 0.2,
-                jail_sec INTEGER DEFAULT 3600,
-                cooldown INTEGER DEFAULT 1800,
-                active INTEGER DEFAULT 1
-            );
-            CREATE TABLE IF NOT EXISTS shop_items (
-                id TEXT PRIMARY KEY,
-                name TEXT,
-                kind TEXT,
-                price INTEGER,
-                effect TEXT,
-                stock INTEGER DEFAULT -1,
-                photo_file_id TEXT,
-                active INTEGER DEFAULT 1
-            );
-            CREATE TABLE IF NOT EXISTS street_raccoons (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT,
-                rarity TEXT,
-                price INTEGER,
-                power INTEGER,
-                photo_file_id TEXT,
-                active INTEGER DEFAULT 1
-            );
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            );
-            CREATE TABLE IF NOT EXISTS logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                kind TEXT,
-                detail TEXT,
-                ts REAL
-            );
-            CREATE TABLE IF NOT EXISTS admins (
-                user_id INTEGER PRIMARY KEY
-            );
-            """
-        )
+        c.executescript("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY,
+            username TEXT DEFAULT '',
+            name TEXT DEFAULT '',
+            wallet INTEGER DEFAULT 0,
+            bank INTEGER DEFAULT 0,
+            bank_account TEXT DEFAULT '',
+            bank_name TEXT DEFAULT '',
+            level INTEGER DEFAULT 1,
+            xp INTEGER DEFAULT 0,
+            city_level INTEGER DEFAULT 1,
+            city_xp INTEGER DEFAULT 0,
+            city_treasury INTEGER DEFAULT 0,
+            streak INTEGER DEFAULT 0,
+            last_daily REAL DEFAULT 0,
+            last_meow REAL DEFAULT 0,
+            last_gather REAL DEFAULT 0,
+            referrals INTEGER DEFAULT 0,
+            referred_by INTEGER,
+            missions_done INTEGER DEFAULT 0,
+            total_earned INTEGER DEFAULT 0,
+            total_spent INTEGER DEFAULT 0,
+            total_transfers INTEGER DEFAULT 0,
+            market_trades INTEGER DEFAULT 0,
+            status TEXT DEFAULT 'active',
+            joined_at REAL,
+            last_active REAL,
+            inv TEXT DEFAULT '{}',
+            daily_transfer INTEGER DEFAULT 0,
+            transfer_day TEXT DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS factories (
+            user_id INTEGER PRIMARY KEY,
+            level INTEGER DEFAULT 1,
+            xp INTEGER DEFAULT 0,
+            storage INTEGER DEFAULT 0,
+            storage_cap INTEGER DEFAULT 1000,
+            workers INTEGER DEFAULT 1,
+            workers_max INTEGER DEFAULT 3,
+            workers_level INTEGER DEFAULT 1,
+            machine_level INTEGER DEFAULT 1,
+            prod_time INTEGER DEFAULT 120,
+            prod_amount INTEGER DEFAULT 50,
+            busy_until REAL DEFAULT 0,
+            ready INTEGER DEFAULT 0,
+            pending INTEGER DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            kind TEXT,
+            amount INTEGER,
+            meta TEXT,
+            txid TEXT,
+            ts REAL
+        );
+        CREATE TABLE IF NOT EXISTS gift_codes (
+            code TEXT PRIMARY KEY,
+            amount INTEGER,
+            uses_left INTEGER,
+            active INTEGER DEFAULT 1,
+            expires REAL
+        );
+        CREATE TABLE IF NOT EXISTS gift_uses (
+            code TEXT, user_id INTEGER, PRIMARY KEY(code, user_id)
+        );
+        CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE IF NOT EXISTS templates (key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE IF NOT EXISTS names (key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE IF NOT EXISTS admins (user_id INTEGER PRIMARY KEY);
+        CREATE TABLE IF NOT EXISTS shop (
+            id TEXT PRIMARY KEY, name TEXT, price INTEGER, effect TEXT, active INTEGER DEFAULT 1
+        );
+        CREATE TABLE IF NOT EXISTS market (
+            id TEXT PRIMARY KEY, name TEXT, price INTEGER, stock INTEGER DEFAULT -1
+        );
+        CREATE TABLE IF NOT EXISTS logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, detail TEXT, ts REAL
+        );
+        """)
         c.execute("INSERT OR IGNORE INTO admins(user_id) VALUES (?)", (ADMIN_ID,))
-        # soft migrations
-        for sql in [
-            "ALTER TABLE users ADD COLUMN bank_account TEXT DEFAULT ''",
-            "ALTER TABLE users ADD COLUMN bank_name TEXT DEFAULT ''",
-            "ALTER TABLE users ADD COLUMN last_bank_profit REAL DEFAULT 0",
-            "ALTER TABLE cities ADD COLUMN fish INTEGER DEFAULT 0",
-            "ALTER TABLE cities ADD COLUMN population INTEGER DEFAULT 0",
-            "ALTER TABLE factories ADD COLUMN storage INTEGER DEFAULT 0",
-            "ALTER TABLE factories ADD COLUMN storage_cap INTEGER DEFAULT 75000",
-            "ALTER TABLE factories ADD COLUMN workers INTEGER DEFAULT 0",
-            "ALTER TABLE factories ADD COLUMN workers_max INTEGER DEFAULT 14",
-            "ALTER TABLE factories ADD COLUMN machine_lv INTEGER DEFAULT 1",
-            "ALTER TABLE factories ADD COLUMN worker_lv INTEGER DEFAULT 1",
-            "ALTER TABLE factories ADD COLUMN xp INTEGER DEFAULT 0",
-        ]:
-            try:
-                c.execute(sql)
-            except Exception:
-                pass
-
         defaults = {
-            "willow_min": "3000",
-            "willow_max": "7000",
-            "willow_cd": "300",
-            "willow_cd_min": "120",
-            "willow_cd_per_city_lv": "15",
-            "willow_cd_per_rescue": "5",
-            "start_willow": "15000",
+            "currency": "MeowPoint",
+            "currency_short": "MP",
+            "coin": "🪙",
+            "entity": "پیشی",
+            "meow_min": "50",
+            "meow_max": "120",
+            "meow_cd": "300",
+            "meow_cd_min": "120",
+            "meow_cd_per_city": "12",
+            "start_mp": "5000",
             "transfer_tax": "0.02",
             "transfer_max": "0",
-            "bank_cap": "50000000",
-            "gather_cd": "600",
-            "factory_base_time": "1800",
-            "factory_base_reward": "25000",
-            "city_xp_per_willow": "1",
-            "currency": "ویلو",
-            "bank_profit_pct": "3",
-            "bank_profit_hour": "6",
-            "market_min_city_lv": "7",
-            "street_tries": "2",
-            "worker_tick_min": "30",
-            "coin_emoji": "🪙",
+            "transfer_daily": "0",
+            "bank_interest": "3",
+            "bank_interest_hour": "6",
+            "bank_cap": "0",
+            "gather_cd": "900",
+            "city_xp_meow": "1",
         }
         for k, v in defaults.items():
-            c.execute("INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)", (k, v))
-        # default raid places
-        places = [
-            ("alley", "کوچه پشتی", 1, 150000, 3, 0.18, 1800, 1200),
-            ("market", "انبار بازار", 3, 400000, 4, 0.25, 3600, 1800),
-            ("vault", "صندوق مرکزی", 5, 900000, 5, 0.32, 5400, 2400),
-        ]
-        for p in places:
-            c.execute(
-                "INSERT OR IGNORE INTO raid_places(id,name,min_level,pool,stages,fail_chance,jail_sec,cooldown,active) VALUES (?,?,?,?,?,?,?,?,1)",
-                p,
-            )
-        # shop defaults
+            c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)", (k, v))
+        names = {
+            "entity": "پیشی", "currency": "MeowPoint", "bank": "بانک میویی",
+            "factory": "کارخانه میویی", "city": "شهر میویی", "market": "بازار",
+            "meow_cmd": "میو",
+        }
+        for k, v in names.items():
+            c.execute("INSERT OR IGNORE INTO names(key,value) VALUES (?,?)", (k, v))
+        tpls = {
+            "meow_ok": "{amount} میو پوینت گرفتی 🐾\n💰 میو پوینت هات : {wallet} {coin}\n⏳ بعد از {cd} میتونی دوباره میو میو کنی",
+            "meow_wait": "🐱 هنوز میوت نمیاد..\n⏳ باید {left} صبر کنی",
+            "gather_wait": "🐱 ماهیا هنوز خوابن..\n⏳ باید {left} صبر کنی",
+        }
+        for k, v in tpls.items():
+            c.execute("INSERT OR IGNORE INTO templates(key,value) VALUES (?,?)", (k, v))
         shop = [
-            ("food_s", "خوراک ساده", "food", 5000, "xp:5", -1),
-            ("food_m", "خوراک مرغوب", "food", 15000, "xp:20", -1),
-            ("food_l", "ضیافت راکون", "food", 40000, "xp:60", -1),
-            ("boost_cd", "شتاب ویلو", "boost", 60000, "cd_half:1", -1),
-            ("jail_card", "کارت آزادی", "boost", 80000, "jail_pass:1", -1),
+            ("boost_meow", "شتاب میو", 25000, "cd_half:1"),
+            ("food", "خوراک پیشی", 8000, "belly:12"),
+            ("xp_pack", "بسته XP", 15000, "xp:30"),
         ]
         for s in shop:
-            c.execute(
-                "INSERT OR IGNORE INTO shop_items(id,name,kind,price,effect,stock,active) VALUES (?,?,?,?,?,?,1)",
-                s,
-            )
-        streets = [
-            ("راکون کوچه", "معمولی", 25000, 12),
-            ("راکون مهتابی", "کمیاب", 80000, 22),
-            ("راکون سایه", "نادر", 200000, 35),
+            c.execute("INSERT OR IGNORE INTO shop(id,name,price,effect,active) VALUES (?,?,?,?,1)", s)
+        market = [
+            ("wood", "چوب", 100, -1),
+            ("metal", "فلز", 250, -1),
+            ("food_m", "غذا", 80, -1),
+            ("energy", "انرژی", 300, -1),
         ]
-        for s in streets:
-            c.execute(
-                "INSERT OR IGNORE INTO street_raccoons(name,rarity,price,power,active) VALUES (?,?,?,?,1)",
-                s,
-            )
+        for m in market:
+            c.execute("INSERT OR IGNORE INTO market(id,name,price,stock) VALUES (?,?,?,?)", m)
 
-
-def sget(key, default=None):
+def sget(k, d=None):
     with tx() as c:
-        r = c.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
-        return r["value"] if r else default
+        r = c.execute("SELECT value FROM settings WHERE key=?", (k,)).fetchone()
+        return r["value"] if r else d
 
-
-def sset(key, value):
+def sset(k, v):
     with tx() as c:
-        c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES (?,?)", (key, str(value)))
+        c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES (?,?)", (k, str(v)))
 
+def sint(k, d=0):
+    try: return int(float(sget(k, d)))
+    except: return int(d)
 
-def sint(key, default=0):
-    try:
-        return int(float(sget(key, default)))
-    except Exception:
-        return int(default)
+def sfloat(k, d=0.0):
+    try: return float(sget(k, d))
+    except: return float(d)
 
+def nget(k, d=""):
+    with tx() as c:
+        r = c.execute("SELECT value FROM names WHERE key=?", (k,)).fetchone()
+        return r["value"] if r else d
 
-def sfloat(key, default=0.0):
-    try:
-        return float(sget(key, default))
-    except Exception:
-        return float(default)
-
+def tget(k, d=""):
+    with tx() as c:
+        r = c.execute("SELECT value FROM templates WHERE key=?", (k,)).fetchone()
+        return r["value"] if r else d
 
 def is_admin(uid):
     with tx() as c:
-        r = c.execute("SELECT 1 FROM admins WHERE user_id=?", (int(uid),)).fetchone()
-        return bool(r) or int(uid) == ADMIN_ID
-
-
-def is_main(uid):
-    return int(uid) == ADMIN_ID
-
-
-def log_event(kind, detail):
-    with tx() as c:
-        c.execute("INSERT INTO logs(kind,detail,ts) VALUES (?,?,?)", (kind, str(detail)[:500], time.time()))
-
-
-def add_tx(user_id, kind, amount, meta=""):
-    with tx() as c:
-        c.execute(
-            "INSERT INTO transactions(user_id,kind,amount,meta,ts) VALUES (?,?,?,?,?)",
-            (int(user_id), kind, int(amount), str(meta)[:200], time.time()),
-        )
-
+        return bool(c.execute("SELECT 1 FROM admins WHERE user_id=?", (int(uid),)).fetchone()) or int(uid)==ADMIN_ID
 
 def num(n):
-    try:
-        return f"{int(n):,}"
-    except Exception:
-        return str(n)
+    try: return f"{int(n):,}"
+    except: return str(n)
 
-
-def parse_amount(text):
+def parse_amt(text):
     t = (text or "").strip().replace(",", "").replace(" ", "").replace("،", "")
     t = t.replace("کا", "k").replace("ک", "k").replace("م", "m").replace("ب", "b")
     m = re.fullmatch(r"(\d+(?:\.\d+)?)([kmbKMB])?", t, re.I)
-    if not m:
-        return None
-    val = float(m.group(1))
-    suf = (m.group(2) or "").lower()
-    mul = {"": 1, "k": 1_000, "m": 1_000_000, "b": 1_000_000_000}.get(suf)
-    return int(val * mul) if mul is not None else None
-
+    if not m: return None
+    v = float(m.group(1))
+    s = (m.group(2) or "").lower()
+    mul = {"":1,"k":1_000,"m":1_000_000,"b":1_000_000_000}.get(s)
+    return int(v*mul) if mul is not None else None
 
 def to_roman(n):
     n = int(n)
-    if n <= 0:
-        return "0"
+    if n <= 0: return "0"
     vals = [(1000,"M"),(900,"CM"),(500,"D"),(400,"CD"),(100,"C"),(90,"XC"),(50,"L"),(40,"XL"),(10,"X"),(9,"IX"),(5,"V"),(4,"IV"),(1,"I")]
-    out = []
-    for v, s in vals:
+    o = []
+    for v,s in vals:
         while n >= v:
-            out.append(s)
-            n -= v
-    return "".join(out)
+            o.append(s); n -= v
+    return "".join(o)
 
+def mono(s): return f"<code>{s}</code>"
 
-def mono(s):
-    return f"<code>{s}</code>"
-
-
-def fancy_name(name: str) -> str:
-    """Mathematical bold style for display names."""
-    if not name:
-        return "—"
+def fancy(name):
     out = []
-    for ch in str(name):
+    for ch in str(name or ""):
         o = ord(ch)
-        if 65 <= o <= 90:  # A-Z
-            out.append(chr(0x1D5D4 + (o - 65)))
-        elif 97 <= o <= 122:  # a-z
-            out.append(chr(0x1D5EE + (o - 97)))
-        elif 48 <= o <= 57:  # 0-9
-            out.append(chr(0x1D7EC + (o - 48)))
-        else:
-            out.append(ch)
-    return "".join(out)
+        if 65 <= o <= 90: out.append(chr(0x1D5D4+(o-65)))
+        elif 97 <= o <= 122: out.append(chr(0x1D5EE+(o-97)))
+        elif 48 <= o <= 57: out.append(chr(0x1D7EC+(o-48)))
+        else: out.append(ch)
+    return "".join(out) or "—"
 
-
-def bar(cur, need, width=5):
-    need = max(1, int(need))
-    cur = max(0, int(cur))
-    filled = min(width, int(width * cur / need))
-    return "▰" * filled + "▱" * (width - filled)
-
-
-def line(title, value, rank=None):
-    s = f"{title} : {value}"
-    if rank is not None:
-        s += f"\n┘─ 🎖️ رتبه {rank}"
-    return s
-
-
+def bar(cur, need, w=10):
+    need = max(1, int(need)); cur = max(0, min(int(cur), need))
+    f = int(w * cur / need)
+    return "▰"*f + "▱"*(w-f)
 
 def fmt_time(sec):
     sec = int(max(0, sec))
     m, s = divmod(sec, 60)
     h, m = divmod(m, 60)
-    if h:
-        return f"{h}س {m}د"
-    if m:
-        return f"{m}د {s}ث"
-    return f"{s}ث"
-
+    if h: return f"{h}:{m:02d}:{s:02d}" if False else f"{h}س {m}د"
+    return f"{m}:{s:02d}" if m else f"{s}ث"
 
 def btn(text, data, style=None):
     kw = {"text": str(text)[:64], "callback_data": data}
-    if style in ("danger", "success", "primary"):
+    if style in ("success", "danger", "primary"):
         kw["style"] = style
     try:
         return InlineKeyboardButton(**kw)
@@ -402,530 +271,386 @@ def btn(text, data, style=None):
         kw.pop("style", None)
         return InlineKeyboardButton(**kw)
 
-
 def mention(uid, name=None):
     if not name:
-        with tx() as c:
-            r = c.execute("SELECT name FROM users WHERE id=?", (int(uid),)).fetchone()
-            name = r["name"] if r else str(uid)
+        u = get_user(uid)
+        name = u["name"] if u else str(uid)
     return f'<a href="tg://user?id={uid}">{name}</a>'
 
+def txid():
+    return "TX-" + secrets.token_hex(4).upper()
+
+def log_ev(kind, detail):
+    with tx() as c:
+        c.execute("INSERT INTO logs(kind,detail,ts) VALUES (?,?,?)", (kind, str(detail)[:400], time.time()))
+
+def add_tx(uid, kind, amount, meta=""):
+    tid = txid()
+    with tx() as c:
+        c.execute("INSERT INTO transactions(user_id,kind,amount,meta,txid,ts) VALUES (?,?,?,?,?,?)",
+                  (int(uid), kind, int(amount), str(meta)[:200], tid, time.time()))
+    return tid
 
 def ensure_user(user):
-    if not user or getattr(user, "is_bot", False):
-        return
+    if not user or getattr(user, "is_bot", False): return
     now = time.time()
     with tx() as c:
         r = c.execute("SELECT id FROM users WHERE id=?", (user.id,)).fetchone()
         if not r:
-            start_w = 15000
+            start = 5000
             try:
-                row = c.execute("SELECT value FROM settings WHERE key=?", ("start_willow",)).fetchone()
-                if row:
-                    start_w = int(float(row["value"]))
-            except Exception:
-                start_w = 15000
-            c.execute(
-                """INSERT INTO users(id,username,name,willow,joined_at,last_active)
-                   VALUES (?,?,?,?,?,?)""",
-                (user.id, user.username or "", user.full_name or str(user.id), start_w, now, now),
-            )
-            c.execute(
-                """INSERT INTO raccoons(owner_id,species,rarity,level,power,speed,luck,capacity,value,is_main)
-                   VALUES (?,?,?,?,?,?,?,?,?,1)""",
-                (user.id, "خاکستری", "معمولی", 1, 10, 10, 10, 10, 1000),
-            )
+                row = c.execute("SELECT value FROM settings WHERE key='start_mp'").fetchone()
+                if row: start = int(float(row["value"]))
+            except Exception: pass
+            acc = str(100000000000 + (user.id % 899999999999))
+            c.execute("""INSERT INTO users(id,username,name,wallet,bank_account,bank_name,joined_at,last_active,total_earned)
+                         VALUES (?,?,?,?,?,?,?,?,?)""",
+                      (user.id, user.username or "", user.full_name or str(user.id), start, acc,
+                       user.full_name or str(user.id), now, now, start))
             c.execute("INSERT OR IGNORE INTO factories(user_id) VALUES (?)", (user.id,))
-            c.execute(
-                "INSERT INTO transactions(user_id,kind,amount,meta,ts) VALUES (?,?,?,?,?)",
-                (user.id, "start", start_w, "welcome", now),
-            )
-            c.execute("INSERT INTO logs(kind,detail,ts) VALUES (?,?,?)", ("join", str(user.id), now))
+            c.execute("INSERT INTO transactions(user_id,kind,amount,meta,txid,ts) VALUES (?,?,?,?,?,?)",
+                      (user.id, "start", start, "welcome", txid(), now))
         else:
-            c.execute(
-                "UPDATE users SET username=?, name=?, last_active=? WHERE id=?",
-                (user.username or "", user.full_name or str(user.id), now, user.id),
-            )
-
+            c.execute("UPDATE users SET username=?, name=?, last_active=? WHERE id=?",
+                      (user.username or "", user.full_name or str(user.id), now, user.id))
 
 def get_user(uid):
     with tx() as c:
         return c.execute("SELECT * FROM users WHERE id=?", (int(uid),)).fetchone()
 
-
-def get_main_raccoon(uid):
+def get_factory(uid):
     with tx() as c:
-        r = c.execute(
-            "SELECT * FROM raccoons WHERE owner_id=? AND is_main=1 ORDER BY id LIMIT 1",
-            (int(uid),),
-        ).fetchone()
-        if not r:
-            c.execute(
-                """INSERT INTO raccoons(owner_id,species,rarity,level,power,speed,luck,capacity,value,is_main)
-                   VALUES (?,?,?,?,?,?,?,?,?,1)""",
-                (int(uid), "خاکستری", "معمولی", 1, 10, 10, 10, 10, 1000),
-            )
-            r = c.execute(
-                "SELECT * FROM raccoons WHERE owner_id=? AND is_main=1 LIMIT 1", (int(uid),)
-            ).fetchone()
-        return r
+        f = c.execute("SELECT * FROM factories WHERE user_id=?", (int(uid),)).fetchone()
+        if not f:
+            c.execute("INSERT INTO factories(user_id) VALUES (?)", (int(uid),))
+            f = c.execute("SELECT * FROM factories WHERE user_id=?", (int(uid),)).fetchone()
+        return f
 
-
-def change_willow(uid, delta, kind, meta=""):
-    """Atomic balance change. Returns new balance or raises ValueError."""
+def change_wallet(uid, delta, kind, meta=""):
     with tx() as c:
-        r = c.execute("SELECT willow, status FROM users WHERE id=?", (int(uid),)).fetchone()
-        if not r:
-            raise ValueError("no user")
-        if r["status"] != "active":
-            raise ValueError("blocked")
-        new = int(r["willow"]) + int(delta)
-        if new < 0:
-            raise ValueError("insufficient")
-        c.execute("UPDATE users SET willow=? WHERE id=?", (new, int(uid)))
+        r = c.execute("SELECT wallet,status FROM users WHERE id=?", (int(uid),)).fetchone()
+        if not r: raise ValueError("کاربر نیست")
+        if r["status"] != "active": raise ValueError("مسدود")
+        new = int(r["wallet"]) + int(delta)
+        if new < 0: raise ValueError("موجودی کم")
+        c.execute("UPDATE users SET wallet=? WHERE id=?", (new, int(uid)))
         if delta > 0:
-            c.execute(
-                "UPDATE users SET willow_collected = willow_collected + ? WHERE id=?",
-                (int(delta), int(uid)),
-            )
-        c.execute(
-            "INSERT INTO transactions(user_id,kind,amount,meta,ts) VALUES (?,?,?,?,?)",
-            (int(uid), kind, int(delta), str(meta)[:200], time.time()),
-        )
-        return new
-
-
-def willow_cooldown(uid, chat_id=None):
-    cd = sint("willow_cd", 300)
-    cd_min = sint("willow_cd_min", 120)
-    reduce = 0
-    if chat_id:
-        with tx() as c:
-            city = c.execute("SELECT level FROM cities WHERE chat_id=?", (int(chat_id),)).fetchone()
-            if city:
-                reduce += (int(city["level"]) - 1) * sint("willow_cd_per_city_lv", 15)
-    u = get_user(uid)
-    if u:
-        reduce += int(u["street_rescues"] or 0) * sint("willow_cd_per_rescue", 5)
-    return max(cd_min, cd - reduce)
-
-
-def ensure_city(chat):
-    if not chat or chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
-        return None
-    with tx() as c:
-        r = c.execute("SELECT * FROM cities WHERE chat_id=?", (chat.id,)).fetchone()
-        if not r:
-            mayor = None
-            try:
-                pass
-            except Exception:
-                pass
-            c.execute(
-                "INSERT INTO cities(chat_id,title,level,xp,treasury,mayor_id) VALUES (?,?,1,0,0,NULL)",
-                (chat.id, chat.title or str(chat.id)),
-            )
-            r = c.execute("SELECT * FROM cities WHERE chat_id=?", (chat.id,)).fetchone()
+            c.execute("UPDATE users SET total_earned = total_earned + ? WHERE id=?", (int(delta), int(uid)))
         else:
-            c.execute("UPDATE cities SET title=? WHERE chat_id=?", (chat.title or r["title"], chat.id))
-        return dict(r) if r else None
+            c.execute("UPDATE users SET total_spent = total_spent + ? WHERE id=?", (abs(int(delta)), int(uid)))
+        tid = txid()
+        c.execute("INSERT INTO transactions(user_id,kind,amount,meta,txid,ts) VALUES (?,?,?,?,?,?)",
+                  (int(uid), kind, int(delta), str(meta)[:200], tid, time.time()))
+        return new, tid
 
+def add_xp(uid, amount):
+    with tx() as c:
+        c.execute("UPDATE users SET xp = xp + ? WHERE id=?", (int(amount), int(uid)))
+        u = c.execute("SELECT xp,level FROM users WHERE id=?", (int(uid),)).fetchone()
+        xp, lv = int(u["xp"]), int(u["level"])
+        need = 100 * lv
+        while xp >= need:
+            xp -= need
+            lv += 1
+            need = 100 * lv
+        c.execute("UPDATE users SET xp=?, level=? WHERE id=?", (xp, lv, int(uid)))
+
+def meow_cd(uid):
+    cd = sint("meow_cd", 300)
+    mn = sint("meow_cd_min", 120)
+    u = get_user(uid)
+    reduce = (int(u["city_level"]) - 1) * sint("meow_cd_per_city", 12) if u else 0
+    return max(mn, cd - reduce)
+
+def render(tpl_key, **kw):
+    text = tget(tpl_key, "")
+    coin = sget("coin", "🪙")
+    kw.setdefault("coin", coin)
+    for k, v in kw.items():
+        text = text.replace("{"+k+"}", str(v))
+    return text
 
 def set_st(ctx, kind, extra=None):
     ctx.user_data["st"] = {"kind": kind, "extra": extra or {}, "ts": time.time()}
 
-
 def get_st(ctx):
     st = ctx.user_data.get("st")
-    if not st:
-        return None
+    if not st: return None
     if time.time() - st.get("ts", 0) > 900:
-        ctx.user_data.pop("st", None)
-        return None
+        ctx.user_data.pop("st", None); return None
     return st
-
 
 def clear_st(ctx):
     ctx.user_data.pop("st", None)
 
+# ═══════════════ PANELS ═══════════════
+def profile_text(u):
+    coin = sget("coin", "🪙")
+    with tx() as c:
+        rank = c.execute("SELECT COUNT(*)+1 AS r FROM users WHERE wallet+bank > ?",
+                         (int(u["wallet"])+int(u["bank"]),)).fetchone()["r"]
+        fc = c.execute("SELECT level FROM factories WHERE user_id=?", (u["id"],)).fetchone()
+    flv = fc["level"] if fc else 1
+    joined = datetime.fromtimestamp(float(u["joined_at"] or time.time()), TZ).strftime("%Y/%m/%d")
+    lines = [
+        "PROFILE // " + (u["name"] or "").upper(),
+        "",
+        f"NAME     : {u['name']}",
+        f"LEVEL    : {u['level']}",
+        f"CITY     : {to_roman(u['city_level'])}",
+        f"XP       : {num(u['xp'])}",
+        f"WALLET   : {num(u['wallet'])}",
+        f"BANK     : {num(u['bank'])}",
+        f"FACTORY  : {flv}",
+        f"RANK     : #{rank}",
+        f"STREAK   : {u['streak']}",
+        f"REFERS   : {u['referrals']}",
+        f"JOINED   : {joined}",
+    ]
+    return mono("\n".join(lines))
 
-# ───────────────────────── UI ─────────────────────────
-def city_panel_text(chat, city, mayor_name=None):
-    coin = sget("coin_emoji", "🪙")
-    try:
-        wusers = json.loads(city.get("willow_users") or "[]")
-    except Exception:
-        wusers = []
-    lv = int(city.get("level") or 1)
-    # goals for next level
-    need_w = 50 * lv
-    need_pop = 2 * lv
-    need_fish = 5 * lv
-    need_treas = 5000 * lv
-    mayor = mayor_name or "—"
-    pop = int(city.get("population") or len(wusers))
-    fish = int(city.get("fish") or 0)
-    tre = int(city.get("treasury") or 0)
-    title = city.get("title") or "شهر"
-    return (
-        f"🦝 شهر راکون <b>{title}</b> 🏰\n"
-        f"{mono('CITY')}\n\n"
-        f"🦁 شهردار : <b>{fancy_name(mayor)}</b> (مالک)\n\n"
-        f"⭐️ سطح شهر : {mono(to_roman(lv))}\n\n"
-        f"🌿 ویلو ها : {num(len(wusers))}\n"
-        f"┘─ 🎖️ رتبه فعالیت\n\n"
-        f"🦝 جمعیت : {num(pop)} راکون\n"
-        f"┘─ 🎖️ رتبه جمعیت\n\n"
-        f"🎣 ماهی ها : {num(fish)}\n"
-        f"┘─ 🎖️ رتبه ماهی\n\n"
-        f"🏦 خزانه : {num(tre)} {coin}\n"
-        f"┘─ 🎖️ رتبه خزانه\n\n"
-        f"⏫ باف های شهر ⬇️\n"
-        f"┘─ این شهر هنوز باف فعالی ندارد ❌\n\n"
-        f"🎯 هدف بعدی شهر برای ارتقا سطح ⬇️\n"
-        f"┘─  🌿 ویلو های مورد نیاز : {num(need_w)}\n"
-        f"┘─ 🦝 راکون های مورد نیاز : {num(need_pop)}\n"
-        f"┘─ 🎣 ماهی های مورد نیاز : {num(need_fish)}\n"
-        f"┘─ 🏦 دارایی مورد نیاز خزانه : {num(need_treas)} {coin}"
-    )
+def entity_panel(u, fac):
+    entity = nget("entity", "پیشی")
+    coin = sget("coin", "🪙")
+    inv = {}
+    try: inv = json.loads(u["inv"] or "{}")
+    except: pass
+    belly = int(inv.get("belly", 12))
+    ranks = {1:"تازه‌کار",2:"چابک",3:"ماهر",4:"ابر پیشی",5:"افسانه"}
+    rl = min(5, max(1, int(u["level"])//5+1))
+    prod = max(1, int(u["level"]) + int(fac["machine_level"]))
+    up = 50000 * int(u["level"])
+    return "\n".join([
+        f"🐱 {entity} <b>{u['name']}</b> 🐈",
+        "",
+        f"💕 نام : {entity}",
+        f"🍖 شکم : {'😻 عاشقتمیووو' if belly>=10 else '😊 سیر' if belly>=5 else '😩 گرسنه'} ({belly} / 12)",
+        "",
+        f"🌟 مقام : {ranks.get(rl,'پیشی')} ⚡️ ({rl})",
+        f"⭐️ سطح : {u['level']} / 50",
+        "",
+        f"💰 میو پوینت تولید شده : {num(u['total_earned'])} {coin}",
+        f"💫 تولید در ثانیه : {prod} {coin}",
+        f"📦 ظرفیت کارخانه : {num(fac['storage_cap'])}",
+        "",
+        f"💰 هزینه ارتقا مقام : {num(up)} {coin}",
+    ])
 
-
-def bank_panel_text(u):
-    coin = sget("coin_emoji", "🪙")
-    keys = u.keys() if hasattr(u, "keys") else u
-    acc = (u["bank_account"] if "bank_account" in keys else "") or str(u["id"])
-    bname = (u["bank_name"] if "bank_name" in keys else "") or (u["name"] or "—")
-    pct = sget("bank_profit_pct", "3")
-    from datetime import datetime, timedelta
+def bank_panel(u):
+    coin = sget("coin", "🪙")
+    pct = sget("bank_interest", "3")
     now = datetime.now(TZ)
-    nxt = now.replace(hour=int(sget("bank_profit_hour", "6") or 6), minute=0, second=0, microsecond=0)
-    if nxt <= now:
-        nxt = nxt + timedelta(days=1)
+    hour = int(sget("bank_interest_hour", "6") or 6)
+    nxt = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+    if nxt <= now: nxt += timedelta(days=1)
     tstr = nxt.strftime("%H:%M %Y/%m/%d")
-    deposit_ref = min(int(u["bank"]), 500000) if int(u["bank"]) > 0 else 0
-    parts = [
-        "🦝 بانک رِیو 🏦",
+    dep = min(int(u["bank"]), 500000) if int(u["bank"]) > 0 else 0
+    return "\n".join([
+        f"🐱 {nget('bank','بانک میویی')} 🏦",
         "",
-        "💳 شماره حساب : " + mono(str(acc)),
-        "👤 به نام : <b>%s</b>" % bname,
+        f"💳 شماره حساب : {mono(str(u['bank_account'] or u['id']))}",
+        f"👤 به نام : <b>{u['bank_name'] or u['name']}</b>",
         "",
-        "💰 موجودی حساب : <b>%s</b> %s" % (num(u["bank"]), coin),
+        f"💰 موجودی حساب : <b>{num(u['bank'])}</b> {coin}",
+        f"💵 کیف پول : <b>{num(u['wallet'])}</b> {coin}",
         "",
         "🤑 سود بانکی",
-        "┘─ 🛍 درصد سود : %s%%" % pct,
-        "┘─ 📥 مبلغ واریزی : %s %s" % (num(deposit_ref), coin),
-        "┘─ ⏳ زمان واریز : %s" % tstr,
+        f"┘─ 🛍 درصد سود : {pct}%",
+        f"┘─ 📥 مبلغ مشمول : {num(dep)} {coin}",
+        f"┘─ ⏳ زمان واریز : {tstr}",
         "",
         "❗️ برای مدیریت حساب بانکی از گزینه‌های زیر استفاده کنید ⬇️",
-    ]
-    return "\n".join(parts)
-
-
-def factory_panel_text(user_name, f):
-    coin = sget("coin_emoji", "🪙")
-    lv = int(f.get("level") or 1)
-    xp = int(f.get("xp") or 0)
-    need = 1000 * lv
-    st = int(f.get("storage") or 0)
-    cap = int(f.get("storage_cap") or 75000)
-    w = int(f.get("workers") or 0)
-    wm = int(f.get("workers_max") or 14)
-    prod = max(10, 120 - int(f.get("machine_lv") or 1) * 5)
-    return (
-        f"🦝 کارخونه راکون 🏭\n\n"
-        f"💼 مدیر کارخونه : <b>{user_name}</b>\n\n"
-        f"🧳 انبار کارخونه\n"
-        f"┘─ 🔺 ظرفیت انبار : {num(st)} / {num(cap)} محصول\n"
-        f"┘─ ⭐️ سطح : {int(f.get('level') or 1)}\n\n"
-        f"🦝 کارگران کارخونه\n"
-        f"┘─ 😺 تعداد کارگران : {w} / {wm} راکون\n"
-        f"┘─ ⭐️ سطح : {int(f.get('worker_lv') or 1)}\n\n"
-        f"🖨 دستگاه های تولید\n"
-        f"┘─ ⏳ زمان تولید محصول : {prod} ثانیه\n"
-        f"┘─ ⭐️ سطح : {int(f.get('machine_lv') or 1)}\n\n"
-        f"🌟 سطح کارخونه : {mono(to_roman(lv))}\n"
-        f"┘─ 🌡 {num(xp)}xᴘ / {num(need)}xᴘ {bar(xp, need)}\n\n"
-        f"🧮 شما درحال مدیریت کارخانه خود می‌باشید."
-    )
-
-
-def raccoon_panel_text(user_row, rac):
-    coin = sget("coin_emoji", "🪙")
-    name = rac["species"] if rac else "راکون"
-    belly = 12
-    try:
-        inv = json.loads(user_row["inv"] or "{}")
-        belly = int(inv.get("belly", 12))
-    except Exception:
-        pass
-    belly = max(0, min(12, belly))
-    heart = "😻 عاشقتم" if belly >= 10 else ("😊 سیر" if belly >= 5 else "😩 گرسنه")
-    rank_names = {1: "تازه‌کار", 2: "چابک", 3: "ماهر", 4: "ابر راکون", 5: "افسانه سایه"}
-    rank_lv = min(5, max(1, int(rac["level"] or 1) // 5 + 1))
-    prod = max(1, int(rac["level"] or 1) + int(rac["power"] or 0) // 5)
-    produced = int(user_row["willow_collected"] or 0)
-    cap = int(rac["capacity"] or 10) * 1000
-    up_cost = 50000 * int(rac["level"] or 1)
-    parts = [
-        "🦝 راکون <b>%s</b> 🌿" % user_row["name"],
-        "",
-        "💕 نام : %s" % name,
-        "🍖 شکم : %s (%s / 12)" % (heart, belly),
-        "",
-        "🌟 مقام : %s ⚡️ (%s)" % (rank_names.get(rank_lv, "راکون"), rank_lv),
-        "⭐️ سطح : %s / 25" % int(rac["level"]),
-        "",
-        "💰 ویلو های تولید شده : %s %s" % (num(produced), coin),
-        "💫 تولید ویلو در ثانیه : %s %s" % (prod, coin),
-        "📦 ظرفیت : %s" % num(cap),
-        "",
-        "💰 هزینه ارتقا مقام : %s %s" % (num(up_cost), coin),
-    ]
-    return "\n".join(parts)
-
-
-def casino_panel_text():
-    parts = [
-        "🃏 کازینو رِیو 🦝",
-        "",
-        "❗️ لطفا قمار مورد نظر را انتخاب کنید ⬇️",
-        "",
-        "‏🍷 قمار رِیو",
-        "┘─ محدودیت قمار باز : 2 - 5 راکون",
-        "",
-        "‏🎰 گردونه شانس",
-        "┘─ محدودیت بازیکن : 1 - 3 راکون",
-        "",
-        "‏🎲 تاس",
-        "┘─ محدودیت بازیکن : 1 - 2 راکون",
-        "",
-        "‏💎 معدن",
-        "┘─ محدودیت بازیکن : 1 راکون",
-    ]
-    return "\n".join(parts)
-
-
-def main_menu_kb():
-    return InlineKeyboardMarkup([
-        [btn("🦝 راکون من", "m:raccoon", "primary"), btn("🌿 دریافت ویلو", "m:willow", "success")],
-        [btn("🏦 بانک", "m:bank", "primary"), btn("🛒 بازار", "m:shop", "primary")],
-        [btn("🏙 شهر", "m:city", "primary"), btn("🏙 مارکت شهر", "m:citymarket", "primary")],
-        [btn("🎣 جمع‌آوری", "m:gather", "primary"), btn("⚔️ غارت", "m:raid", "danger")],
-        [btn("🃏 کازینو", "m:casino", "primary"), btn("🎁 کد هدیه", "m:gift", "success")],
-        [btn("🦝 راکون", "m:raccoon", "primary"), btn("🏆 رتبه‌بندی", "m:lb", "primary")],
-        [btn("👥 دوستان", "m:friends", "primary"), btn("👤 پروفایل", "m:profile", "primary")],
-        [btn("📖 راهنما", "m:help", "primary")],
     ])
 
-
-def back_main():
-    return InlineKeyboardMarkup([[btn("🔙 منوی اصلی", "m:home", "primary")]])
-
-
-def admin_kb():
-    return InlineKeyboardMarkup([
-        [btn("👥 لیست کاربران (کپی)", "a:ulist", "primary")],
-        [btn("➕ واریز", "a:add", "success"), btn("➖ کسر", "a:sub", "danger")],
-        [btn("📦 بازیابی دسته‌ای", "a:restore", "success")],
-        [btn("🌿 تنظیم ویلو", "a:willow", "primary"), btn("⚔️ مکان غارت", "a:raids", "primary")],
-        [btn("🛒 آیتم فروشگاه", "a:shop", "primary"), btn("🦝 راکون خیابانی", "a:street", "primary")],
-        [btn("🎁 کد هدیه", "a:code", "success"), btn("📢 همگانی", "a:bcast", "primary")],
-        [btn("📊 آمار", "a:stats", "primary"), btn("👤 ادمین‌ها", "a:admins", "primary")],
-        [btn("❌ بستن", "a:close", "danger")],
+def factory_panel(name, f):
+    coin = sget("coin", "🪙")
+    lv = int(f["level"]); xp = int(f["xp"]); need = 1000 * lv
+    return "\n".join([
+        f"🐱 {nget('factory','کارخانه میویی')} 🏭",
+        "",
+        f"💼 مدیر کارخانه : <b>{name}</b>",
+        "",
+        "🧳 انبار کارخانه",
+        f"┘─ 🔺 ظرفیت انبار : {num(f['storage'])} / {num(f['storage_cap'])} محصول",
+        f"┘─ ⭐️ سطح : {lv}",
+        "",
+        "🐈 کارگران کارخانه",
+        f"┘─ 😺 تعداد کارگران : {f['workers']} / {f['workers_max']} پیشی",
+        f"┘─ ⭐️ سطح : {f['workers_level']}",
+        "",
+        "🖨 دستگاه‌های تولید",
+        f"┘─ ⏳ زمان تولید محصول : {f['prod_time']} ثانیه",
+        f"┘─ ⭐️ سطح : {f['machine_level']}",
+        "",
+        f"🌟 سطح کارخانه : {mono(to_roman(lv))}",
+        f"┘─ 🌡 {num(xp)} XP / {num(need)} XP {bar(xp, need)}",
+        "",
+        "🧮 شما در حال مدیریت کارخانه خود می‌باشید.",
     ])
 
+def city_panel(u):
+    coin = sget("coin", "🪙")
+    lv = int(u["city_level"])
+    need_xp = 100 * lv
+    need_mp = 5000 * lv
+    need_fac = max(1, lv // 2)
+    with tx() as c:
+        fl = c.execute("SELECT level FROM factories WHERE user_id=?", (u["id"],)).fetchone()
+    flv = int(fl["level"]) if fl else 1
+    return "\n".join([
+        f"🐱 {nget('city','شهر میویی')} <b>{u['name']}</b> 🏰",
+        f"{mono('CITY')}",
+        "",
+        f"🦁 شهردار : <b>{fancy(u['name'])}</b>",
+        "",
+        f"⭐️ سطح شهر : {mono(to_roman(lv))}",
+        f"✨ XP شهر : {num(u['city_xp'])} / {num(need_xp)}",
+        f"🏦 خزانه : {num(u['city_treasury'])} {coin}",
+        "",
+        "⏫ باف های شهر ⬇️",
+        "┘─ باف فعال ثبت نشده ❌",
+        "",
+        "🎯 هدف ارتقا سطح بعدی ⬇️",
+        f"┘─ ✨ XP : {num(u['city_xp'])} / {num(need_xp)}",
+        f"┘─ 🪙 MP : {num(u['wallet'])} / {num(need_mp)}",
+        f"┘─ 🏭 کارخانه سطح : {flv} / {need_fac}",
+    ])
 
-def help_full():
-    return """📖 <b>راهنمای کامل رِیو</b>
+def help_text():
+    e = nget("entity", "پیشی")
+    return f"""📖 <b>راهنمای MeowPoint</b>
 ━━━━━━━━━━━━━━━━
-🦝 <b>هویت</b>
-بازی اقتصادی با راکون‌ها. ارز رسمی: <b>🌿 ویلو</b>.
+🪙 <b>ارز:</b> MeowPoint (MP)
 
-🌿 <b>ویلو</b>
-با دکمه «دریافت ویلو» یا نوشتن <code>ویلو</code> در گپ، ویلو می‌گیری.
-کول‌داون پایه ۵ دقیقه است؛ با <b>سطح شهر</b> و <b>نجات راکون خیابانی</b> کمتر می‌شود.
+🐱 <b>{e}</b>
+دستور: <code>{e}</code> یا <code>پیشی</code>
+پنل شخصی، سطح، شکم، ارتقا
 
-🦝 <b>راکون من</b>
-راکون اصلی‌ات سطح، قدرت، سرعت و شانس دارد.
-با خوراک از بازار ارتقا می‌یابد.
-
-🏦 <b>بانک</b>
-واریز و برداشت. انتقال با نوشتن:
-<code>انتقال 10k</code> + ریپلای روی کاربر
-کارمزد از تنظیمات ادمین.
-
-🏭 <b>کارخانه</b>
-تولید زمان‌دار؛ حتی وقتی آفلاینی زمان می‌گذرد.
-دوباره «کارخانه» بزن تا محصول را بگیری.
-
-🛒 <b>بازار</b>
-خوراک و تقویت‌کننده از فروشگاه سیستم.
-
-🏙 <b>مارکت شهر</b>
-فقط <b>شهردار (مالک گپ)</b> می‌تواند کالا/راکون از فروشگاه ادمین بخرد و با قیمت کمتر برای اعضای گپ بگذارد.
-
-🎣 <b>جمع‌آوری</b>
-راکون به منطقه می‌رود؛ ممکن است ویلو، آیتم یا چیزی پیدا نکند.
-
-⚔️ <b>غارت</b>
-حمله به <b>مکان‌های تعیین‌شده توسط ادمین</b> (نه کیف بازیکن‌ها).
-چند مرحله‌ای است؛ شکست = بازداشت.
+🐾 <b>میو</b>
+دستور: <code>میو</code>
+دریافت MP با کول‌داون (وابسته به سطح شهر)
 
 🏙 <b>شهر</b>
-هر گپ یک شهر دارد با سطح رومی (مثل <code>IV</code>)، خزانه و دونیت.
+دستور: <code>شهر</code>
+سطح رومی، خزانه، شرایط ارتقا
+
+🏭 <b>کارخانه</b>
+دستور: <code>کارخانه</code>
+تولید زمان‌دار، انبار، کارگر، ارتقا
+
+🏦 <b>بانک</b>
+دستور: <code>بانک</code>
+واریز / برداشت / انتقال / تاریخچه / شماره حساب
+
+🛒 <b>بازار</b>
+دستور: <code>بازار</code>
+خرید کالا و منابع
+
+🎣 <b>جمع‌آوری</b>
+دستور: <code>جمع آوری</code> یا <code>شکار</code>
 
 🎁 <b>کد هدیه</b>
-کدی که ادمین ساخته را وارد کن.
+دستور: <code>کد</code>
 
-👥 <b>دوستان</b>
-لینک دعوت اختصاصی و پاداش.
+👥 <b>دعوت</b>
+دستور: <code>دعوت</code>
 
-🏆 <b>رتبه‌بندی</b>
-بیشترین ویلو و سطح.
+🏆 <b>رتبه</b>
+دستور: <code>رتبه</code> یا <code>رتبه بندی</code>
 
-دستورات متنی (بدون /):
-<code>پروفایل</code> · <code>ویلو</code> · <code>شهر</code> · <code>بانک</code>
-<code>بازار</code> · <code>مارکت</code> · <code>غارت</code> · <code>کارخانه</code>
-<code>رتبه</code> · <code>راهنما</code> · <code>منو</code>
+👤 <b>پروفایل</b>
+دستور: <code>پروفایل</code> (حالت MONO)
+
+💸 <b>انتقال</b>
+<code>انتقال 10k</code> + ریپلای
+
 ادمین: <code>پنل</code> (فقط پیوی)
 """
 
+def main_kb(uid):
+    e = nget("entity", "پیشی")
+    return InlineKeyboardMarkup([
+        [btn(f"🐱 {e}", f"p:entity:{uid}", "primary"), btn("🐾 میو", f"p:meow:{uid}", "success")],
+        [btn("🏦 بانک", f"p:bank:{uid}", "primary"), btn("🏭 کارخانه", f"p:fac:{uid}", "primary")],
+        [btn("🏙 شهر", f"p:city:{uid}", "primary"), btn("🛒 بازار", f"p:shop:{uid}", "primary")],
+        [btn("🎣 جمع‌آوری", f"p:gather:{uid}", "primary"), btn("🎁 کد", f"p:gift:{uid}", "success")],
+        [btn("🏆 رتبه", f"p:lb:{uid}", "primary"), btn("👤 پروفایل", f"p:prof:{uid}", "primary")],
+        [btn("📖 راهنما", f"p:help:{uid}", "primary")],
+    ])
 
-# ───────────────────────── HANDLERS ─────────────────────────
-async def on_start_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    """شروع با کلمه استارت یا /start"""
+def own(data, uid):
+    parts = data.split(":")
+    if len(parts) >= 3:
+        try:
+            return int(parts[-1]) == int(uid)
+        except: return False
+    return True
+
+def admin_kb():
+    return InlineKeyboardMarkup([
+        [btn("👥 لیست کاربران", "a:ulist", "primary")],
+        [btn("➕ واریز", "a:add", "success"), btn("➖ کسر", "a:sub", "danger")],
+        [btn("⚙️ تنظیم میو", "a:meow", "primary"), btn("🏦 تنظیم بانک", "a:bank", "primary")],
+        [btn("📝 قالب‌ها", "a:tpl", "primary"), btn("🏷 نام‌ها", "a:names", "primary")],
+        [btn("🎁 کد هدیه", "a:code", "success"), btn("📢 همگانی", "a:bcast", "primary")],
+        [btn("📊 آمار", "a:stats", "primary"), btn("👤 ادمین+", "a:admins", "primary")],
+        [btn("❌ بستن", "a:close", "danger")],
+    ])
+
+# ═══════════════ HANDLERS ═══════════════
+async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
     user = u.effective_user
     ensure_user(user)
-    uw = get_user(user.id)
-    text = (
-        f"🦝 <b>به دنیای رِیو خوش آمدی</b>\n"
-        f"━━━━━━━━━━━━━━━━\n"
-        f"اینجا راکون‌ها برای <b>ویلو</b> می‌جنگند.\n"
-        f"موجودی اولیه: 🌿 <b>{num(uw['willow'])}</b>\n\n"
-        f"از منو شروع کن یا بنویس: <code>ویلو</code>"
-    )
-    await u.message.reply_text(text, parse_mode="HTML", reply_markup=main_menu_kb())
-
-
-async def show_profile(bot, chat_id, uid, message=None):
-    u = get_user(uid)
-    if not u:
-        return
-    rac = get_main_raccoon(uid)
-    with tx() as c:
-        rank = c.execute(
-            "SELECT COUNT(*)+1 AS r FROM users WHERE willow > ?", (u["willow"],)
-        ).fetchone()["r"]
-    jl = max(0, float(u["jail_until"] or 0) - time.time())
-    jail = f"\n🚔 بازداشت: {fmt_time(jl)}" if jl else ""
-    text = (
-        f"👤 <b>پروفایل رِیو</b>\n━━━━━━━━━━━━━━━━\n"
-        f"{mention(uid, u['name'])}\n"
-        f"⭐ سطح {mono(to_roman(u['level']))} · XP {num(u['xp'])}\n"
-        f"🌿 ویلو: <b>{num(u['willow'])}</b>\n"
-        f"🏦 بانک: <b>{num(u['bank'])}</b>\n"
-        f"🦝 راکون: {rac['species']} | سطح {mono(to_roman(rac['level']))}\n"
-        f"⚔️ قدرت {rac['power']} · 💨 {rac['speed']} · 🍀 {rac['luck']}\n"
-        f"🏆 رتبه ویلو: {mono(str(rank))}\n"
-        f"🌿 جمع‌شده: {num(u['willow_collected'])}\n"
-        f"✅ عملیات: {num(u['ops_ok'])} | ❌ {num(u['ops_fail'])}\n"
-        f"🕊 نجات خیابانی: {num(u['street_rescues'])}\n"
-        f"👥 دعوت: {num(u['invites'])}{jail}"
-    )
-    photo = rac["photo_file_id"]
-    kb = InlineKeyboardMarkup([[btn("🔙 منوی اصلی", "m:home", "primary")]])
-    if not photo:
+    text = u.message.text or ""
+    if "ref" in text:
         try:
-            ph = await bot.get_user_profile_photos(int(uid), limit=1)
-            if ph.total_count:
-                photo = ph.photos[0][-1].file_id
-        except Exception:
-            pass
-    if photo:
-        try:
-            await bot.send_photo(chat_id, photo=photo, caption=text, parse_mode="HTML", reply_markup=kb)
-            return
-        except Exception:
-            pass
-    await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb)
-
-
-async def do_willow(u: Update, c: ContextTypes.DEFAULT_TYPE, from_cb=False):
-    user = u.effective_user
-    ensure_user(user)
-    chat = u.effective_chat
-    if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
-        ensure_city(chat)
+            ref = int(re.search(r"ref(\d+)", text).group(1))
+            if ref != user.id:
+                uu = get_user(user.id)
+                if uu and not uu["referred_by"]:
+                    with tx() as conn:
+                        conn.execute("UPDATE users SET referred_by=? WHERE id=? AND referred_by IS NULL", (ref, user.id))
+                        conn.execute("UPDATE users SET referrals = referrals + 1 WHERE id=?", (ref,))
+                    try:
+                        change_wallet(user.id, 2000, "ref_bonus", str(ref))
+                        change_wallet(ref, 5000, "ref_reward", str(user.id))
+                    except Exception: pass
+        except Exception: pass
     uu = get_user(user.id)
-    if uu["status"] != "active":
-        msg = "حسابت مسدود است."
-        if from_cb:
-            await u.callback_query.answer(msg, show_alert=True)
-        else:
-            await u.message.reply_text(msg)
-        return
-    jl = max(0, float(uu["jail_until"] or 0) - time.time())
-    if jl:
-        msg = f"🚔 در بازداشتی: {fmt_time(jl)}"
-        if from_cb:
-            await u.callback_query.edit_message_text(msg, reply_markup=back_main())
-        else:
-            await u.message.reply_text(msg)
-        return
-    cd = willow_cooldown(user.id, chat.id if chat.type != ChatType.PRIVATE else None)
-    left = float(uu["last_willow"] or 0) + cd - time.time()
-    if left > 0:
-        text = (
-            f"🦝 هنوز ریو نمیاد..\n"
-            f"⏳ باید <b>{fmt_time(left)}</b> صبر کنی"
-        )
-        if from_cb:
-            await u.callback_query.edit_message_text(text, parse_mode="HTML", reply_markup=back_main())
-        else:
-            await u.message.reply_text(text, parse_mode="HTML")
-        return
-    amin, amax = sint("willow_min", 3000), sint("willow_max", 7000)
-    amount = random.randint(min(amin, amax), max(amin, amax))
-    # city bonus
-    if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
-        with tx() as conn:
-            city = conn.execute("SELECT level, willow_users FROM cities WHERE chat_id=?", (chat.id,)).fetchone()
-            if city:
-                amount += (int(city["level"]) - 1) * 200
-                try:
-                    users = json.loads(city["willow_users"] or "[]")
-                except Exception:
-                    users = []
-                if user.id not in users:
-                    users.append(user.id)
-                conn.execute(
-                    "UPDATE cities SET willow_users=?, xp = xp + ? WHERE chat_id=?",
-                    (json.dumps(users), sint("city_xp_per_willow", 1), chat.id),
-                )
-                # level up city
-                city2 = conn.execute("SELECT level, xp FROM cities WHERE chat_id=?", (chat.id,)).fetchone()
-                need = 50 * int(city2["level"])
-                if int(city2["xp"]) >= need:
-                    conn.execute(
-                        "UPDATE cities SET level = level + 1, xp = xp - ? WHERE chat_id=?",
-                        (need, chat.id),
-                    )
-    new_bal = change_willow(user.id, amount, "willow", "collect")
-    with tx() as conn:
-        conn.execute("UPDATE users SET last_willow=? WHERE id=?", (time.time(), user.id))
-    coin = sget("coin_emoji", "🪙")
-    text = (
-        f"<b>{num(amount)}</b> ویلو گرفتی 🌿\n"
-        f"💰 ویلو هات : <b>{num(new_bal)}</b> {coin}\n"
-        f"⏳ بعد از <b>{fmt_time(cd)}</b> می‌تونی دوباره ویلو بگیری"
+    await u.message.reply_text(
+        f"🐱 به <b>MeowPoint</b> خوش آمدی!\n"
+        f"موجودی: <b>{num(uu['wallet'])}</b> {sget('coin','🪙')}\n\n"
+        f"بنویس <code>{nget('entity','پیشی')}</code> یا از منو استفاده کن.",
+        parse_mode="HTML",
+        reply_markup=main_kb(user.id) if u.effective_chat.type == ChatType.PRIVATE else None,
     )
-    if from_cb:
-        await u.callback_query.edit_message_text(text, parse_mode="HTML", reply_markup=back_main())
-    else:
-        await u.message.reply_text(text, parse_mode="HTML")
 
+async def do_meow(bot, chat_id, user, message=None, edit=False):
+    ensure_user(user)
+    u = get_user(user.id)
+    if u["status"] != "active":
+        return "مسدود هستی"
+    cd = meow_cd(user.id)
+    left = float(u["last_meow"] or 0) + cd - time.time()
+    if left > 0:
+        return render("meow_wait", left=fmt_time(left))
+    amin, amax = sint("meow_min", 50), sint("meow_max", 120)
+    amount = random.randint(min(amin, amax), max(amin, amax))
+    amount += (int(u["city_level"]) - 1) * 10
+    new, _ = change_wallet(user.id, amount, "meow", "")
+    add_xp(user.id, 2)
+    with tx() as c:
+        c.execute("UPDATE users SET last_meow=?, city_xp = city_xp + ? WHERE id=?",
+                  (time.time(), sint("city_xp_meow", 1), user.id))
+        # city level up
+        uu = c.execute("SELECT city_level, city_xp FROM users WHERE id=?", (user.id,)).fetchone()
+        need = 100 * int(uu["city_level"])
+        if int(uu["city_xp"]) >= need:
+            c.execute("UPDATE users SET city_level = city_level + 1, city_xp = city_xp - ? WHERE id=?",
+                      (need, user.id))
+    return render("meow_ok", amount=num(amount), wallet=num(new), cd=fmt_time(cd))
 
-async def on_callback(u: Update, c: ContextTypes.DEFAULT_TYPE):
+async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
     q = u.callback_query
     data = q.data or ""
     user = u.effective_user
@@ -934,1306 +659,556 @@ async def on_callback(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
     if data == "a:close":
         await q.answer()
-        try:
-            await q.message.delete()
-        except Exception:
-            pass
+        try: await q.message.delete()
+        except: pass
         return
 
-    # ---- main menu ----
-    if data == "m:home":
-        await q.answer()
-        await q.edit_message_text("🦝 <b>منوی رِیو</b>\nیک بخش را انتخاب کن:", parse_mode="HTML", reply_markup=main_menu_kb())
-        return
-    if data == "m:help":
-        await q.answer()
-        await q.edit_message_text(help_full(), parse_mode="HTML", reply_markup=back_main())
-        return
-    if data == "m:profile":
-        await q.answer()
-        try:
-            await q.message.delete()
-        except Exception:
-            pass
-        await show_profile(c.bot, chat.id, user.id)
-        return
-    if data == "m:willow":
-        await q.answer()
-        await do_willow(u, c, from_cb=True)
-        return
-    if data == "m:raccoon":
-        await q.answer()
-        if user.id != user.id:
-            return
-        rac = get_main_raccoon(user.id)
-        uu = get_user(user.id)
-        kb = InlineKeyboardMarkup([
-            [btn("⬆️ ارتقا مقام", f"rac:up:{user.id}", "success")],
-            [btn("🔙", "m:home", "primary")],
-        ])
-        await q.edit_message_text(raccoon_panel_text(uu, rac), parse_mode="HTML", reply_markup=kb)
-        return
-    if data.startswith("rac:up:"):
-        await q.answer()
-        if user.id != int(data.split(":")[2]):
-            await q.answer("مال تو نیست", show_alert=True)
-            return
-        rac = get_main_raccoon(user.id)
-        cost = 50000 * int(rac["level"] or 1)
-        if int(rac["level"]) >= 25:
-            await q.answer("حداکثر سطح", show_alert=True)
-            return
-        try:
-            change_willow(user.id, -cost, "rac_up", "")
-        except ValueError:
-            await q.answer("ویلو کافی نیست", show_alert=True)
-            return
-        with tx() as conn:
-            conn.execute(
-                "UPDATE raccoons SET level = level + 1, power = power + 2, speed = speed + 1, luck = luck + 1, capacity = capacity + 1, value = value + 500 WHERE id=?",
-                (rac["id"],),
-            )
-            conn.execute("UPDATE users SET level = level + 1 WHERE id=?", (user.id,))
-        rac = get_main_raccoon(user.id)
-        uu = get_user(user.id)
-        kb = InlineKeyboardMarkup([
-            [btn("⬆️ ارتقا مقام", f"rac:up:{user.id}", "success")],
-            [btn("🔙", "m:home", "primary")],
-        ])
-        await q.edit_message_text("✅ ارتقا یافت!\n" + raccoon_panel_text(uu, rac), parse_mode="HTML", reply_markup=kb)
-        return
-    if data == "m:bank":
-        await q.answer()
-        uu = get_user(user.id)
-        kb = InlineKeyboardMarkup([
-            [btn("⬆️ واریز", f"bank:in:{user.id}", "success"), btn("⬇️ برداشت", f"bank:out:{user.id}", "danger")],
-            [btn("💸 انتقال", f"bank:tr:{user.id}", "primary"), btn("📜 تاریخچه", f"bank:log:{user.id}", "primary")],
-            [btn("💳 تغییر شماره حساب", f"bank:acc:{user.id}", "primary")],
-            [btn("🔙", "m:home", "primary")],
-        ])
-        await q.edit_message_text(bank_panel_text(uu), parse_mode="HTML", reply_markup=kb)
-        return
-    if data.startswith("bank:in:") or data.startswith("bank:out:"):
-        await q.answer()
-        owner = int(data.split(":")[2])
-        if user.id != owner:
-            await q.answer("مال تو نیست", show_alert=True)
-            return
-        set_st(c, "bank_in" if data.startswith("bank:in") else "bank_out")
-        await q.edit_message_text("مبلغ را به صورت عددی بفرست (مثال 10k):")
-        return
-    if data.startswith("bank:log:"):
-        await q.answer()
-        if user.id != int(data.split(":")[2]):
-            return
-        with tx() as conn:
-            rows = conn.execute(
-                "SELECT * FROM transactions WHERE user_id=? ORDER BY id DESC LIMIT 15", (user.id,)
-            ).fetchall()
-        lines = ["📜 <b>آخرین تراکنش‌ها</b>\n"]
-        for r in rows:
-            lines.append(f"• {r['kind']}: {num(r['amount'])}")
-        await q.edit_message_text("\n".join(lines) or "خالی", parse_mode="HTML", reply_markup=back_main())
-        return
-
-    if data == "m:factory":
-        await q.answer()
-        now = time.time()
-        with tx() as conn:
-            f = conn.execute("SELECT * FROM factories WHERE user_id=?", (user.id,)).fetchone()
-            if not f:
-                conn.execute("INSERT INTO factories(user_id) VALUES (?)", (user.id,))
-                f = conn.execute("SELECT * FROM factories WHERE user_id=?", (user.id,)).fetchone()
-            f = dict(f)
-        # sync workers from street_rescues
-        uu = get_user(user.id)
-        rescues = int(uu["street_rescues"] or 0)
-        with tx() as conn:
-            conn.execute(
-                "UPDATE factories SET workers = MIN(workers_max, ?) WHERE user_id=?",
-                (rescues, user.id),
-            )
-            f = dict(conn.execute("SELECT * FROM factories WHERE user_id=?", (user.id,)).fetchone())
-        kb_fac = InlineKeyboardMarkup([
-            [btn("▶️ شروع تولید", f"fac:go:{user.id}", "success")],
-            [btn("⬆️ ارتقا کارخانه", f"fac:up:{user.id}", "success")],
-            [btn("🔙", "m:home", "primary")],
-        ])
-        extra = ""
-        if float(f["busy_until"] or 0) > now:
-            extra = f"\n\n⏳ تولید جاری: {fmt_time(float(f['busy_until']) - now)}"
-        elif int(f.get("ready") or 0):
-            extra = f"\n\n✅ محصول آماده — دوباره شروع تولید را بزن تا تحویل شود"
-        await q.edit_message_text(
-            factory_panel_text(user.full_name, f) + extra,
-            parse_mode="HTML",
-            reply_markup=kb_fac,
-        )
-        return
-    if data.startswith("fac:go:"):
-        await q.answer()
-        if user.id != int(data.split(":")[2]):
-            return
-        now = time.time()
-        with tx() as conn:
-            f = dict(conn.execute("SELECT * FROM factories WHERE user_id=?", (user.id,)).fetchone())
-        if float(f["busy_until"] or 0) > now:
-            await q.answer("هنوز در حال تولید", show_alert=True)
-            return
-        if int(f.get("ready") or 0):
-            reward = int(f.get("reward") or 0)
-            # workers bonus
-            reward += int(f.get("workers") or 0) * 500
-            change_willow(user.id, reward, "factory", f"lv{f['level']}")
-            with tx() as conn:
-                conn.execute("UPDATE factories SET ready=0, reward=0, storage = MIN(storage_cap, storage + ?) WHERE user_id=?", (max(1, reward // 1000), user.id))
-            await q.edit_message_text(f"🏭 تحویل شد: 🌿 <b>+{num(reward)}</b>", parse_mode="HTML", reply_markup=back_main())
-            return
-        tsec = max(10, sint("factory_base_time", 1800) - int(f.get("machine_lv") or 1) * 5)
-        reward = sint("factory_base_reward", 25000) * int(f["level"])
-        with tx() as conn:
-            conn.execute(
-                "UPDATE factories SET busy_until=?, ready=1, reward=?, xp = xp + 50 WHERE user_id=?",
-                (now + tsec, reward, user.id),
-            )
-        await q.edit_message_text(
-            f"🏭 تولید شروع شد\nپاداش حدودی: {num(reward)}\n⏱ {fmt_time(tsec)}",
-            parse_mode="HTML",
-            reply_markup=back_main(),
-        )
-        return
-    if data.startswith("fac:up:"):
-        await q.answer()
-        if user.id != int(data.split(":")[2]):
-            return
-        cost = 50000
-        try:
-            change_willow(user.id, -cost, "factory_up", "")
-        except ValueError:
-            await q.answer("ویلو کافی نیست", show_alert=True)
-            return
-        with tx() as conn:
-            conn.execute("UPDATE factories SET level = level + 1 WHERE user_id=?", (user.id,))
-            lv = conn.execute("SELECT level FROM factories WHERE user_id=?", (user.id,)).fetchone()["level"]
-        await q.edit_message_text(f"🏭 ارتقا یافت → سطح {mono(to_roman(lv))}", parse_mode="HTML", reply_markup=back_main())
-        return
-
-    if data == "m:shop":
-        await q.answer()
-        with tx() as conn:
-            items = conn.execute("SELECT * FROM shop_items WHERE active=1").fetchall()
-        lines = ["🛒 <b>بازار رِیو</b>\n━━━━━━━━━━━━━━━━\n"]
-        rows = []
-        for it in items:
-            lines.append(f"• <b>{it['name']}</b> — 🌿 {num(it['price'])}")
-            rows.append([btn(f"{it['name'][:18]} | {num(it['price'])}", f"buy:{it['id']}:{user.id}", "success")])
-        rows.append([btn("🔙", "m:home", "primary")])
-        await q.edit_message_text("\n".join(lines), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
-        return
-    if data.startswith("buy:"):
-        await q.answer()
-        _, iid, owner = data.split(":")
-        if user.id != int(owner):
-            await q.answer("مال تو نیست", show_alert=True)
-            return
-        with tx() as conn:
-            it = conn.execute("SELECT * FROM shop_items WHERE id=? AND active=1", (iid,)).fetchone()
-        if not it:
-            await q.answer("ناموجود", show_alert=True)
-            return
-        try:
-            change_willow(user.id, -int(it["price"]), "shop", iid)
-        except ValueError:
-            await q.answer("ویلو کافی نیست", show_alert=True)
-            return
-        # apply effect
-        eff = it["effect"] or ""
-        with tx() as conn:
-            inv = conn.execute("SELECT inv FROM users WHERE id=?", (user.id,)).fetchone()["inv"]
-            try:
-                invd = json.loads(inv or "{}")
-            except Exception:
-                invd = {}
-            if eff.startswith("xp:"):
-                xp = int(eff.split(":")[1])
-                conn.execute("UPDATE users SET xp = xp + ? WHERE id=?", (xp, user.id))
-                rac = get_main_raccoon(user.id)
-                conn.execute("UPDATE raccoons SET xp = xp + ?, value = value + ? WHERE id=?", (xp, xp * 10, rac["id"]))
-            elif eff.startswith("cd_half:"):
-                invd["cd_half"] = int(invd.get("cd_half") or 0) + 1
-            elif eff.startswith("jail_pass:"):
-                invd["jail_pass"] = int(invd.get("jail_pass") or 0) + 1
-            conn.execute("UPDATE users SET inv=? WHERE id=?", (json.dumps(invd, ensure_ascii=False), user.id))
-        await q.edit_message_text(f"✅ خرید: <b>{it['name']}</b>", parse_mode="HTML", reply_markup=back_main())
-        return
-
-    if data == "m:city":
-        await q.answer()
-        if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
-            await q.edit_message_text("شهر فقط در گپ معنا دارد. ربات را به گپ اضافه کن.", reply_markup=back_main())
-            return
-        ensure_city(chat)
-        with tx() as conn:
-            city = dict(conn.execute("SELECT * FROM cities WHERE chat_id=?", (chat.id,)).fetchone())
-        mayor_name = "—"
-        mayor_id = city.get("mayor_id")
-        try:
-            admins = await c.bot.get_chat_administrators(chat.id)
-            for a in admins:
-                if a.status == "creator":
-                    mayor_name = a.user.full_name
-                    mayor_id = a.user.id
-                    with tx() as conn:
-                        conn.execute("UPDATE cities SET mayor_id=? WHERE chat_id=?", (mayor_id, chat.id))
-                    break
-        except Exception:
-            if mayor_id:
-                urow = get_user(mayor_id)
-                if urow:
-                    mayor_name = urow["name"]
-        # population = unique willow users
-        try:
-            wusers = json.loads(city.get("willow_users") or "[]")
-        except Exception:
-            wusers = []
-        with tx() as conn:
-            conn.execute("UPDATE cities SET population=? WHERE chat_id=?", (len(wusers), chat.id))
-            city["population"] = len(wusers)
-        kb = InlineKeyboardMarkup([
-            [btn("🕊 دونیت به خزانه", f"don:{chat.id}:{user.id}", "success")],
-            [btn("🏙 مارکت شهر", "m:citymarket", "primary")],
-            [btn("🔙 منو", "m:home", "primary")],
-        ])
-        await q.edit_message_text(city_panel_text(chat, city, mayor_name), parse_mode="HTML", reply_markup=kb)
-        return
-    if data.startswith("don:"):
-
-        await q.answer()
-        parts = data.split(":")
-        if user.id != int(parts[2]):
-            return
-        set_st(c, "donate_city", {"chat_id": int(parts[1])})
-        await q.edit_message_text("مبلغ دونیت به خزانه شهر را بفرست:")
-        return
-
-    if data == "m:raid":
-        await q.answer()
-        uu = get_user(user.id)
-        jl = max(0, float(uu["jail_until"] or 0) - time.time())
-        if jl:
-            await q.edit_message_text(f"🚔 بازداشت: {fmt_time(jl)}", reply_markup=back_main())
-            return
-        with tx() as conn:
-            places = conn.execute("SELECT * FROM raid_places WHERE active=1").fetchall()
-        rows = []
-        lines = ["⚔️ <b>غارت — مکان‌های رسمی</b>\nپول از مکان است، نه از بازیکن‌ها\n"]
-        for p in places:
-            lines.append(f"• {p['name']} | سطح {p['min_level']}+ | صندوق {num(p['pool'])}")
-            rows.append([btn(f"{p['name']} · {num(p['pool'])}", f"raid:{p['id']}:{user.id}", "danger")])
-        rows.append([btn("🔙", "m:home", "primary")])
-        await q.edit_message_text("\n".join(lines), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
-        return
-    if data.startswith("raid:") and data.count(":") == 2:
-        await q.answer()
-        _, pid, owner = data.split(":")
-        if user.id != int(owner):
-            await q.answer("مال تو نیست", show_alert=True)
-            return
-        with tx() as conn:
-            p = conn.execute("SELECT * FROM raid_places WHERE id=? AND active=1", (pid,)).fetchone()
-        if not p:
-            return
-        uu = get_user(user.id)
-        if int(uu["level"]) < int(p["min_level"]):
-            await q.answer("سطح‌ات کم است", show_alert=True)
-            return
-        cd_left = float(uu["last_raid"] or 0) + int(p["cooldown"]) - time.time()
-        if cd_left > 0:
-            await q.answer(f"کول‌داون {fmt_time(cd_left)}", show_alert=True)
-            return
-        # multi stage animation
-        stages = max(5, int(p["stages"]) + 2)
-        flavor = [
-            "🕶️ نفوذ به تاریکی...",
-            "🔐 شکستن قفل اول...",
-            "📡 قطع کردن دوربین...",
-            "👜 پر کردن کیسه...",
-            "🚪 مسیر فرار...",
-            "🏃 تعقیب سایه‌ها...",
-            "✨ لحظه آخر...",
-        ]
-        for i in range(stages):
-            try:
-                msg = flavor[i % len(flavor)]
-                await q.edit_message_text(
-                    f"{msg}\n⚔️ مرحله {mono(to_roman(i+1))} / {mono(to_roman(stages))}"
-                )
-            except Exception:
-                pass
-            await asyncio.sleep(0.75)
-        fail = random.random() < float(p["fail_chance"])
-        # jail pass?
-        with tx() as conn:
-            inv = json.loads(conn.execute("SELECT inv FROM users WHERE id=?", (user.id,)).fetchone()["inv"] or "{}")
-        if fail:
-            if int(inv.get("jail_pass") or 0) > 0:
-                inv["jail_pass"] = int(inv["jail_pass"]) - 1
-                with tx() as conn:
-                    conn.execute("UPDATE users SET inv=?, ops_fail = ops_fail + 1, last_raid=? WHERE id=?",
-                                 (json.dumps(inv), time.time(), user.id))
-                await q.edit_message_text("🚓 شکست — اما کارت آزادی نجاتت داد!", reply_markup=back_main())
-                return
-            sec = int(p["jail_sec"])
-            with tx() as conn:
-                conn.execute(
-                    "UPDATE users SET jail_until=?, ops_fail = ops_fail + 1, last_raid=? WHERE id=?",
-                    (time.time() + sec, time.time(), user.id),
-                )
-                # pool slightly grows on fail (tension)
-                conn.execute("UPDATE raid_places SET pool = pool + ? WHERE id=?", (int(p["pool"] * 0.02), pid))
-            await q.edit_message_text(
-                f"🚓 <b>دستگیر شدی</b>\nمکان: {p['name']}\nبازداشت: {fmt_time(sec)}",
-                parse_mode="HTML",
-                reply_markup=back_main(),
-            )
-            return
-        loot = int(int(p["pool"]) * random.uniform(0.08, 0.18))
-        loot = max(1000, loot)
-        with tx() as conn:
-            pool = conn.execute("SELECT pool FROM raid_places WHERE id=?", (pid,)).fetchone()["pool"]
-            loot = min(loot, int(pool))
-            conn.execute("UPDATE raid_places SET pool = pool - ? WHERE id=?", (loot, pid))
-            conn.execute(
-                "UPDATE users SET ops_ok = ops_ok + 1, last_raid=? WHERE id=?",
-                (time.time(), user.id),
-            )
-        change_willow(user.id, loot, "raid", pid)
-        await q.edit_message_text(
-            f"✅ <b>غارت موفق</b>\n📍 {p['name']}\n🌿 <b>+{num(loot)}</b>\nصندوق باقی: {num(int(p['pool']) - loot)}",
-            parse_mode="HTML",
-            reply_markup=back_main(),
-        )
-        return
-
-    if data == "m:gather":
-        await q.answer()
-        uu = get_user(user.id)
-        cd = sint("gather_cd", 600)
-        left = float(uu["last_gather"] or 0) + cd - time.time()
-        if left > 0:
-            await q.edit_message_text(f"🦝 ماهیا هنوز خوابن..\n⏳ باید <b>{fmt_time(left)}</b> صبر کنی", parse_mode="HTML", reply_markup=back_main())
-            return
-        rac = get_main_raccoon(user.id)
-        chance = 0.55 + int(rac["luck"]) / 200
-        with tx() as conn:
-            conn.execute("UPDATE users SET last_gather=? WHERE id=?", (time.time(), user.id))
-        if random.random() > chance:
-            await q.edit_message_text("🌫️ چیزی پیدا نشد... راکونت خسته برگشت.", reply_markup=back_main())
-            return
-        gain = random.randint(2000, 9000) + int(rac["level"]) * 200
-        change_willow(user.id, gain, "gather", "")
-        # rare street rescue
-        extra = ""
-        kb_g = back_main()
-        if random.random() < 0.12:
-            with tx() as conn:
-                conn.execute("UPDATE users SET street_rescues = street_rescues + 1 WHERE id=?", (user.id,))
-            bonus = random.randint(500, 1200)
-            change_willow(user.id, bonus, "street_rescue", "")
-            # meow-like 3 willows conceptually
-            text = (
-                f"🦝 راکون خیابانی بعد از تلاش با موفقیت نجات یافت و صاحب یک خونه جدید شد 🌿\n\n"
-                f"🦝 {mention(user.id, user.full_name)} با موفقیت راکون خیابانی را نجات داد\n\n"
-                f"💝 پاداش ⬇️\n"
-                f"┘─ +{num(bonus)} 🪙\n"
-                f"┘─ راکون خیابانی براتون ۳ بار ویلو جمع کرد 🌿\n"
-                f"┘─ جمع‌آوری: +{num(gain)}"
-            )
-            kb_g = InlineKeyboardMarkup([
-                [btn("🕊 نجات دوباره", "m:gather", "success")],
-                [btn("🔙", "m:home", "primary")],
-            ])
-            await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb_g)
-            return
-        kb_meat = InlineKeyboardMarkup([
-            [btn("💰 فروش گوشت", f"meat:sell:{user.id}:{gain}", "success")],
-            [btn("🍖 دادن به راکون", f"meat:feed:{user.id}", "primary")],
-            [btn("🔙", "m:home", "primary")],
-        ])
-        await q.edit_message_text(
-            "🎣 شکار شد!\n🌿 +%s (موقت)\nگوشت را بفروش یا به راکون بده:" % num(gain),
-            parse_mode="HTML",
-            reply_markup=kb_meat,
-        )
-        # hold gain in pending via inv
-        with tx() as conn:
-            inv = json.loads(conn.execute("SELECT inv FROM users WHERE id=?", (user.id,)).fetchone()["inv"] or "{}")
-            inv["pending_meat"] = gain
-            conn.execute("UPDATE users SET inv=? WHERE id=?", (json.dumps(inv), user.id))
-        # revert auto gain - we already added - actually gain already applied; meat is cosmetic choice for belly
-
-        return
-
-    if data == "m:casino":
-        await q.answer()
-        kb = InlineKeyboardMarkup([
-            [btn("🎲 تاس (زوج/فرد)", f"cas:dice:{user.id}", "primary")],
-            [btn("🎰 اسلات", f"cas:slot:{user.id}", "primary")],
-            [btn("🔙", "m:home", "primary")],
-        ])
-        await q.edit_message_text(casino_panel_text(), parse_mode="HTML", reply_markup=kb)
-        return
-    if data.startswith("cas:dice:") or data.startswith("cas:slot:"):
-        await q.answer()
-        owner = int(data.split(":")[2])
-        if user.id != owner:
-            await q.answer("مال تو نیست", show_alert=True)
-            return
-        mode = "dice" if data.startswith("cas:dice") else "slot"
-        set_st(c, "casino_bet", {"mode": mode})
-        await q.edit_message_text(
-            "مبلغ شرط را بفرست (مثال 5k):\nبعد برای تاس ایموجی 🎲 بفرست یا بگو زوج/فرد\nبرای اسلات 🎰 بفرست",
-        )
-        return
-    if data == "m:gift":
-        await q.answer()
-        set_st(c, "gift")
-        await q.edit_message_text("🎁 کد هدیه را بفرست:")
-        return
-    if data == "m:friends":
-        await q.answer()
-        me = await c.bot.get_me()
-        link = f"https://t.me/{me.username}?start=ref{user.id}"
-        uu = get_user(user.id)
-        await q.edit_message_text(
-            f"👥 <b>دعوت دوستان</b>\nلینک تو:\n{link}\n\nدعوت‌های موفق: <b>{num(uu['invites'])}</b>",
-            parse_mode="HTML",
-            reply_markup=back_main(),
-        )
-        return
-    if data == "m:lb":
-        await q.answer()
-        with tx() as conn:
-            rows = conn.execute(
-                "SELECT id,name,willow,level FROM users WHERE IFNULL(status,'active')='active' ORDER BY willow DESC LIMIT 10"
-            ).fetchall()
-        if not rows:
-            await q.edit_message_text("رتبه‌بندی خالی است.", reply_markup=back_main())
-            return
-        lines = ["🏆 <b>رتبه‌بندی ویلو</b>", "━━━━━━━━━━━━━━━━", ""]
-        for i, r in enumerate(rows, 1):
-            lines.append("%s %s" % (mono(to_roman(i)), mention(r["id"], r["name"] or str(r["id"]))))
-            lines.append("    🌿 %s · سطح %s" % (num(r["willow"]), to_roman(r["level"] or 1)))
-            lines.append("")
-        await q.edit_message_text("\n".join(lines), parse_mode="HTML", reply_markup=back_main())
-        return
-    if data == "m:missions":
-        await q.answer()
-        uu = get_user(user.id)
-        lines = [
-            "🎯 <b>مأموریت‌ها</b>\n",
-            f"• روزانه: یک‌بار ویلو بگیر — {'✅' if float(uu['last_willow'] or 0) > time.time()-86400 else '⬜'}",
-            f"• جمع‌آوری: یک‌بار فعالیت — {'✅' if float(uu['last_gather'] or 0) > time.time()-86400 else '⬜'}",
-            f"• غارت موفق کل: {num(uu['ops_ok'])}",
-            "\nپاداش مأموریت‌های پیشرفته از پنل ادمین قابل گسترش است.",
-        ]
-        await q.edit_message_text("\n".join(lines), parse_mode="HTML", reply_markup=back_main())
-        return
-    if data == "m:citymarket":
-        await q.answer()
-        if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
-            await q.edit_message_text("مارکت شهر فقط در گپ.", reply_markup=back_main())
-            return
-        ensure_city(chat)
-        with tx() as conn:
-            clv = conn.execute("SELECT level FROM cities WHERE chat_id=?", (chat.id,)).fetchone()
-            clv = int(clv["level"]) if clv else 1
-        need_lv = sint("market_min_city_lv", 7)
-        if clv < need_lv:
-            await q.edit_message_text(
-                f"🏙 مارکت شهر از سطح {mono(to_roman(need_lv))} باز می‌شود.\nسطح فعلی شهر: {mono(to_roman(clv))}",
-                parse_mode="HTML",
-                reply_markup=back_main(),
-            )
-            return
-        with tx() as conn:
-            city = dict(conn.execute("SELECT * FROM cities WHERE chat_id=?", (chat.id,)).fetchone())
-            streets = conn.execute("SELECT * FROM street_raccoons WHERE active=1").fetchall()
-        try:
-            market = json.loads(city.get("market") or "[]")
-        except Exception:
-            market = []
-        lines = ["🏙 <b>مارکت شهر</b>\nقیمت‌ها توسط شهردار تنظیم می‌شود\n"]
-        rows = []
-        if not market:
-            lines.append("هنوز کالایی نیست.\nشهردار از فروشگاه ادمین شارژ کند.")
-        for i, it in enumerate(market[:20]):
-            lines.append(f"• {it.get('name')} — 🌿 {num(it.get('price', 0))}")
-            rows.append([btn(f"خرید {it.get('name')[:15]}", f"cmbuy:{chat.id}:{i}:{user.id}", "success")])
-        # mayor can stock
-        rows.append([btn("➕ شارژ مارکت (شهردار)", f"cmstock:{chat.id}:{user.id}", "primary")])
-        rows.append([btn("🔙", "m:home", "primary")])
-        await q.edit_message_text("\n".join(lines), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
-        return
-
-    if data.startswith("cmstock:"):
-        await q.answer()
-        _, cid, uid = data.split(":")
-        if user.id != int(uid):
-            return
-        # only chat creator / mayor
-        try:
-            member = await c.bot.get_chat_member(int(cid), user.id)
-            status = member.status
-        except Exception:
-            status = ""
-        if status not in ("creator", "administrator") and not is_admin(user.id):
-            await q.answer("فقط شهردار/ادمین گپ", show_alert=True)
-            return
-        with tx() as conn:
-            streets = conn.execute("SELECT * FROM street_raccoons WHERE active=1").fetchall()
-        rows = []
-        for s in streets:
-            rows.append([btn(f"{s['name']} ({s['rarity']})", f"cmadd:{cid}:{s['id']}:{user.id}", "success")])
-        rows.append([btn("🔙", "m:citymarket", "primary")])
-        await q.edit_message_text("کدام راکون خیابانی را به مارکت شهر اضافه کنی؟\n(از موجودی ادمین)", reply_markup=InlineKeyboardMarkup(rows))
-        return
-    if data.startswith("cmadd:"):
-        await q.answer()
-        _, cid, sid, uid = data.split(":")
-        if user.id != int(uid):
-            return
-        with tx() as conn:
-            s = conn.execute("SELECT * FROM street_raccoons WHERE id=?", (int(sid),)).fetchone()
-            city = conn.execute("SELECT market FROM cities WHERE chat_id=?", (int(cid),)).fetchone()
-            market = json.loads(city["market"] or "[]")
-            # member price = 85% of base
-            price = int(int(s["price"]) * 0.85)
-            market.append({"name": s["name"], "rarity": s["rarity"], "price": price, "power": s["power"], "photo": s["photo_file_id"]})
-            conn.execute("UPDATE cities SET market=? WHERE chat_id=?", (json.dumps(market, ensure_ascii=False), int(cid)))
-        await q.edit_message_text(f"به مارکت شهر اضافه شد: {s['name']} با قیمت {num(price)}", reply_markup=back_main())
-        return
-    if data.startswith("cmbuy:"):
-        await q.answer()
-        _, cid, idx, uid = data.split(":")
-        if user.id != int(uid):
-            return
-        idx = int(idx)
-        with tx() as conn:
-            city = conn.execute("SELECT market FROM cities WHERE chat_id=?", (int(cid),)).fetchone()
-            market = json.loads(city["market"] or "[]")
-            if idx >= len(market):
-                await q.answer("ناموجود", show_alert=True)
-                return
-            it = market[idx]
-            price = int(it["price"])
-        try:
-            change_willow(user.id, -price, "city_market", it["name"])
-        except ValueError:
-            await q.answer("ویلو کم", show_alert=True)
-            return
-        with tx() as conn:
-            conn.execute(
-                """INSERT INTO raccoons(owner_id,species,rarity,level,power,speed,luck,capacity,value,is_main,photo_file_id)
-                   VALUES (?,?,?,1,?,?,?,?,?,0,?)""",
-                (user.id, it["name"], it.get("rarity", "معمولی"), int(it.get("power") or 10), 10, 10, 10, price, it.get("photo")),
-            )
-            conn.execute("UPDATE users SET raccoon_count = raccoon_count + 1, street_rescues = street_rescues + 1 WHERE id=?", (user.id,))
-            market.pop(idx)
-            conn.execute("UPDATE cities SET market=? WHERE chat_id=?", (json.dumps(market, ensure_ascii=False), int(cid)))
-        await q.edit_message_text(f"🦝 <b>{it['name']}</b> به مجموعه اضافه شد!", parse_mode="HTML", reply_markup=back_main())
-        return
-
-    # ---- ADMIN ----
-    if data.startswith("a:") and not is_admin(user.id):
-        await q.answer("دسترسی نداری", show_alert=True)
-        return
-    if data == "a:home" or data == "پنل":
-        await q.answer()
-        await q.edit_message_text("🎛 <b>پنل مدیریت رِیو</b>", parse_mode="HTML", reply_markup=admin_kb())
-        return
-    if data == "a:ulist":
-        await q.answer()
-        with tx() as conn:
-            rows = conn.execute(
-                "SELECT u.id, u.willow, u.level, u.bank, r.level AS rl FROM users u "
-                "LEFT JOIN raccoons r ON r.owner_id=u.id AND r.is_main=1 ORDER BY u.willow DESC LIMIT 200"
-            ).fetchall()
-        lines = ["USERS mono list (copy)\n"]
-        for r in rows:
-            lines.append(f"{r['id']}|{r['willow']}|{r['level']}|{r['bank']}|{r['rl'] or 1}")
-        text = "\n".join(lines)
-        # split if long
-        if len(text) > 3500:
-            text = "\n".join(lines[:80]) + "\n..."
-        await q.edit_message_text(mono(text), parse_mode="HTML", reply_markup=admin_kb())
-        return
-    if data == "a:add":
-        set_st(c, "a_add")
-        await q.edit_message_text("فرمت:\n<code>آیدی مبلغ</code>\nمثال: <code>123456 50k</code>", parse_mode="HTML")
-        return
-    if data == "a:sub":
-        set_st(c, "a_sub")
-        await q.edit_message_text("فرمت کسر:\n<code>آیدی مبلغ</code>", parse_mode="HTML")
-        return
-    if data == "a:restore":
-        set_st(c, "a_restore")
-        await q.edit_message_text(
-            "لیست mono را بفرست (هر خط):\n<code>id|willow|level|bank|raccoon_level</code>\n"
-            "همان خروجی «لیست کاربران»",
-            parse_mode="HTML",
-        )
-        return
-    if data == "a:willow":
-        set_st(c, "a_willow")
-        await q.edit_message_text(
-            f"ویلو min={sget('willow_min')} max={sget('willow_max')} cd={sget('willow_cd')}\n"
-            "بفرست:\n<code>min 3000</code>\n<code>max 7000</code>\n<code>cd 300</code>",
-            parse_mode="HTML",
-        )
-        return
-    if data == "a:stats":
-        with tx() as conn:
-            uc = conn.execute("SELECT COUNT(*) c FROM users").fetchone()["c"]
-            tw = conn.execute("SELECT SUM(willow) s FROM users").fetchone()["s"] or 0
-            tb = conn.execute("SELECT SUM(bank) s FROM users").fetchone()["s"] or 0
-            rc = conn.execute("SELECT COUNT(*) c FROM raccoons").fetchone()["c"]
-        await q.edit_message_text(
-            f"📊 کاربران: {num(uc)}\n🌿 ویلو گردش: {num(tw)}\n🏦 بانک‌ها: {num(tb)}\n🦝 راکون‌ها: {num(rc)}",
-            reply_markup=admin_kb(),
-        )
-        return
-    if data == "a:code":
-        set_st(c, "a_code")
-        await q.edit_message_text("فرمت:\n<code>کد مبلغ تعداد</code>\nمثال: <code>RIVO 20k 100</code>", parse_mode="HTML")
-        return
-    if data == "a:bcast":
-        set_st(c, "a_bcast")
-        await q.edit_message_text("متن همگانی را بفرست:")
-        return
-    if data == "a:raids":
-        with tx() as conn:
-            places = conn.execute("SELECT * FROM raid_places").fetchall()
-        lines = ["⚔️ مکان‌های غارت\n"]
-        for p in places:
-            lines.append(f"{p['id']}: {p['name']} pool={num(p['pool'])} fail={p['fail_chance']}")
-        lines.append("\nشارژ صندوق:\n<code>pool alley 500000</code>")
-        set_st(c, "a_raids")
-        await q.edit_message_text("\n".join(lines), parse_mode="HTML", reply_markup=admin_kb())
-        return
-    if data == "a:street":
-        set_st(c, "a_street_photo")
-        await q.edit_message_text("برای راکون خیابانی عکس بفرست، بعد نام|نادر بودن|قیمت|قدرت")
-        return
-    if data == "a:admins":
-        set_st(c, "a_admins")
-        with tx() as conn:
-            ads = conn.execute("SELECT user_id FROM admins").fetchall()
-        await q.edit_message_text(
-            "ادمین‌ها:\n" + "\n".join(str(a["user_id"]) for a in ads) + "\n\n<code>ادمین + آیدی</code>\n<code>ادمین - آیدی</code>",
-            parse_mode="HTML",
-        )
-        return
-    if data == "a:shop":
-        await q.edit_message_text("فروشگاه از دیتابیس shop_items مدیریت می‌شود.\nقیمت: <code>قیمت food_s 6000</code>", parse_mode="HTML", reply_markup=admin_kb())
-        set_st(c, "a_shop")
+    # ownership for player panels
+    if data.startswith("p:") and not own(data, user.id):
+        await q.answer("این پنل برای تو نیست", show_alert=True)
         return
 
     await q.answer()
 
+    if data.startswith("p:help"):
+        await q.edit_message_text(help_text(), parse_mode="HTML",
+                                  reply_markup=InlineKeyboardMarkup([[btn("🔙", f"p:home:{user.id}", "primary")]]))
+        return
+    if data.startswith("p:home"):
+        await q.edit_message_text("🐱 منوی MeowPoint", reply_markup=main_kb(user.id))
+        return
+    if data.startswith("p:meow"):
+        msg = await do_meow(c.bot, chat.id, user)
+        await q.edit_message_text(msg, parse_mode="HTML",
+                                  reply_markup=InlineKeyboardMarkup([[btn("🔙", f"p:home:{user.id}", "primary")]]))
+        return
+    if data.startswith("p:entity"):
+        uu = get_user(user.id); fac = get_factory(user.id)
+        kb = InlineKeyboardMarkup([
+            [btn("⬆️ ارتقا مقام", f"p:up:{user.id}", "success")],
+            [btn("🔙", f"p:home:{user.id}", "primary")],
+        ])
+        await q.edit_message_text(entity_panel(uu, fac), parse_mode="HTML", reply_markup=kb)
+        return
+    if data.startswith("p:up:"):
+        uu = get_user(user.id)
+        cost = 50000 * int(uu["level"])
+        try:
+            change_wallet(user.id, -cost, "level_up", "")
+            add_xp(user.id, 50)
+            with tx() as conn:
+                conn.execute("UPDATE users SET level = level + 1 WHERE id=?", (user.id,))
+        except ValueError as e:
+            await q.answer(str(e), show_alert=True); return
+        uu = get_user(user.id); fac = get_factory(user.id)
+        await q.edit_message_text("✅ ارتقا یافت!\n" + entity_panel(uu, fac), parse_mode="HTML",
+                                  reply_markup=InlineKeyboardMarkup([[btn("🔙", f"p:home:{user.id}")]]))
+        return
+    if data.startswith("p:bank"):
+        uu = get_user(user.id)
+        kb = InlineKeyboardMarkup([
+            [btn("📥 واریز", f"p:bin:{user.id}", "success"), btn("📤 برداشت", f"p:bout:{user.id}", "danger")],
+            [btn("💸 انتقال", f"p:btr:{user.id}", "primary"), btn("📜 تاریخچه", f"p:blog:{user.id}", "primary")],
+            [btn("💳 تغییر حساب", f"p:bacc:{user.id}", "primary")],
+            [btn("🔙", f"p:home:{user.id}", "primary")],
+        ])
+        await q.edit_message_text(bank_panel(uu), parse_mode="HTML", reply_markup=kb)
+        return
+    if data.startswith("p:bin:"):
+        set_st(c, "bank_in"); await q.edit_message_text("مبلغ واریز از کیف به بانک را بفرست:")
+        return
+    if data.startswith("p:bout:"):
+        set_st(c, "bank_out"); await q.edit_message_text("مبلغ برداشت از بانک به کیف را بفرست:")
+        return
+    if data.startswith("p:btr:"):
+        set_st(c, "bank_tr"); await q.edit_message_text("فرمت:\n<code>شماره_حساب مبلغ</code>", parse_mode="HTML")
+        return
+    if data.startswith("p:bacc:"):
+        set_st(c, "bank_acc"); await q.edit_message_text("شماره حساب جدید (عدد):")
+        return
+    if data.startswith("p:blog:"):
+        with tx() as conn:
+            rows = conn.execute("SELECT * FROM transactions WHERE user_id=? ORDER BY id DESC LIMIT 12", (user.id,)).fetchall()
+        lines = ["📜 تاریخچه\n"] + [f"• {r['kind']}: {num(r['amount'])} | {r['txid']}" for r in rows]
+        await q.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup([[btn("🔙", f"p:bank:{user.id}")]]))
+        return
+    if data.startswith("p:fac"):
+        fac = dict(get_factory(user.id))
+        now = time.time()
+        extra = ""
+        if float(fac["busy_until"] or 0) > now:
+            extra = f"\n\n⏳ تولید: {fmt_time(float(fac['busy_until'])-now)}"
+        elif int(fac.get("ready") or 0):
+            extra = f"\n\n✅ محصول آماده: {num(fac.get('pending') or 0)}"
+        kb = InlineKeyboardMarkup([
+            [btn("▶️ تولید / برداشت", f"p:fgo:{user.id}", "success")],
+            [btn("⬆️ ارتقا کارخانه", f"p:fup:{user.id}", "primary")],
+            [btn("🔙", f"p:home:{user.id}", "primary")],
+        ])
+        await q.edit_message_text(factory_panel(user.full_name, fac)+extra, parse_mode="HTML", reply_markup=kb)
+        return
+    if data.startswith("p:fgo:"):
+        fac = dict(get_factory(user.id)); now = time.time()
+        if float(fac["busy_until"] or 0) > now:
+            await q.answer("هنوز تولید تمام نشده", show_alert=True); return
+        if int(fac.get("ready") or 0):
+            pend = int(fac.get("pending") or 0)
+            if int(fac["storage"]) + pend > int(fac["storage_cap"]):
+                await q.answer("انبار پر است", show_alert=True); return
+            with tx() as conn:
+                conn.execute("UPDATE factories SET storage = storage + ?, ready=0, pending=0, xp = xp + 20 WHERE user_id=?",
+                             (pend, user.id))
+            try:
+                gain = pend * 10
+                change_wallet(user.id, gain, "factory_sell", "")
+                await q.edit_message_text(f"🏭 برداشت و فروش: +{num(gain)} MP", reply_markup=InlineKeyboardMarkup([[btn("🔙", f"p:fac:{user.id}")]]))
+            except Exception as e:
+                await q.answer(str(e), show_alert=True)
+            return
+        tsec = int(fac["prod_time"]); amt = int(fac["prod_amount"]) * int(fac["workers"])
+        with tx() as conn:
+            conn.execute("UPDATE factories SET busy_until=?, ready=1, pending=? WHERE user_id=?",
+                         (now+tsec, amt, user.id))
+        await q.edit_message_text(f"🏭 تولید شروع شد — {fmt_time(tsec)}\nمحصول: {num(amt)}",
+                                  reply_markup=InlineKeyboardMarkup([[btn("🔙", f"p:fac:{user.id}")]]))
+        return
+    if data.startswith("p:fup:"):
+        fac = get_factory(user.id)
+        cost = 30000 * int(fac["level"])
+        try: change_wallet(user.id, -cost, "fac_up", "")
+        except ValueError as e:
+            await q.answer(str(e), show_alert=True); return
+        with tx() as conn:
+            conn.execute("""UPDATE factories SET level=level+1, storage_cap=storage_cap+500,
+                workers_max=workers_max+1, machine_level=machine_level+1,
+                prod_time=MAX(10,prod_time-5), prod_amount=prod_amount+10 WHERE user_id=?""", (user.id,))
+        await q.edit_message_text("✅ کارخانه ارتقا یافت", reply_markup=InlineKeyboardMarkup([[btn("🔙", f"p:fac:{user.id}")]]))
+        return
+    if data.startswith("p:city"):
+        uu = get_user(user.id)
+        kb = InlineKeyboardMarkup([
+            [btn("⬆️ ارتقا شهر", f"p:cup:{user.id}", "success")],
+            [btn("🕊 دونیت خزانه", f"p:cdon:{user.id}", "primary")],
+            [btn("🔙", f"p:home:{user.id}", "primary")],
+        ])
+        await q.edit_message_text(city_panel(uu), parse_mode="HTML", reply_markup=kb)
+        return
+    if data.startswith("p:cup:"):
+        uu = get_user(user.id)
+        lv = int(uu["city_level"]); need_xp = 100*lv; need_mp = 5000*lv
+        fac = get_factory(user.id)
+        if int(uu["city_xp"]) < need_xp or int(uu["wallet"]) < need_mp or int(fac["level"]) < max(1, lv//2):
+            await q.answer("شرایط ارتقا کامل نیست", show_alert=True); return
+        try: change_wallet(user.id, -need_mp, "city_up", "")
+        except ValueError as e:
+            await q.answer(str(e), show_alert=True); return
+        with tx() as conn:
+            conn.execute("UPDATE users SET city_level=city_level+1, city_xp=city_xp-? WHERE id=?", (need_xp, user.id))
+        await q.edit_message_text(f"🏙 شهر ارتقا یافت → {mono(to_roman(lv+1))}", parse_mode="HTML",
+                                  reply_markup=InlineKeyboardMarkup([[btn("🔙", f"p:city:{user.id}")]]))
+        return
+    if data.startswith("p:cdon:"):
+        set_st(c, "city_don"); await q.edit_message_text("مبلغ دونیت به خزانه شهر:")
+        return
+    if data.startswith("p:shop"):
+        with tx() as conn:
+            items = conn.execute("SELECT * FROM shop WHERE active=1").fetchall()
+            mkt = conn.execute("SELECT * FROM market").fetchall()
+        lines = ["🛒 فروشگاه / بازار\n"]
+        rows = []
+        for it in items:
+            lines.append(f"• {it['name']} — {num(it['price'])}")
+            rows.append([btn(f"{it['name']}|{num(it['price'])}", f"p:buy:{it['id']}:{user.id}", "success")])
+        for m in mkt:
+            lines.append(f"• {m['name']} (بازار) — {num(m['price'])}")
+            rows.append([btn(f"{m['name']}|{num(m['price'])}", f"p:mbuy:{m['id']}:{user.id}", "primary")])
+        rows.append([btn("🔙", f"p:home:{user.id}", "primary")])
+        await q.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(rows))
+        return
+    if data.startswith("p:buy:"):
+        parts = data.split(":")
+        iid, owner = parts[2], int(parts[3])
+        if user.id != owner: return
+        with tx() as conn:
+            it = conn.execute("SELECT * FROM shop WHERE id=?", (iid,)).fetchone()
+        if not it: return
+        try: change_wallet(user.id, -int(it["price"]), "shop", iid)
+        except ValueError as e:
+            await q.answer(str(e), show_alert=True); return
+        inv = {}
+        with tx() as conn:
+            inv = json.loads(conn.execute("SELECT inv FROM users WHERE id=?", (user.id,)).fetchone()["inv"] or "{}")
+            eff = it["effect"] or ""
+            if eff.startswith("cd_half"): inv["cd_half"] = int(inv.get("cd_half") or 0)+1
+            elif eff.startswith("belly"): inv["belly"] = 12
+            elif eff.startswith("xp:"): add_xp(user.id, int(eff.split(":")[1]))
+            conn.execute("UPDATE users SET inv=? WHERE id=?", (json.dumps(inv), user.id))
+        await q.edit_message_text(f"✅ خرید {it['name']}", reply_markup=InlineKeyboardMarkup([[btn("🔙", f"p:shop:{user.id}")]]))
+        return
+    if data.startswith("p:mbuy:"):
+        parts = data.split(":")
+        mid, owner = parts[2], int(parts[3])
+        if user.id != owner: return
+        with tx() as conn:
+            m = conn.execute("SELECT * FROM market WHERE id=?", (mid,)).fetchone()
+        if not m: return
+        try: change_wallet(user.id, -int(m["price"]), "market", mid)
+        except ValueError as e:
+            await q.answer(str(e), show_alert=True); return
+        with tx() as conn:
+            inv = json.loads(conn.execute("SELECT inv FROM users WHERE id=?", (user.id,)).fetchone()["inv"] or "{}")
+            inv[mid] = int(inv.get(mid) or 0) + 1
+            conn.execute("UPDATE users SET inv=?, market_trades=market_trades+1 WHERE id=?", (json.dumps(inv), user.id))
+        await q.edit_message_text(f"✅ خرید {m['name']}", reply_markup=InlineKeyboardMarkup([[btn("🔙", f"p:shop:{user.id}")]]))
+        return
+    if data.startswith("p:gather"):
+        u = get_user(user.id)
+        cd = sint("gather_cd", 900)
+        left = float(u["last_gather"] or 0) + cd - time.time()
+        if left > 0:
+            await q.edit_message_text(render("gather_wait", left=fmt_time(left)), parse_mode="HTML",
+                                      reply_markup=InlineKeyboardMarkup([[btn("🔙", f"p:home:{user.id}")]]))
+            return
+        with tx() as conn:
+            conn.execute("UPDATE users SET last_gather=? WHERE id=?", (time.time(), user.id))
+        if random.random() < 0.3:
+            await q.edit_message_text("🌫️ چیزی پیدا نشد...", reply_markup=InlineKeyboardMarkup([[btn("🔙", f"p:home:{user.id}")]]))
+            return
+        gain = random.randint(30, 150)
+        change_wallet(user.id, gain, "gather", "")
+        kb = InlineKeyboardMarkup([
+            [btn("💰 فروش", f"p:home:{user.id}", "success"), btn("🍖 به پیشی بده", f"p:feed:{user.id}", "primary")],
+            [btn("🔙", f"p:home:{user.id}", "primary")],
+        ])
+        await q.edit_message_text(f"🎣 شکار موفق!\n🪙 +{num(gain)}", reply_markup=kb)
+        return
+    if data.startswith("p:feed:"):
+        with tx() as conn:
+            inv = json.loads(conn.execute("SELECT inv FROM users WHERE id=?", (user.id,)).fetchone()["inv"] or "{}")
+            inv["belly"] = 12
+            conn.execute("UPDATE users SET inv=? WHERE id=?", (json.dumps(inv), user.id))
+        await q.edit_message_text("🍖 پیشی سیر شد!", reply_markup=InlineKeyboardMarkup([[btn("🔙", f"p:home:{user.id}")]]))
+        return
+    if data.startswith("p:gift"):
+        set_st(c, "gift"); await q.edit_message_text("🎁 کد را بفرست:")
+        return
+    if data.startswith("p:lb"):
+        with tx() as conn:
+            rows = conn.execute("SELECT id,name,wallet,bank,level FROM users ORDER BY wallet+bank DESC LIMIT 10").fetchall()
+        lines = ["🏆 رتبه‌بندی ثروت\n"]
+        for i, r in enumerate(rows, 1):
+            lines.append(f"{mono(to_roman(i))} {mention(r['id'], r['name'])}")
+            lines.append(f"    🪙 {num(int(r['wallet'])+int(r['bank']))} · Lv {r['level']}\n")
+        await q.edit_message_text("\n".join(lines), parse_mode="HTML",
+                                  reply_markup=InlineKeyboardMarkup([[btn("🔙", f"p:home:{user.id}")]]))
+        return
+    if data.startswith("p:prof"):
+        await q.edit_message_text(profile_text(get_user(user.id)), parse_mode="HTML",
+                                  reply_markup=InlineKeyboardMarkup([[btn("🔙", f"p:home:{user.id}")]]))
+        return
+
+    # Admin
+    if data.startswith("a:") and not is_admin(user.id):
+        await q.answer("دسترسی نداری", show_alert=True); return
+    if data == "a:ulist":
+        with tx() as conn:
+            rows = conn.execute("SELECT id,wallet,bank,level,city_level FROM users ORDER BY wallet DESC LIMIT 150").fetchall()
+        lines = ["id|wallet|bank|level|city\n"] + [f"{r['id']}|{r['wallet']}|{r['bank']}|{r['level']}|{r['city_level']}" for r in rows]
+        await q.edit_message_text(mono("\n".join(lines)[:3500]), parse_mode="HTML", reply_markup=admin_kb())
+        return
+    if data == "a:add":
+        set_st(c, "a_add"); await q.edit_message_text("آیدی مبلغ:\n<code>123 10k</code>", parse_mode="HTML"); return
+    if data == "a:sub":
+        set_st(c, "a_sub"); await q.edit_message_text("آیدی مبلغ کسر:", parse_mode="HTML"); return
+    if data == "a:meow":
+        set_st(c, "a_meow")
+        await q.edit_message_text(f"min={sget('meow_min')} max={sget('meow_max')} cd={sget('meow_cd')}\n<code>min 50</code>\n<code>max 120</code>\n<code>cd 300</code>", parse_mode="HTML"); return
+    if data == "a:bank":
+        set_st(c, "a_bank")
+        await q.edit_message_text(f"سود={sget('bank_interest')}%\n<code>سود 3</code>\n<code>مالیات 0.02</code>", parse_mode="HTML"); return
+    if data == "a:tpl":
+        set_st(c, "a_tpl"); await q.edit_message_text("قالب KEY متن\nکلیدها: meow_ok meow_wait gather_wait"); return
+    if data == "a:names":
+        set_st(c, "a_names"); await q.edit_message_text("نام KEY مقدار\nمثال: نام entity پیشی"); return
+    if data == "a:code":
+        set_st(c, "a_code"); await q.edit_message_text("کد مبلغ تعداد\n<code>MEOW 10k 50</code>", parse_mode="HTML"); return
+    if data == "a:bcast":
+        set_st(c, "a_bcast"); await q.edit_message_text("متن همگانی:"); return
+    if data == "a:stats":
+        with tx() as conn:
+            uc = conn.execute("SELECT COUNT(*) c FROM users").fetchone()["c"]
+            tw = conn.execute("SELECT SUM(wallet)+SUM(bank) s FROM users").fetchone()["s"] or 0
+        await q.edit_message_text(f"کاربران: {num(uc)}\nکل MP: {num(tw)}", reply_markup=admin_kb()); return
+    if data == "a:admins":
+        set_st(c, "a_admins"); await q.edit_message_text("ادمین + آیدی / ادمین - آیدی"); return
 
 async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    if not u.message:
-        return
-    # dice without text still OK for casino
-    if not u.message.text and not u.message.dice:
-        return
-    if not u.message.text and u.message.dice:
-        text = u.message.dice.emoji or "dice"
-
+    if not u.message or not u.message.text: return
     user = u.effective_user
     chat = u.effective_chat
-    text = (u.message.text or "").strip()
-    log.info("msg from %s chat=%s text=%r", user.id if user else None, chat.id if chat else None, text[:80])
+    text = u.message.text.strip()
     ensure_user(user)
-    if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
-        ensure_city(chat)
-
-    # referral deep link
-    if text.startswith("/start"):
-        parts = text.split(maxsplit=1)
-        if len(parts) > 1 and parts[1].startswith("ref"):
-            try:
-                ref = int(parts[1][3:])
-                if ref != user.id:
-                    uu = get_user(user.id)
-                    if not uu["referred_by"]:
-                        with tx() as conn:
-                            conn.execute("UPDATE users SET referred_by=? WHERE id=? AND (referred_by IS NULL OR referred_by=0)", (ref, user.id))
-                            conn.execute("UPDATE users SET invites = invites + 1 WHERE id=?", (ref,))
-                        try:
-                            change_willow(user.id, 5000, "ref_bonus", str(ref))
-                            change_willow(ref, 8000, "ref_reward", str(user.id))
-                        except Exception:
-                            pass
-            except Exception:
-                pass
-        await on_start_text(u, c)
-        return
-
     st = get_st(c)
+    low = re.sub(r"^/", "", text).strip()
 
-    # admin states
-    if st and is_admin(user.id) and chat.type == ChatType.PRIVATE:
+    # states
+    if st:
         kind = st["kind"]
-        if kind in ("a_add", "a_sub"):
-            parts = text.split()
-            if len(parts) < 2:
-                await u.message.reply_text("آیدی مبلغ")
-                return
-            try:
-                tid = int(parts[0])
-            except ValueError:
-                await u.message.reply_text("آیدی عددی")
-                return
-            amt = parse_amount(parts[1])
-            if not amt:
-                await u.message.reply_text("مبلغ نامعتبر")
-                return
-            ensure_user(type("U", (), {"id": tid, "username": "", "full_name": str(tid), "is_bot": False})())
-            try:
-                if kind == "a_add":
-                    change_willow(tid, amt, "admin_add", str(user.id))
-                else:
-                    change_willow(tid, -amt, "admin_sub", str(user.id))
-            except ValueError as e:
-                await u.message.reply_text(str(e))
-                return
-            clear_st(c)
-            await u.message.reply_text("انجام شد.", reply_markup=admin_kb())
-            return
-        if kind == "a_restore":
-            ok = 0
-            for line in text.splitlines():
-                line = line.strip()
-                if not line or line.startswith("USERS"):
-                    continue
-                parts = line.split("|")
-                if len(parts) < 2:
-                    continue
-                try:
-                    tid = int(parts[0])
-                    willow = int(parts[1])
-                    level = int(parts[2]) if len(parts) > 2 else 1
-                    bank = int(parts[3]) if len(parts) > 3 else 0
-                    rl = int(parts[4]) if len(parts) > 4 else 1
-                except ValueError:
-                    continue
-                ensure_user(type("U", (), {"id": tid, "username": "", "full_name": str(tid), "is_bot": False})())
+        if kind in ("bank_in", "bank_out") and own_check_ok(user):
+            amt = parse_amt(text)
+            if not amt: await u.message.reply_text("مبلغ نامعتبر"); return
+            uu = get_user(user.id)
+            if kind == "bank_in":
+                if int(uu["wallet"]) < amt: await u.message.reply_text("کیف کم"); return
                 with tx() as conn:
-                    conn.execute("UPDATE users SET willow=?, level=?, bank=? WHERE id=?", (willow, level, bank, tid))
-                    conn.execute("UPDATE raccoons SET level=? WHERE owner_id=? AND is_main=1", (rl, tid))
-                ok += 1
-            clear_st(c)
-            await u.message.reply_text(f"بازیابی {ok} کاربر", reply_markup=admin_kb())
-            return
-        if kind == "a_willow":
-            m = re.match(r"^(min|max|cd)\s+(\d+)$", text, re.I)
-            if m:
-                sset("willow_" + m.group(1).lower() if m.group(1).lower() != "cd" else "willow_cd", m.group(2))
-                if m.group(1).lower() == "cd":
-                    sset("willow_cd", m.group(2))
-                clear_st(c)
-                await u.message.reply_text("ذخیره شد", reply_markup=admin_kb())
-            return
-        if kind == "a_code":
-            parts = text.split()
-            if len(parts) >= 3:
-                code, amt, uses = parts[0].upper(), parse_amount(parts[1]), parse_amount(parts[2])
-                if amt and uses:
-                    with tx() as conn:
-                        conn.execute(
-                            "INSERT OR REPLACE INTO gift_codes(code,amount,uses_left,expires_at,active) VALUES (?,?,?,?,1)",
-                            (code, amt, int(uses), time.time() + 30 * 86400),
-                        )
-                    clear_st(c)
-                    await u.message.reply_text(f"کد {code} ثبت شد", reply_markup=admin_kb())
-            return
-        if kind == "a_bcast":
+                    conn.execute("UPDATE users SET wallet=wallet-?, bank=bank+? WHERE id=?", (amt, amt, user.id))
+                add_tx(user.id, "bank_in", -amt, "")
+            else:
+                if int(uu["bank"]) < amt: await u.message.reply_text("بانک کم"); return
+                with tx() as conn:
+                    conn.execute("UPDATE users SET wallet=wallet+?, bank=bank-? WHERE id=?", (amt, amt, user.id))
+                add_tx(user.id, "bank_out", amt, "")
+            clear_st(c); await u.message.reply_text("✅ انجام شد"); return
+        if kind == "bank_acc":
+            acc = re.sub(r"\D", "", text)
+            if len(acc) < 6: await u.message.reply_text("نامعتبر"); return
             with tx() as conn:
-                ids = [r["id"] for r in conn.execute("SELECT id FROM users").fetchall()]
-            ok = fail = 0
-            for tid in ids:
-                try:
-                    await c.bot.send_message(int(tid), text)
-                    ok += 1
-                except Exception:
-                    fail += 1
+                conn.execute("UPDATE users SET bank_account=?, bank_name=? WHERE id=?", (acc, user.full_name, user.id))
+            clear_st(c); await u.message.reply_text(f"💳 {mono(acc)}", parse_mode="HTML"); return
+        if kind == "bank_tr":
+            parts = text.split()
+            if len(parts) < 2: await u.message.reply_text("شماره مبلغ"); return
+            acc, amt = parts[0], parse_amt(parts[1])
+            if not amt: await u.message.reply_text("مبلغ?"); return
+            with tx() as conn:
+                target = conn.execute("SELECT id,name FROM users WHERE bank_account=?", (acc,)).fetchone()
+            if not target: await u.message.reply_text("حساب پیدا نشد"); return
+            if int(target["id"]) == user.id: await u.message.reply_text("خودت؟"); return
+            uu = get_user(user.id)
+            if int(uu["bank"]) < amt: await u.message.reply_text("بانک کم"); return
+            tax = int(amt * sfloat("transfer_tax", 0.02)); send = amt - tax
+            with tx() as conn:
+                conn.execute("UPDATE users SET bank=bank-? WHERE id=?", (amt, user.id))
+                conn.execute("UPDATE users SET bank=bank+? WHERE id=?", (send, int(target["id"])))
+            tid = add_tx(user.id, "transfer_out", -amt, acc)
+            add_tx(int(target["id"]), "transfer_in", send, str(user.id))
             clear_st(c)
-            await u.message.reply_text(f"✅{ok} ❌{fail}", reply_markup=admin_kb())
-            return
-        if kind == "a_raids":
-            m = re.match(r"pool\s+(\w+)\s+(\d+)", text, re.I)
-            if m:
-                with tx() as conn:
-                    conn.execute("UPDATE raid_places SET pool=? WHERE id=?", (int(m.group(2)), m.group(1)))
-                clear_st(c)
-                await u.message.reply_text("صندوق بروز شد", reply_markup=admin_kb())
-            return
-        if kind == "a_admins":
-            m = re.match(r"ادمین\s*([+-])\s*(\d+)", text)
-            if m:
-                op, aid = m.group(1), int(m.group(2))
-                with tx() as conn:
-                    if op == "+":
-                        conn.execute("INSERT OR IGNORE INTO admins(user_id) VALUES (?)", (aid,))
-                    elif is_main(user.id) and aid != ADMIN_ID:
-                        conn.execute("DELETE FROM admins WHERE user_id=?", (aid,))
-                clear_st(c)
-                await u.message.reply_text("OK", reply_markup=admin_kb())
-            return
-        if kind == "a_shop":
-            m = re.match(r"قیمت\s+(\w+)\s+(\d+)", text)
-            if m:
-                with tx() as conn:
-                    conn.execute("UPDATE shop_items SET price=? WHERE id=?", (int(m.group(2)), m.group(1)))
-                clear_st(c)
-                await u.message.reply_text("OK", reply_markup=admin_kb())
-            return
+            await u.message.reply_text(f"💸 انتقال {num(send)}\nبه {target['name']}\n{tid}"); return
+        if kind == "city_don":
+            amt = parse_amt(text)
+            if not amt: await u.message.reply_text("مبلغ?"); return
+            try: change_wallet(user.id, -amt, "city_don", "")
+            except ValueError as e: await u.message.reply_text(str(e)); return
+            with tx() as conn:
+                conn.execute("UPDATE users SET city_treasury=city_treasury+? WHERE id=?", (amt, user.id))
+            clear_st(c); await u.message.reply_text(f"🕊 دونیت {num(amt)}"); return
         if kind == "gift":
             code = text.strip().upper()
             with tx() as conn:
                 g = conn.execute("SELECT * FROM gift_codes WHERE code=? AND active=1", (code,)).fetchone()
                 if not g or int(g["uses_left"]) < 1:
-                    await u.message.reply_text("کد نامعتبر")
-                    clear_st(c)
-                    return
-                used = conn.execute("SELECT 1 FROM gift_uses WHERE code=? AND user_id=?", (code, user.id)).fetchone()
-                if used:
-                    await u.message.reply_text("قبلاً استفاده کردی")
-                    clear_st(c)
-                    return
-                conn.execute("UPDATE gift_codes SET uses_left = uses_left - 1 WHERE code=?", (code,))
-                conn.execute("INSERT INTO gift_uses(code,user_id,ts) VALUES (?,?,?)", (code, user.id, time.time()))
-            change_willow(user.id, int(g["amount"]), "gift", code)
-            clear_st(c)
-            await u.message.reply_text(f"🎁 +{num(g['amount'])} ویلو")
-            return
-        if kind == "donate_city":
-            amt = parse_amount(text)
-            if not amt:
-                await u.message.reply_text("مبلغ نامعتبر")
-                return
-            cid = st["extra"]["chat_id"]
-            try:
-                change_willow(user.id, -amt, "donate_city", str(cid))
-            except ValueError:
-                await u.message.reply_text("ویلو کم")
-                return
-            with tx() as conn:
-                conn.execute("UPDATE cities SET treasury = treasury + ? WHERE chat_id=?", (amt, cid))
-            clear_st(c)
-            await u.message.reply_text(f"🕊 دونیت {num(amt)} به خزانه شهر")
-            return
-        if kind == "casino_bet":
-            mode = st["extra"].get("mode")
-            amt = parse_amount(text)
-            if not amt:
-                await u.message.reply_text("مبلغ نامعتبر — مثال 5k")
-                return
-            try:
-                change_willow(user.id, -amt, "casino_lock", mode)
-            except ValueError:
-                await u.message.reply_text("ویلو کافی نیست")
-                return
-            set_st(c, "casino_play", {"mode": mode, "amount": amt})
-            if mode == "dice":
-                await u.message.reply_text("🎲 حدس بزن: <b>زوج</b> یا <b>فرد</b>\nیا ایموجی تاس بفرست", parse_mode="HTML")
-            else:
-                await u.message.reply_text("🎰 ایموجی اسلات بفرست یا بنویس <code>چرخش</code>", parse_mode="HTML")
-            return
-        if kind == "casino_play":
-            mode = st["extra"]["mode"]
-            amt = int(st["extra"]["amount"])
-            if mode == "dice":
-                guess = (text or "").strip()
-                if guess not in ("زوج", "فرد", "even", "odd"):
-                    await u.message.reply_text("بگو: زوج یا فرد")
-                    return
-                want_even = guess in ("زوج", "even")
-                # prefer real telegram dice if present
-                if getattr(u.message, "dice", None) and u.message.dice.emoji == "🎲":
-                    dice_val = u.message.dice.value
-                else:
-                    dice_val = random.randint(1, 6)
-                    await u.message.reply_text("🎲 آمد: <b>%s</b>" % dice_val, parse_mode="HTML")
-                is_even = dice_val % 2 == 0
-                win = (is_even and want_even) or ((not is_even) and (not want_even))
-                clear_st(c)
-                if win:
-                    gain = int(amt * 1.9)
-                    change_willow(user.id, gain, "casino_win", "dice")
-                    await u.message.reply_text("✅ برد! 🌿 +%s" % num(gain))
-                else:
-                    await u.message.reply_text("❌ باخت... −%s" % num(amt))
-                return
-            # slot
-            if getattr(u.message, "dice", None) and u.message.dice.emoji == "🎰":
-                val = u.message.dice.value
-            else:
-                val = random.randint(1, 64)
-                await u.message.reply_text("🎰 نتیجه: %s" % val)
-            clear_st(c)
-            if val >= 60:
-                gain = amt * 5
-            elif val >= 40:
-                gain = int(amt * 2)
-            elif val >= 22:
-                gain = amt
-            else:
-                gain = 0
-            if gain:
-                change_willow(user.id, gain, "casino_win", "slot")
-                await u.message.reply_text("✅ 🌿 +%s" % num(gain))
-            else:
-                await u.message.reply_text("❌ باخت −%s" % num(amt))
-            return
-        if kind == "bank_acc":
-            acc = re.sub(r"\D", "", text)
-            if len(acc) < 6:
-                await u.message.reply_text("شماره حساب نامعتبر")
-                return
-            with tx() as conn:
-                conn.execute("UPDATE users SET bank_account=?, bank_name=? WHERE id=?", (acc, user.full_name, user.id))
-            clear_st(c)
-            await u.message.reply_text(f"💳 حساب ثبت شد: {mono(acc)}", parse_mode="HTML")
-            return
-        if kind == "bank_tr":
-            parts = text.split()
-            if len(parts) < 2:
-                await u.message.reply_text("شماره_حساب مبلغ")
-                return
-            acc, amt = parts[0], parse_amount(parts[1])
-            if not amt:
-                await u.message.reply_text("مبلغ نامعتبر")
-                return
-            with tx() as conn:
-                target = conn.execute("SELECT id, name FROM users WHERE bank_account=?", (acc,)).fetchone()
-            if not target:
-                await u.message.reply_text("حساب پیدا نشد")
-                return
-            if int(target["id"]) == user.id:
-                await u.message.reply_text("به خودت؟")
-                return
-            uu = get_user(user.id)
-            if int(uu["bank"]) < amt:
-                await u.message.reply_text("موجودی بانک کم")
-                return
-            tax = int(amt * sfloat("transfer_tax", 0.02))
-            send = amt - tax
-            with tx() as conn:
-                conn.execute("UPDATE users SET bank = bank - ? WHERE id=?", (amt, user.id))
-                conn.execute("UPDATE users SET bank = bank + ? WHERE id=?", (send, int(target["id"])))
-            add_tx(user.id, "bank_tr_out", -amt, acc)
-            add_tx(int(target["id"]), "bank_tr_in", send, str(user.id))
-            clear_st(c)
-            await u.message.reply_text(
-                f"💸 انتقال بانکی\nبه: {target['name']}\n{mono(acc)}\n🌿 {num(send)}",
-                parse_mode="HTML",
-            )
-            return
-        if kind in ("bank_in", "bank_out"):
-            amt = parse_amount(text)
-            if not amt:
-                await u.message.reply_text("مبلغ نامعتبر")
-                return
-            uu = get_user(user.id)
-            if kind == "bank_in":
-                if int(uu["willow"]) < amt:
-                    await u.message.reply_text("موجودی کم")
-                    return
-                cap = sint("bank_cap")
-                if cap and int(uu["bank"]) + amt > cap:
-                    await u.message.reply_text("سقف بانک")
-                    return
-                with tx() as conn:
-                    conn.execute("UPDATE users SET willow = willow - ?, bank = bank + ? WHERE id=?", (amt, amt, user.id))
-                add_tx(user.id, "bank_in", -amt, "")
-            else:
-                if int(uu["bank"]) < amt:
-                    await u.message.reply_text("بانک کم")
-                    return
-                with tx() as conn:
-                    conn.execute("UPDATE users SET willow = willow + ?, bank = bank - ? WHERE id=?", (amt, amt, user.id))
-                add_tx(user.id, "bank_out", amt, "")
-            clear_st(c)
-            await u.message.reply_text("انجام شد.")
-            return
+                    await u.message.reply_text("کد نامعتبر"); clear_st(c); return
+                if conn.execute("SELECT 1 FROM gift_uses WHERE code=? AND user_id=?", (code, user.id)).fetchone():
+                    await u.message.reply_text("قبلاً زدی"); clear_st(c); return
+                conn.execute("UPDATE gift_codes SET uses_left=uses_left-1 WHERE code=?", (code,))
+                conn.execute("INSERT INTO gift_uses(code,user_id) VALUES (?,?)", (code, user.id))
+            change_wallet(user.id, int(g["amount"]), "gift", code)
+            clear_st(c); await u.message.reply_text(f"🎁 +{num(g['amount'])}"); return
 
-    # plain commands (no slash required)
-    cmd = re.sub(r"^/", "", text).strip()
-    low = cmd
+        # admin states
+        if is_admin(user.id) and chat.type == ChatType.PRIVATE:
+            if kind in ("a_add", "a_sub"):
+                parts = text.split()
+                if len(parts) < 2: await u.message.reply_text("آیدی مبلغ"); return
+                try: tid = int(parts[0])
+                except: await u.message.reply_text("آیدی?"); return
+                amt = parse_amt(parts[1])
+                if not amt: await u.message.reply_text("مبلغ?"); return
+                ensure_user(type("U",(),{"id":tid,"username":"","full_name":str(tid),"is_bot":False})())
+                try:
+                    if kind == "a_add": change_wallet(tid, amt, "admin_add", str(user.id))
+                    else: change_wallet(tid, -amt, "admin_sub", str(user.id))
+                except ValueError as e: await u.message.reply_text(str(e)); return
+                clear_st(c); await u.message.reply_text("OK", reply_markup=admin_kb()); return
+            if kind == "a_meow":
+                m = re.match(r"^(min|max|cd)\s+(\d+)$", text, re.I)
+                if m:
+                    key = {"min":"meow_min","max":"meow_max","cd":"meow_cd"}[m.group(1).lower()]
+                    sset(key, m.group(2)); clear_st(c); await u.message.reply_text("OK", reply_markup=admin_kb())
+                return
+            if kind == "a_bank":
+                m = re.match(r"^(سود|مالیات)\s+([\d.]+)$", text)
+                if m:
+                    if m.group(1)=="سود": sset("bank_interest", m.group(2))
+                    else: sset("transfer_tax", m.group(2))
+                    clear_st(c); await u.message.reply_text("OK", reply_markup=admin_kb())
+                return
+            if kind == "a_tpl":
+                if text.startswith("قالب "):
+                    rest = text[5:].strip().split(maxsplit=1)
+                    if len(rest)==2:
+                        with tx() as conn:
+                            conn.execute("INSERT OR REPLACE INTO templates(key,value) VALUES (?,?)", (rest[0], rest[1]))
+                        clear_st(c); await u.message.reply_text("قالب OK", reply_markup=admin_kb())
+                return
+            if kind == "a_names":
+                m = re.match(r"نام\s+(\w+)\s+(.+)", text)
+                if m:
+                    with tx() as conn:
+                        conn.execute("INSERT OR REPLACE INTO names(key,value) VALUES (?,?)", (m.group(1), m.group(2)))
+                    clear_st(c); await u.message.reply_text("نام OK", reply_markup=admin_kb())
+                return
+            if kind == "a_code":
+                parts = text.split()
+                if len(parts)>=3:
+                    code, amt, uses = parts[0].upper(), parse_amt(parts[1]), parse_amt(parts[2])
+                    if amt and uses:
+                        with tx() as conn:
+                            conn.execute("INSERT OR REPLACE INTO gift_codes(code,amount,uses_left,active,expires) VALUES (?,?,?,1,?)",
+                                         (code, amt, int(uses), time.time()+30*86400))
+                        clear_st(c); await u.message.reply_text(f"کد {code}", reply_markup=admin_kb())
+                return
+            if kind == "a_bcast":
+                with tx() as conn:
+                    ids = [r["id"] for r in conn.execute("SELECT id FROM users").fetchall()]
+                ok=fail=0
+                for i in ids:
+                    try: await c.bot.send_message(int(i), text); ok+=1
+                    except: fail+=1
+                clear_st(c); await u.message.reply_text(f"✅{ok} ❌{fail}", reply_markup=admin_kb()); return
+            if kind == "a_admins":
+                m = re.match(r"ادمین\s*([+-])\s*(\d+)", text)
+                if m:
+                    with tx() as conn:
+                        if m.group(1)=="+": conn.execute("INSERT OR IGNORE INTO admins(user_id) VALUES (?)", (int(m.group(2)),))
+                        elif int(user.id)==ADMIN_ID and int(m.group(2))!=ADMIN_ID:
+                            conn.execute("DELETE FROM admins WHERE user_id=?", (int(m.group(2)),))
+                    clear_st(c); await u.message.reply_text("OK", reply_markup=admin_kb())
+                return
 
-    if re.fullmatch(r"(منو|menu)", low, re.I):
+    # commands
+    entity = nget("entity", "پیشی")
+    if re.fullmatch(rf"(منو|menu|{re.escape(entity)}|پیشی)", low, re.I):
         if chat.type != ChatType.PRIVATE:
-            await u.message.reply_text(
-                "در گپ منو نیست.\nبنویس: <code>راهنما</code> یا <code>ویلو</code> · <code>شهر</code> · <code>بانک</code>",
-                parse_mode="HTML",
-            )
+            await u.message.reply_text("در گپ از دستورات متنی استفاده کن.\n<code>راهنما</code>", parse_mode="HTML")
             return
-        await u.message.reply_text("🦝 منوی رِیو:", reply_markup=main_menu_kb())
-        return
+        await u.message.reply_text("🐱 پنل MeowPoint", reply_markup=main_kb(user.id)); return
     if re.fullmatch(r"(راهنما|help)", low, re.I):
-        await u.message.reply_text(help_full(), parse_mode="HTML")
-        return
+        await u.message.reply_text(help_text(), parse_mode="HTML"); return
+    if re.fullmatch(r"(میو|meow|میو میو)", low, re.I):
+        msg = await do_meow(c.bot, chat.id, user)
+        await u.message.reply_text(msg, parse_mode="HTML"); return
     if re.fullmatch(r"(پروفایل|profile)", low, re.I):
-        await show_profile(c.bot, chat.id, user.id)
-        return
-    if re.fullmatch(r"(ویلو|willow|دریافت ویلو)", low, re.I):
-        await do_willow(u, c, from_cb=False)
-        return
-    if re.fullmatch(r"(شهر|city)", low, re.I):
-        if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
-            await u.message.reply_text("شهر فقط در گپ")
-            return
-        # fake callback path
-        class Q:
-            pass
-        # simpler: duplicate city text
-        city = ensure_city(chat)
-        with tx() as conn:
-            city = dict(conn.execute("SELECT * FROM cities WHERE chat_id=?", (chat.id,)).fetchone())
-        wusers = json.loads(city.get("willow_users") or "[]")
-        kb = InlineKeyboardMarkup([
-            [btn("🕊 دونیت", f"don:{chat.id}:{user.id}", "success")],
-            [btn("🏙 مارکت شهر", "m:citymarket", "primary")],
-        ])
-        mayor_name = "—"
-        try:
-            for a in await c.bot.get_chat_administrators(chat.id):
-                if a.status == "creator":
-                    mayor_name = a.user.full_name
-                    break
-        except Exception:
-            pass
-        city["population"] = len(wusers)
-        await u.message.reply_text(
-            city_panel_text(chat, city, mayor_name),
-            parse_mode="HTML",
-            reply_markup=kb,
-        )
-        return
+        await u.message.reply_text(profile_text(get_user(user.id)), parse_mode="HTML"); return
     if re.fullmatch(r"(بانک|bank)", low, re.I):
         uu = get_user(user.id)
         kb = InlineKeyboardMarkup([
-            [btn("⬆️ واریز", f"bank:in:{user.id}", "success"), btn("⬇️ برداشت", f"bank:out:{user.id}", "danger")],
+            [btn("📥 واریز", f"p:bin:{user.id}", "success"), btn("📤 برداشت", f"p:bout:{user.id}", "danger")],
+            [btn("💸 انتقال", f"p:btr:{user.id}", "primary"), btn("📜 تاریخچه", f"p:blog:{user.id}", "primary")],
+            [btn("💳 تغییر حساب", f"p:bacc:{user.id}", "primary")],
         ])
-        await u.message.reply_text(f"🏦 کیف {num(uu['willow'])} | بانک {num(uu['bank'])}", reply_markup=kb)
-        return
-    if re.fullmatch(r"(بازار|فروشگاه|shop)", low, re.I):
-        with tx() as conn:
-            items = conn.execute("SELECT * FROM shop_items WHERE active=1").fetchall()
-        rows = [[btn(f"{it['name']}|{num(it['price'])}", f"buy:{it['id']}:{user.id}", "success")] for it in items]
-        await u.message.reply_text("🛒 بازار:", reply_markup=InlineKeyboardMarkup(rows))
-        return
-    if re.fullmatch(r"(مارکت|مارکت شهر)", low, re.I):
-        await u.message.reply_text("از منو «مارکت شهر» را بزن یا در گپ باش.")
-        return
-    if re.fullmatch(r"(غارت|raid)", low, re.I):
-        with tx() as conn:
-            places = conn.execute("SELECT * FROM raid_places WHERE active=1").fetchall()
-        rows = [[btn(p["name"], f"raid:{p['id']}:{user.id}", "danger")] for p in places]
-        await u.message.reply_text("⚔️ مکان غارت:", reply_markup=InlineKeyboardMarkup(rows))
-        return
-    if re.fullmatch(r"(کارخانه|factory)", low, re.I):
-        await u.message.reply_text("از منو کارخانه را باز کن:", reply_markup=main_menu_kb())
-        return
-    
-    if re.fullmatch(r"(کازینو|casino)", low, re.I):
-        kb = InlineKeyboardMarkup([
-            [btn("🎲 تاس (زوج/فرد)", f"cas:dice:{user.id}", "primary")],
-            [btn("🎰 اسلات", f"cas:slot:{user.id}", "primary")],
-        ])
-        await u.message.reply_text(casino_panel_text(), parse_mode="HTML", reply_markup=kb)
-        return
+        await u.message.reply_text(bank_panel(uu), parse_mode="HTML", reply_markup=kb); return
     if re.fullmatch(r"(کارخانه|کارخونه|factory)", low, re.I):
-        # open factory panel via fake flow - reply with text
-        now = time.time()
-        with tx() as conn:
-            f = conn.execute("SELECT * FROM factories WHERE user_id=?", (user.id,)).fetchone()
-            if not f:
-                conn.execute("INSERT INTO factories(user_id) VALUES (?)", (user.id,))
-                f = conn.execute("SELECT * FROM factories WHERE user_id=?", (user.id,)).fetchone()
-            f = dict(f)
-            uu = get_user(user.id)
-            rescues = int(uu["street_rescues"] or 0)
-            conn.execute("UPDATE factories SET workers = MIN(workers_max, ?) WHERE user_id=?", (rescues, user.id))
-            f = dict(conn.execute("SELECT * FROM factories WHERE user_id=?", (user.id,)).fetchone())
+        fac = dict(get_factory(user.id))
         kb = InlineKeyboardMarkup([
-            [btn("▶️ شروع تولید", f"fac:go:{user.id}", "success")],
-            [btn("⬆️ ارتقا", f"fac:up:{user.id}", "success")],
+            [btn("▶️ تولید/برداشت", f"p:fgo:{user.id}", "success")],
+            [btn("⬆️ ارتقا", f"p:fup:{user.id}", "primary")],
         ])
-        await u.message.reply_text(factory_panel_text(user.full_name, f), parse_mode="HTML", reply_markup=kb)
-        return
-    if re.fullmatch(r"(راکون|raccoon)", low, re.I):
-        rac = get_main_raccoon(user.id)
-        uu = get_user(user.id)
-        kb = InlineKeyboardMarkup([[btn("⬆️ ارتقا مقام", f"rac:up:{user.id}", "success")]])
-        await u.message.reply_text(raccoon_panel_text(uu, rac), parse_mode="HTML", reply_markup=kb)
-        return
-    if re.fullmatch(r"(کد هدیه|کد|gift)", low, re.I):
-        set_st(c, "gift")
-        await u.message.reply_text("🎁 کد هدیه را بفرست:")
-        return
-
-    if re.fullmatch(r"(رتبه|رتبه‌بندی|رتبه بندی|لیدربرد|leaderboard)", low, re.I):
+        await u.message.reply_text(factory_panel(user.full_name, fac), parse_mode="HTML", reply_markup=kb); return
+    if re.fullmatch(r"(شهر|city)", low, re.I):
+        kb = InlineKeyboardMarkup([
+            [btn("⬆️ ارتقا شهر", f"p:cup:{user.id}", "success")],
+            [btn("🕊 دونیت", f"p:cdon:{user.id}", "primary")],
+        ])
+        await u.message.reply_text(city_panel(get_user(user.id)), parse_mode="HTML", reply_markup=kb); return
+    if re.fullmatch(r"(بازار|فروشگاه|shop|market)", low, re.I):
+        # reuse callback style by sending keyboard
         with tx() as conn:
-            rows = conn.execute("SELECT id,name,willow,level FROM users ORDER BY willow DESC LIMIT 10").fetchall()
-        lines = ["🏆 رتبه‌بندی\n"]
-        for i, r in enumerate(rows, 1):
-            lines.append(f"{mono(to_roman(i))} {mention(r['id'], r['name'])} — {num(r['willow'])}")
-        await u.message.reply_text("\n".join(lines), parse_mode="HTML")
-        return
+            items = conn.execute("SELECT * FROM shop WHERE active=1").fetchall()
+        rows = [[btn(f"{it['name']}|{num(it['price'])}", f"p:buy:{it['id']}:{user.id}", "success")] for it in items]
+        await u.message.reply_text("🛒 بازار:", reply_markup=InlineKeyboardMarkup(rows)); return
+    if re.fullmatch(r"(رتبه|رتبه‌بندی|رتبه بندی|لیدربرد)", low, re.I):
+        with tx() as conn:
+            rows = conn.execute("SELECT id,name,wallet,bank,level FROM users ORDER BY wallet+bank DESC LIMIT 10").fetchall()
+        lines = ["🏆 رتبه\n"]
+        for i,r in enumerate(rows,1):
+            lines.append(f"{mono(to_roman(i))} {mention(r['id'], r['name'])} — {num(int(r['wallet'])+int(r['bank']))}")
+        await u.message.reply_text("\n".join(lines), parse_mode="HTML"); return
+    if re.fullmatch(r"(جمع.?آوری|شکار|gather)", low, re.I):
+        urow = get_user(user.id)
+        cd = sint("gather_cd", 900)
+        left = float(urow["last_gather"] or 0)+cd-time.time()
+        if left > 0:
+            await u.message.reply_text(render("gather_wait", left=fmt_time(left)), parse_mode="HTML"); return
+        with tx() as conn:
+            conn.execute("UPDATE users SET last_gather=? WHERE id=?", (time.time(), user.id))
+        gain = random.randint(30, 150)
+        change_wallet(user.id, gain, "gather", "")
+        await u.message.reply_text(f"🎣 +{num(gain)} MP"); return
+    if re.fullmatch(r"(کد|کد هدیه|gift)", low, re.I):
+        set_st(c, "gift"); await u.message.reply_text("🎁 کد را بفرست:"); return
+    if re.fullmatch(r"(دعوت|رفرال|friends)", low, re.I):
+        me = await c.bot.get_me()
+        link = f"https://t.me/{me.username}?start=ref{user.id}"
+        uu = get_user(user.id)
+        await u.message.reply_text(f"👥 لینک دعوت:\n{link}\nدعوت‌ها: {uu['referrals']}"); return
     if re.fullmatch(r"(پنل|admin)", low, re.I):
         if chat.type == ChatType.PRIVATE and is_admin(user.id):
-            await u.message.reply_text("🎛 پنل مدیریت", reply_markup=admin_kb())
+            await u.message.reply_text("🎛 پنل مدیریت MeowPoint", reply_markup=admin_kb())
         return
-
     m = re.match(r"^(?:انتقال)\s+(.+)$", low, re.I)
     if m:
-        amt = parse_amount(m.group(1))
+        amt = parse_amt(m.group(1))
         if not amt or not u.message.reply_to_message or not u.message.reply_to_message.from_user:
-            await u.message.reply_text("ریپلای کن و بنویس: انتقال 10k")
-            return
+            await u.message.reply_text("ریپلای + انتقال 10k"); return
         to = u.message.reply_to_message.from_user
-        if to.id == user.id or to.is_bot:
-            await u.message.reply_text("نامعتبر")
-            return
-        tax = int(amt * sfloat("transfer_tax", 0.02))
-        send = amt - tax
+        if to.id == user.id or to.is_bot: await u.message.reply_text("نامعتبر"); return
+        tax = int(amt * sfloat("transfer_tax", 0.02)); send = amt - tax
         try:
-            change_willow(user.id, -amt, "transfer_out", str(to.id))
+            change_wallet(user.id, -amt, "transfer_out", str(to.id))
             ensure_user(to)
-            change_willow(to.id, send, "transfer_in", str(user.id))
-        except ValueError:
-            await u.message.reply_text("موجودی کم")
-            return
-        await u.message.reply_text(
-            f"✅ انتقال {num(send)} ویلو\n{mention(user.id, user.full_name)} → {mention(to.id, to.full_name)}",
-            parse_mode="HTML",
-        )
+            change_wallet(to.id, send, "transfer_in", str(user.id))
+        except ValueError as e:
+            await u.message.reply_text(str(e)); return
+        await u.message.reply_text(f"✅ {num(send)} MP\n{mention(user.id,user.full_name)} → {mention(to.id,to.full_name)}", parse_mode="HTML")
         return
 
-
-async def on_photo(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    st = get_st(c)
-    if not st or not is_admin(u.effective_user.id):
-        return
-    if st.get("kind") == "a_street_photo":
-        fid = u.message.photo[-1].file_id
-        set_st(c, "a_street_meta", {"photo": fid})
-        await u.message.reply_text("حالا بفرست:\n<code>نام|نادر بودن|قیمت|قدرت</code>\nمثال: راکون شب|کمیاب|90000|25", parse_mode="HTML")
-        return
-
-
-async def on_text_street_meta(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    st = get_st(c)
-    if not st or st.get("kind") != "a_street_meta":
-        return False
-    if not is_admin(u.effective_user.id):
-        return False
-    parts = (u.message.text or "").split("|")
-    if len(parts) < 4:
-        await u.message.reply_text("فرمت: نام|نادر بودن|قیمت|قدرت")
-        return True
-    name, rarity, price, power = parts[0].strip(), parts[1].strip(), parse_amount(parts[2]), parse_amount(parts[3])
-    if not price or not power:
-        await u.message.reply_text("قیمت/قدرت نامعتبر")
-        return True
-    with tx() as conn:
-        conn.execute(
-            "INSERT INTO street_raccoons(name,rarity,price,power,photo_file_id,active) VALUES (?,?,?,?,?,1)",
-            (name, rarity, int(price), int(power), st["extra"].get("photo")),
-        )
-    clear_st(c)
-    await u.message.reply_text(f"راکون خیابانی ثبت شد: {name}", reply_markup=admin_kb())
+def own_check_ok(user):
     return True
-
-
-_orig = on_text
-
-async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):  # noqa: F811
-    if await on_text_street_meta(u, c):
-        return
-    await _orig(u, c)
-
 
 def main():
     init_db()
-    from telegram.request import HTTPXRequest
-    req_kwargs = dict(
-        connection_pool_size=8,
-        connect_timeout=60.0,
-        read_timeout=60.0,
-        write_timeout=60.0,
-        pool_timeout=60.0,
-    )
-    if PROXY_URL:
-        req_kwargs["proxy"] = PROXY_URL
-    req = HTTPXRequest(**req_kwargs)
-    get_req = HTTPXRequest(**req_kwargs)
-    app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .request(req)
-        .get_updates_request(get_req)
-        .build()
-    )
-    async def _safe_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        try:
-            await on_text(update, context)
+    req_kw = dict(connection_pool_size=8, connect_timeout=60.0, read_timeout=60.0, write_timeout=60.0, pool_timeout=60.0)
+    if PROXY_URL: req_kw["proxy"] = PROXY_URL
+    req = HTTPXRequest(**req_kw)
+    get_req = HTTPXRequest(**req_kw)
+    app = Application.builder().token(BOT_TOKEN).request(req).get_updates_request(get_req).build()
+
+    async def safe_text(update, context):
+        try: await on_text(update, context)
         except Exception as e:
-            log.exception("on_text error")
+            log.exception("text")
             try:
                 if update.effective_message:
-                    await update.effective_message.reply_text("⚠️ خطا: %s" % str(e)[:180])
-            except Exception:
-                pass
+                    await update.effective_message.reply_text("⚠️ %s" % str(e)[:150])
+            except: pass
 
-    async def _safe_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        try:
-            await on_callback(update, context)
+    async def safe_cb(update, context):
+        try: await on_cb(update, context)
         except Exception as e:
-            log.exception("on_callback error")
+            log.exception("cb")
             try:
                 if update.callback_query:
                     await update.callback_query.answer(str(e)[:100], show_alert=True)
-            except Exception:
-                pass
+            except: pass
 
-    async def _cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        try:
-            await on_text(update, context)
-        except Exception as e:
-            log.exception("start error")
-            try:
-                await update.message.reply_text("⚠️ استارت: %s" % str(e)[:180])
-            except Exception:
-                pass
-
-    app.add_handler(CommandHandler("start", _cmd_start))
-    app.add_handler(CallbackQueryHandler(_safe_cb))
-    app.add_handler(MessageHandler(filters.PHOTO, on_photo))
-    app.add_handler(MessageHandler(filters.Dice.ALL, _safe_text))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _safe_text))
-
-    log.info("Rivo bot starting (timeout=60s proxy=%s)", bool(PROXY_URL))
-    app.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        bootstrap_retries=10,
-        drop_pending_updates=True,
-    )
-
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", lambda u,c: u.message.reply_text(help_text(), parse_mode="HTML")))
+    app.add_handler(CallbackQueryHandler(safe_cb))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, safe_text))
+    app.add_handler(MessageHandler(filters.COMMAND, safe_text))
+    log.info("MeowPoint started")
+    app.run_polling(allowed_updates=Update.ALL_TYPES, bootstrap_retries=10, drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
