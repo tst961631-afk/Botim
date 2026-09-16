@@ -87,16 +87,31 @@ def init_db():
             confirmed INTEGER DEFAULT 0,
             created_at REAL
         );
+        CREATE TABLE IF NOT EXISTS claim_options (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL,
+            threshold INTEGER NOT NULL,
+            label TEXT DEFAULT '',
+            active INTEGER DEFAULT 1,
+            sort_order INTEGER DEFAULT 0
+        );
         """)
         c.execute("INSERT OR IGNORE INTO admins(user_id) VALUES (?)", (ADMIN_ID,))
         defaults = {
             "lock_enabled": "1",
             "ref_reward": "100000",
-            "tiers": "6,8,12,16,18",
             "card_len": "12",
         }
         for k, v in defaults.items():
             c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)", (k, v))
+        # default claim options only if empty
+        n = c.execute("SELECT COUNT(*) c FROM claim_options").fetchone()["c"]
+        if n == 0:
+            for i, th in enumerate([6, 8, 12, 16, 18]):
+                c.execute(
+                    "INSERT INTO claim_options(kind,threshold,label,active,sort_order) VALUES (?,?,?,1,?)",
+                    ("ref", th, f"{th} رفرال", i),
+                )
 
 def sget(k, d=None):
     with tx() as c:
@@ -183,14 +198,37 @@ def get_st(ctx):
 def clear_st(ctx):
     ctx.user_data.pop("st", None)
 
-def tiers_list():
-    raw = sget("tiers", "6,8,12,16,18") or "6,8,12,16,18"
-    out = []
-    for x in raw.split(","):
-        x = x.strip()
-        if x.isdigit():
-            out.append(int(x))
-    return out or [6, 8, 12, 16, 18]
+def get_claim_options():
+    with tx() as c:
+        return c.execute(
+            "SELECT * FROM claim_options WHERE active=1 ORDER BY sort_order, id"
+        ).fetchall()
+
+def format_need_msg(opt, uu):
+    """پیام کامل وقتی شرط برداشت برقرار نیست."""
+    kind = opt["kind"]
+    th = int(opt["threshold"])
+    if kind == "ref":
+        have = int(uu["ref_count"] or 0)
+        return (
+            f"❌ رفرال شما کافی نیست\n\n"
+            f"📌 گزینه: {opt['label'] or (str(th) + ' رفرال')}\n"
+            f"👥 رفرال شما: <b>{have}</b>\n"
+            f"🎯 نیاز: <b>{th}</b>\n"
+            f"📉 کمبود: <b>{max(0, th - have)}</b>\n\n"
+            f"با دعوت دوستان و تأیید عضویت، رفرال‌ات بیشتر می‌شود."
+        )
+    # points / claimable
+    have = int(uu["claimable"] or 0)
+    return (
+        f"❌ امتیاز قابل‌برداشت شما کافی نیست\n\n"
+        f"📌 گزینه: {opt['label'] or (num(th) + ' میوپوینت')}\n"
+        f"💰 امتیاز شما: <b>{num(have)}</b>\n"
+        f"🎯 نیاز: <b>{num(th)}</b>\n"
+        f"📉 کمبود: <b>{num(max(0, th - have))}</b>\n\n"
+        f"با رفرال‌های جدید امتیاز جمع می‌شود."
+    )
+
 
 def active_channels():
     with tx() as c:
@@ -264,6 +302,7 @@ def admin_kb():
         [btn(lock, "a:toggle_lock", "primary")],
         [btn("📢 مدیریت چنل‌ها", "a:channels", "primary")],
         [btn("💵 پاداش رفرال", "a:reward", "primary")],
+        [btn("⚙️ گزینه‌های برداشت", "a:copt", "primary")],
         [btn("📥 دریافتی‌ها", "a:claims", "success")],
         [btn("➕ واریز دستی", "a:add", "success"), btn("➖ کسر", "a:sub", "danger")],
         [btn("👤 ادمین‌ها", "a:admins", "primary"), btn("📊 آمار", "a:stats", "primary")],
@@ -370,13 +409,13 @@ async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
         return
 
     # player panels ownership
-    if ":" in data and data.split(":")[0] in ("bal", "reflink", "myrefs", "claim", "help", "ctier"):
+    if ":" in data and data.split(":")[0] in ("bal", "reflink", "myrefs", "claim", "help", "ctier", "copt"):
         try:
             owner = int(data.split(":")[-1])
             if owner != user.id and not data.startswith("ctier:"):
                 # ctier has format ctier:TIER:UID
                 pass
-            if data.startswith("ctier:"):
+            if data.startswith("ctier:") or data.startswith("copt:"):
                 owner = int(data.split(":")[2])
             if owner != user.id:
                 await q.answer("این پنل برای تو نیست", show_alert=True)
@@ -462,9 +501,8 @@ async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if data.startswith("claim:") and not data.startswith("ctier:"):
+    if data.startswith("claim:") and not data.startswith("copt:"):
         uu = get_user(user.id)
-        # pending claim?
         with tx() as conn:
             pend = conn.execute(
                 "SELECT id FROM claims WHERE user_id=? AND status='pending'", (user.id,)
@@ -475,45 +513,78 @@ async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
                 reply_markup=main_kb(user.id),
             )
             return
-        tlist = tiers_list()
+        opts = get_claim_options()
+        if not opts:
+            await q.edit_message_text(
+                "هنوز گزینه‌ای برای برداشت از طرف ادمین ثبت نشده.",
+                reply_markup=main_kb(user.id),
+            )
+            return
         rows = []
-        for t in tlist:
-            rows.append([btn(f"{t} رفرال", f"ctier:{t}:{user.id}", "success")])
+        for o in opts:
+            if o["kind"] == "ref":
+                label = o["label"] or f"{o['threshold']} رفرال"
+            else:
+                label = o["label"] or f"{num(o['threshold'])} میوپوینت"
+            rows.append([btn(label, f"copt:{o['id']}:{user.id}", "success")])
         rows.append([btn("🔙", f"bal:{user.id}", "primary")])
         await q.edit_message_text(
-            f"💸 <b>دریافت میوپوینت جمع‌آوری‌شده</b>\n\n"
-            f"رفرال تأییدشده: <b>{uu['ref_count']}</b>\n"
-            f"امتیاز قابل برداشت: <b>{num(uu['claimable'])}</b>\n\n"
-            f"یک پله را انتخاب کن (باید حداقل همان تعداد رفرال داشته باشی):",
+            f"💸 <b>دریافت میوپوینت</b>\n\n"
+            f"👥 رفرال تأییدشده: <b>{uu['ref_count']}</b>\n"
+            f"💰 امتیاز قابل برداشت: <b>{num(uu['claimable'])}</b>\n\n"
+            f"یک گزینه را انتخاب کن:",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(rows),
         )
         return
 
-    if data.startswith("ctier:"):
+    if data.startswith("copt:"):
         parts = data.split(":")
-        need, owner = int(parts[1]), int(parts[2])
+        oid, owner = int(parts[1]), int(parts[2])
         if user.id != owner:
             await q.answer("برای تو نیست", show_alert=True)
             return
+        with tx() as conn:
+            opt = conn.execute("SELECT * FROM claim_options WHERE id=? AND active=1", (oid,)).fetchone()
+        if not opt:
+            await q.answer("گزینه نامعتبر", show_alert=True)
+            return
         uu = get_user(user.id)
-        if int(uu["ref_count"]) < need:
-            await q.answer(f"رفرال شما کم است (نیاز: {need})", show_alert=True)
+        ok = False
+        if opt["kind"] == "ref":
+            ok = int(uu["ref_count"] or 0) >= int(opt["threshold"])
+        else:
+            ok = int(uu["claimable"] or 0) >= int(opt["threshold"])
+        if not ok:
+            # پیام کامل داخل چت (مثل پاپ‌آپ واضح)
+            await q.edit_message_text(
+                format_need_msg(opt, uu),
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([
+                    [btn("🔙 بازگشت به گزینه‌ها", f"claim:{user.id}", "primary")],
+                    [btn("🏠 منو", f"bal:{user.id}", "primary")],
+                ]),
+            )
             return
-        if int(uu["claimable"]) <= 0:
-            await q.answer("امتیاز قابل برداشت صفر است", show_alert=True)
+        if int(uu["claimable"] or 0) <= 0:
+            await q.edit_message_text(
+                "❌ امتیاز قابل‌برداشت شما صفر است.\nبا رفرال جدید امتیاز جمع می‌شود.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[btn("🔙", f"claim:{user.id}", "primary")]]),
+            )
             return
-        # already pending?
         with tx() as conn:
             if conn.execute(
                 "SELECT 1 FROM claims WHERE user_id=? AND status='pending'", (user.id,)
             ).fetchone():
                 await q.answer("درخواست قبلی در انتظاره", show_alert=True)
                 return
-        set_st(c, "card", {"tier": need, "amount": int(uu["claimable"])})
+        amount = int(uu["claimable"])
+        set_st(c, "card", {"opt_id": oid, "amount": amount, "kind": opt["kind"], "threshold": int(opt["threshold"])})
         await q.edit_message_text(
-            f"پله <b>{need}</b> رفرال\n"
-            f"مبلغ قابل دریافت: <b>{num(uu['claimable'])}</b>\n\n"
+            f"✅ شرایط برقرار است\n\n"
+            f"📌 {opt['label'] or opt['kind']}\n"
+            f"💰 مبلغ قابل دریافت: <b>{num(amount)}</b>\n\n"
             f"شماره کارت میویی را بفرست (فقط عدد، ۱۲ رقم)\n"
             f"مثال: <code>109658451189</code>",
             parse_mode="HTML",
@@ -583,6 +654,53 @@ async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
             f"مقدار جدید را بفرست (مثال: <code>100k</code> یا <code>200000</code>)",
             parse_mode="HTML",
         )
+        return
+
+    if data == "a:copt":
+        with tx() as conn:
+            opts = conn.execute("SELECT * FROM claim_options ORDER BY sort_order, id").fetchall()
+        lines = ["⚙️ <b>گزینه‌های برداشت</b>\n", "هر گزینه یا بر اساس رفرال است یا امتیاز.\n"]
+        kb_rows = []
+        for o in opts:
+            st = "✅" if o["active"] else "❌"
+            if o["kind"] == "ref":
+                info = f"{st} رفرال ≥ {o['threshold']} | {o['label']}"
+            else:
+                info = f"{st} امتیاز ≥ {num(o['threshold'])} | {o['label']}"
+            lines.append(info)
+            kb_rows.append([
+                btn(("خاموش" if o["active"] else "روشن"), f"a:copt_tog:{o['id']}", "primary"),
+                btn("حذف", f"a:copt_del:{o['id']}", "danger"),
+            ])
+        kb_rows.append([btn("➕ افزودن گزینه", "a:copt_add", "success")])
+        kb_rows.append([btn("🔙", "a:home", "primary")])
+        await q.edit_message_text("\n".join(lines), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb_rows))
+        return
+
+    if data == "a:copt_add":
+        set_st(c, "a_copt_add")
+        await q.edit_message_text(
+            "گزینه جدید را این‌طور بفرست:\n\n"
+            "<b>رفرال</b>:\n<code>رفرال 6</code>\n<code>رفرال 6 شش رفرال</code>\n\n"
+            "<b>امتیاز</b>:\n<code>امتیاز 600000</code>\n<code>امتیاز 600k برداشت 600کا</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    if data.startswith("a:copt_tog:"):
+        oid = int(data.split(":")[2])
+        with tx() as conn:
+            cur = conn.execute("SELECT active FROM claim_options WHERE id=?", (oid,)).fetchone()
+            if cur:
+                conn.execute("UPDATE claim_options SET active=? WHERE id=?", (0 if cur["active"] else 1, oid))
+        await q.edit_message_text("عوض شد. دوباره گزینه‌ها را باز کن.", reply_markup=admin_kb())
+        return
+
+    if data.startswith("a:copt_del:"):
+        oid = int(data.split(":")[2])
+        with tx() as conn:
+            conn.execute("DELETE FROM claim_options WHERE id=?", (oid,))
+        await q.edit_message_text("حذف شد.", reply_markup=admin_kb())
         return
 
     if data == "a:claims":
@@ -686,10 +804,23 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
             clear_st(c)
             await u.message.reply_text("امتیاز قابل برداشت صفر است.")
             return
-        if int(uu["ref_count"]) < int(st["extra"].get("tier") or 0):
-            clear_st(c)
-            await u.message.reply_text("رفرال کافی نیست.")
-            return
+        # re-validate option
+        opt_id = st["extra"].get("opt_id")
+        if opt_id:
+            with tx() as conn:
+                opt = conn.execute("SELECT * FROM claim_options WHERE id=? AND active=1", (opt_id,)).fetchone()
+            if not opt:
+                clear_st(c)
+                await u.message.reply_text("گزینه دیگر فعال نیست.")
+                return
+            if opt["kind"] == "ref" and int(uu["ref_count"] or 0) < int(opt["threshold"]):
+                clear_st(c)
+                await u.message.reply_text("رفرال کافی نیست.")
+                return
+            if opt["kind"] == "points" and int(uu["claimable"] or 0) < int(opt["threshold"]):
+                clear_st(c)
+                await u.message.reply_text("امتیاز کافی نیست.")
+                return
         with tx() as conn:
             pend = conn.execute(
                 "SELECT 1 FROM claims WHERE user_id=? AND status='pending'", (user.id,)
@@ -760,6 +891,37 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
                 )
             clear_st(c)
             await u.message.reply_text(f"ثبت شد: {title}\n<code>{cid}</code>", parse_mode="HTML", reply_markup=admin_kb())
+            return
+        if kind == "a_copt_add":
+            # رفرال 6 [label...]  |  امتیاز 600k [label...]
+            m = re.match(r"^(رفرال|امتیاز)\s+(\S+)(?:\s+(.+))?$", text.strip(), re.I)
+            if not m:
+                await u.message.reply_text("فرمت: رفرال 6 یا امتیاز 600k")
+                return
+            kind_fa, th_raw, label = m.group(1), m.group(2), (m.group(3) or "").strip()
+            kind = "ref" if kind_fa == "رفرال" else "points"
+            if kind == "ref":
+                try:
+                    th = int(th_raw)
+                except ValueError:
+                    await u.message.reply_text("تعداد رفرال عدد باشد")
+                    return
+                if not label:
+                    label = f"{th} رفرال"
+            else:
+                th = parse_amt(th_raw)
+                if not th:
+                    await u.message.reply_text("مبلغ نامعتبر")
+                    return
+                if not label:
+                    label = f"{num(th)} میوپوینت"
+            with tx() as conn:
+                conn.execute(
+                    "INSERT INTO claim_options(kind,threshold,label,active,sort_order) VALUES (?,?,?,1,?)",
+                    (kind, th, label, 99),
+                )
+            clear_st(c)
+            await u.message.reply_text(f"✅ ثبت شد: {label}", reply_markup=admin_kb())
             return
         if kind == "a_reward":
             amt = parse_amt(text)
