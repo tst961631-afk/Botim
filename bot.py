@@ -11,12 +11,16 @@ from datetime import datetime, timezone, timedelta
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import (
-    Application, CallbackQueryHandler, MessageHandler, ContextTypes, filters,
+    Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters,
 )
 from telegram.constants import ChatType
 
 BOT_TOKEN = "8727762178:AAGrdb5XFjhkcdoOEIFy1s8U71idRpN0DX8"
 ADMIN_ID = 7530457395
+# اگر اینترنت به api.telegram.org وصل نمی‌شود، پروکسی بگذار (مثال):
+# PROXY_URL = "http://127.0.0.1:10809"
+# PROXY_URL = "socks5://127.0.0.1:1080"
+PROXY_URL = None
 DB_PATH = "rivo_game.db"
 TZ = timezone(timedelta(hours=3, minutes=30))  # تهران
 
@@ -1276,6 +1280,7 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
     user = u.effective_user
     chat = u.effective_chat
     text = (u.message.text or "").strip()
+    log.info("msg from %s chat=%s text=%r", user.id if user else None, chat.id if chat else None, text[:80])
     ensure_user(user)
     if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
         ensure_city(chat)
@@ -1632,12 +1637,73 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):  # noqa: F811
 
 def main():
     init_db()
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CallbackQueryHandler(on_callback))
+    from telegram.request import HTTPXRequest
+    req = HTTPXRequest(
+        connection_pool_size=8,
+        connect_timeout=60.0,
+        read_timeout=60.0,
+        write_timeout=60.0,
+        pool_timeout=60.0,
+        proxy=PROXY_URL if PROXY_URL else None,
+    )
+    builder = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .request(req)
+        .get_updates_request(req)
+        .connect_timeout(60.0)
+        .read_timeout(60.0)
+        .write_timeout(60.0)
+        .pool_timeout(60.0)
+    )
+    app = builder.build()
+    async def _safe_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        try:
+            await on_text(update, context)
+        except Exception:
+            log.exception("on_text error")
+            try:
+                if update.effective_message:
+                    await update.effective_message.reply_text("⚠️ خطای موقت. دوباره امتحان کن.")
+            except Exception:
+                pass
+
+    async def _safe_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        try:
+            await on_callback(update, context)
+        except Exception:
+            log.exception("on_callback error")
+            try:
+                if update.callback_query:
+                    await update.callback_query.answer("خطا", show_alert=True)
+            except Exception:
+                pass
+
+    async def _cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        try:
+            # normalize as /start for on_text referral logic
+            if update.message and update.message.text and not update.message.text.startswith("/start"):
+                update.message.text = "/start"
+            await on_text(update, context)
+        except Exception:
+            log.exception("start error")
+            try:
+                await update.message.reply_text("raccoon error")
+            except Exception:
+                pass
+
+    app.add_handler(CommandHandler("start", _cmd_start))
+    app.add_handler(CallbackQueryHandler(_safe_cb))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
-    app.add_handler(MessageHandler(filters.TEXT, on_text))
-    log.info("Rivo bot started")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    # همه پیام‌های متنی (با یا بدون /)
+    app.add_handler(MessageHandler(filters.TEXT, _safe_text))
+    app.add_handler(MessageHandler(filters.COMMAND, _safe_text))
+    log.info("Rivo bot starting (timeout=60s proxy=%s)", bool(PROXY_URL))
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        bootstrap_retries=10,
+        drop_pending_updates=True,
+    )
 
 
 if __name__ == "__main__":
