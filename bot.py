@@ -1638,25 +1638,24 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):  # noqa: F811
 def main():
     init_db()
     from telegram.request import HTTPXRequest
-    req = HTTPXRequest(
+    req_kwargs = dict(
         connection_pool_size=8,
         connect_timeout=60.0,
         read_timeout=60.0,
         write_timeout=60.0,
         pool_timeout=60.0,
-        proxy=PROXY_URL if PROXY_URL else None,
     )
-    builder = (
+    if PROXY_URL:
+        req_kwargs["proxy"] = PROXY_URL
+    req = HTTPXRequest(**req_kwargs)
+    get_req = HTTPXRequest(**req_kwargs)
+    app = (
         Application.builder()
         .token(BOT_TOKEN)
         .request(req)
-        .get_updates_request(req)
-        .connect_timeout(60.0)
-        .read_timeout(60.0)
-        .write_timeout(60.0)
-        .pool_timeout(60.0)
+        .get_updates_request(get_req)
+        .build()
     )
-    app = builder.build()
     async def _safe_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await on_text(update, context)
