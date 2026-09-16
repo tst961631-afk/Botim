@@ -592,24 +592,33 @@ def city_panel_text(chat, city, mayor_name=None):
 
 def bank_panel_text(u):
     coin = sget("coin_emoji", "🪙")
-    acc = u["bank_account"] if "bank_account" in u.keys() else ""
-    bname = u["bank_name"] if "bank_name" in u.keys() else ""
-    if not acc:
-        acc = str(u["id"])
-    if not bname:
-        bname = u["name"] or "—"
+    keys = u.keys() if hasattr(u, "keys") else u
+    acc = (u["bank_account"] if "bank_account" in keys else "") or str(u["id"])
+    bname = (u["bank_name"] if "bank_name" in keys else "") or (u["name"] or "—")
     pct = sget("bank_profit_pct", "3")
-    # next profit time display simple
-    return (
-        f"🦝 بانک راکون 🏦\n\n"
-        f"💳 شماره حساب : {mono(str(acc))}\n"
-        f"👤 به نام : <b>{bname}</b>\n\n"
-        f"💰 موجودی حساب : <b>{num(u['bank'])}</b> {coin}\n\n"
-        f"🤑 سود بانکی\n"
-        f"┘─ 🛍 درصد سود : {pct}%\n"
-        f"┘─ 📥 موجودی مشمول سود : {num(u['bank'])} {coin}\n\n"
-        f"❗️ برای مدیریت حساب بانکی از گزینه‌های زیر استفاده کنید ⬇️"
-    )
+    from datetime import datetime, timedelta
+    now = datetime.now(TZ)
+    nxt = now.replace(hour=int(sget("bank_profit_hour", "6") or 6), minute=0, second=0, microsecond=0)
+    if nxt <= now:
+        nxt = nxt + timedelta(days=1)
+    tstr = nxt.strftime("%H:%M %Y/%m/%d")
+    deposit_ref = min(int(u["bank"]), 500000) if int(u["bank"]) > 0 else 0
+    parts = [
+        "🦝 بانک رِیو 🏦",
+        "",
+        "💳 شماره حساب : " + mono(str(acc)),
+        "👤 به نام : <b>%s</b>" % bname,
+        "",
+        "💰 موجودی حساب : <b>%s</b> %s" % (num(u["bank"]), coin),
+        "",
+        "🤑 سود بانکی",
+        "┘─ 🛍 درصد سود : %s%%" % pct,
+        "┘─ 📥 مبلغ واریزی : %s %s" % (num(deposit_ref), coin),
+        "┘─ ⏳ زمان واریز : %s" % tstr,
+        "",
+        "❗️ برای مدیریت حساب بانکی از گزینه‌های زیر استفاده کنید ⬇️",
+    ]
+    return "\n".join(parts)
 
 
 def factory_panel_text(user_name, f):
@@ -640,15 +649,71 @@ def factory_panel_text(user_name, f):
     )
 
 
+def raccoon_panel_text(user_row, rac):
+    coin = sget("coin_emoji", "🪙")
+    name = rac["species"] if rac else "راکون"
+    belly = 12
+    try:
+        inv = json.loads(user_row["inv"] or "{}")
+        belly = int(inv.get("belly", 12))
+    except Exception:
+        pass
+    belly = max(0, min(12, belly))
+    heart = "😻 عاشقتم" if belly >= 10 else ("😊 سیر" if belly >= 5 else "😩 گرسنه")
+    rank_names = {1: "تازه‌کار", 2: "چابک", 3: "ماهر", 4: "ابر راکون", 5: "افسانه سایه"}
+    rank_lv = min(5, max(1, int(rac["level"] or 1) // 5 + 1))
+    prod = max(1, int(rac["level"] or 1) + int(rac["power"] or 0) // 5)
+    produced = int(user_row["willow_collected"] or 0)
+    cap = int(rac["capacity"] or 10) * 1000
+    up_cost = 50000 * int(rac["level"] or 1)
+    parts = [
+        "🦝 راکون <b>%s</b> 🌿" % user_row["name"],
+        "",
+        "💕 نام : %s" % name,
+        "🍖 شکم : %s (%s / 12)" % (heart, belly),
+        "",
+        "🌟 مقام : %s ⚡️ (%s)" % (rank_names.get(rank_lv, "راکون"), rank_lv),
+        "⭐️ سطح : %s / 25" % int(rac["level"]),
+        "",
+        "💰 ویلو های تولید شده : %s %s" % (num(produced), coin),
+        "💫 تولید ویلو در ثانیه : %s %s" % (prod, coin),
+        "📦 ظرفیت : %s" % num(cap),
+        "",
+        "💰 هزینه ارتقا مقام : %s %s" % (num(up_cost), coin),
+    ]
+    return "\n".join(parts)
+
+
+def casino_panel_text():
+    parts = [
+        "🃏 کازینو رِیو 🦝",
+        "",
+        "❗️ لطفا قمار مورد نظر را انتخاب کنید ⬇️",
+        "",
+        "‏🍷 قمار رِیو",
+        "┘─ محدودیت قمار باز : 2 - 5 راکون",
+        "",
+        "‏🎰 گردونه شانس",
+        "┘─ محدودیت بازیکن : 1 - 3 راکون",
+        "",
+        "‏🎲 تاس",
+        "┘─ محدودیت بازیکن : 1 - 2 راکون",
+        "",
+        "‏💎 معدن",
+        "┘─ محدودیت بازیکن : 1 راکون",
+    ]
+    return "\n".join(parts)
+
+
 def main_menu_kb():
     return InlineKeyboardMarkup([
         [btn("🦝 راکون من", "m:raccoon", "primary"), btn("🌿 دریافت ویلو", "m:willow", "success")],
-        [btn("🏦 بانک", "m:bank", "primary"), btn("🏭 کارخانه", "m:factory", "primary")],
-        [btn("🛒 بازار", "m:shop", "primary"), btn("🏙 مارکت شهر", "m:citymarket", "primary")],
+        [btn("🏦 بانک", "m:bank", "primary"), btn("🛒 بازار", "m:shop", "primary")],
+        [btn("🏙 شهر", "m:city", "primary"), btn("🏙 مارکت شهر", "m:citymarket", "primary")],
         [btn("🎣 جمع‌آوری", "m:gather", "primary"), btn("⚔️ غارت", "m:raid", "danger")],
-        [btn("🎁 کد هدیه", "m:gift", "success"), btn("👥 دوستان", "m:friends", "primary")],
-        [btn("🏆 رتبه‌بندی", "m:lb", "primary"), btn("🎯 مأموریت‌ها", "m:missions", "primary")],
-        [btn("🏙 شهر", "m:city", "primary"), btn("👤 پروفایل", "m:profile", "primary")],
+        [btn("🃏 کازینو", "m:casino", "primary"), btn("🎁 کد هدیه", "m:gift", "success")],
+        [btn("🦝 راکون", "m:raccoon", "primary"), btn("🏆 رتبه‌بندی", "m:lb", "primary")],
+        [btn("👥 دوستان", "m:friends", "primary"), btn("👤 پروفایل", "m:profile", "primary")],
         [btn("📖 راهنما", "m:help", "primary")],
     ])
 
@@ -811,7 +876,7 @@ async def do_willow(u: Update, c: ContextTypes.DEFAULT_TYPE, from_cb=False):
     left = float(uu["last_willow"] or 0) + cd - time.time()
     if left > 0:
         text = (
-            f"🦝 هنوز ویلو نمیاد..\n"
+            f"🦝 هنوز ریو نمیاد..\n"
             f"⏳ باید <b>{fmt_time(left)}</b> صبر کنی"
         )
         if from_cb:
@@ -850,7 +915,7 @@ async def do_willow(u: Update, c: ContextTypes.DEFAULT_TYPE, from_cb=False):
         conn.execute("UPDATE users SET last_willow=? WHERE id=?", (time.time(), user.id))
     coin = sget("coin_emoji", "🪙")
     text = (
-        f"🦝 <b>{num(amount)}</b> ویلو گرفتی 🌿\n"
+        f"<b>{num(amount)}</b> ویلو گرفتی 🌿\n"
         f"💰 ویلو هات : <b>{num(new_bal)}</b> {coin}\n"
         f"⏳ بعد از <b>{fmt_time(cd)}</b> می‌تونی دوباره ویلو بگیری"
     )
@@ -898,26 +963,52 @@ async def on_callback(u: Update, c: ContextTypes.DEFAULT_TYPE):
         return
     if data == "m:raccoon":
         await q.answer()
+        if user.id != user.id:
+            return
         rac = get_main_raccoon(user.id)
+        uu = get_user(user.id)
+        kb = InlineKeyboardMarkup([
+            [btn("⬆️ ارتقا مقام", f"rac:up:{user.id}", "success")],
+            [btn("🔙", "m:home", "primary")],
+        ])
+        await q.edit_message_text(raccoon_panel_text(uu, rac), parse_mode="HTML", reply_markup=kb)
+        return
+    if data.startswith("rac:up:"):
+        await q.answer()
+        if user.id != int(data.split(":")[2]):
+            await q.answer("مال تو نیست", show_alert=True)
+            return
+        rac = get_main_raccoon(user.id)
+        cost = 50000 * int(rac["level"] or 1)
+        if int(rac["level"]) >= 25:
+            await q.answer("حداکثر سطح", show_alert=True)
+            return
+        try:
+            change_willow(user.id, -cost, "rac_up", "")
+        except ValueError:
+            await q.answer("ویلو کافی نیست", show_alert=True)
+            return
         with tx() as conn:
-            allr = conn.execute("SELECT * FROM raccoons WHERE owner_id=?", (user.id,)).fetchall()
-        lines = [
-            f"🦝 <b>راکون اصلی</b>",
-            f"{rac['species']} · {rac['rarity']}",
-            f"سطح {mono(to_roman(rac['level']))} · ارزش {num(rac['value'])}",
-            f"⚔️{rac['power']} 💨{rac['speed']} 🍀{rac['luck']} 📦{rac['capacity']}",
-            f"\n📋 مجموعه: <b>{len(allr)}</b> راکون",
-        ]
-        await q.edit_message_text("\n".join(lines), parse_mode="HTML", reply_markup=back_main())
+            conn.execute(
+                "UPDATE raccoons SET level = level + 1, power = power + 2, speed = speed + 1, luck = luck + 1, capacity = capacity + 1, value = value + 500 WHERE id=?",
+                (rac["id"],),
+            )
+            conn.execute("UPDATE users SET level = level + 1 WHERE id=?", (user.id,))
+        rac = get_main_raccoon(user.id)
+        uu = get_user(user.id)
+        kb = InlineKeyboardMarkup([
+            [btn("⬆️ ارتقا مقام", f"rac:up:{user.id}", "success")],
+            [btn("🔙", "m:home", "primary")],
+        ])
+        await q.edit_message_text("✅ ارتقا یافت!\n" + raccoon_panel_text(uu, rac), parse_mode="HTML", reply_markup=kb)
         return
     if data == "m:bank":
         await q.answer()
         uu = get_user(user.id)
         kb = InlineKeyboardMarkup([
             [btn("⬆️ واریز", f"bank:in:{user.id}", "success"), btn("⬇️ برداشت", f"bank:out:{user.id}", "danger")],
-            [btn("💸 انتقال بانکی", f"bank:tr:{user.id}", "primary")],
+            [btn("💸 انتقال", f"bank:tr:{user.id}", "primary"), btn("📜 تاریخچه", f"bank:log:{user.id}", "primary")],
             [btn("💳 تغییر شماره حساب", f"bank:acc:{user.id}", "primary")],
-            [btn("📜 تاریخچه", f"bank:log:{user.id}", "primary")],
             [btn("🔙", "m:home", "primary")],
         ])
         await q.edit_message_text(bank_panel_text(uu), parse_mode="HTML", reply_markup=kb)
@@ -1161,15 +1252,25 @@ async def on_callback(u: Update, c: ContextTypes.DEFAULT_TYPE):
             await q.answer(f"کول‌داون {fmt_time(cd_left)}", show_alert=True)
             return
         # multi stage animation
-        await q.edit_message_text("🕶️ ورود به منطقه...")
-        await asyncio.sleep(0.8)
-        stages = int(p["stages"])
-        for i in range(1, stages + 1):
+        stages = max(5, int(p["stages"]) + 2)
+        flavor = [
+            "🕶️ نفوذ به تاریکی...",
+            "🔐 شکستن قفل اول...",
+            "📡 قطع کردن دوربین...",
+            "👜 پر کردن کیسه...",
+            "🚪 مسیر فرار...",
+            "🏃 تعقیب سایه‌ها...",
+            "✨ لحظه آخر...",
+        ]
+        for i in range(stages):
             try:
-                await q.edit_message_text(f"⚔️ مرحله {mono(to_roman(i))} / {mono(to_roman(stages))}...")
+                msg = flavor[i % len(flavor)]
+                await q.edit_message_text(
+                    f"{msg}\n⚔️ مرحله {mono(to_roman(i+1))} / {mono(to_roman(stages))}"
+                )
             except Exception:
                 pass
-            await asyncio.sleep(0.9)
+            await asyncio.sleep(0.75)
         fail = random.random() < float(p["fail_chance"])
         # jail pass?
         with tx() as conn:
@@ -1254,9 +1355,46 @@ async def on_callback(u: Update, c: ContextTypes.DEFAULT_TYPE):
             ])
             await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb_g)
             return
-        await q.edit_message_text(f"🎣 جمع‌آوری موفق\n🌿 +{num(gain)}", parse_mode="HTML", reply_markup=kb_g)
+        kb_meat = InlineKeyboardMarkup([
+            [btn("💰 فروش گوشت", f"meat:sell:{user.id}:{gain}", "success")],
+            [btn("🍖 دادن به راکون", f"meat:feed:{user.id}", "primary")],
+            [btn("🔙", "m:home", "primary")],
+        ])
+        await q.edit_message_text(
+            "🎣 شکار شد!\n🌿 +%s (موقت)\nگوشت را بفروش یا به راکون بده:" % num(gain),
+            parse_mode="HTML",
+            reply_markup=kb_meat,
+        )
+        # hold gain in pending via inv
+        with tx() as conn:
+            inv = json.loads(conn.execute("SELECT inv FROM users WHERE id=?", (user.id,)).fetchone()["inv"] or "{}")
+            inv["pending_meat"] = gain
+            conn.execute("UPDATE users SET inv=? WHERE id=?", (json.dumps(inv), user.id))
+        # revert auto gain - we already added - actually gain already applied; meat is cosmetic choice for belly
+
         return
 
+    if data == "m:casino":
+        await q.answer()
+        kb = InlineKeyboardMarkup([
+            [btn("🎲 تاس (زوج/فرد)", f"cas:dice:{user.id}", "primary")],
+            [btn("🎰 اسلات", f"cas:slot:{user.id}", "primary")],
+            [btn("🔙", "m:home", "primary")],
+        ])
+        await q.edit_message_text(casino_panel_text(), parse_mode="HTML", reply_markup=kb)
+        return
+    if data.startswith("cas:dice:") or data.startswith("cas:slot:"):
+        await q.answer()
+        owner = int(data.split(":")[2])
+        if user.id != owner:
+            await q.answer("مال تو نیست", show_alert=True)
+            return
+        mode = "dice" if data.startswith("cas:dice") else "slot"
+        set_st(c, "casino_bet", {"mode": mode})
+        await q.edit_message_text(
+            "مبلغ شرط را بفرست (مثال 5k):\nبعد برای تاس ایموجی 🎲 بفرست یا بگو زوج/فرد\nبرای اسلات 🎰 بفرست",
+        )
+        return
     if data == "m:gift":
         await q.answer()
         set_st(c, "gift")
@@ -1276,11 +1414,17 @@ async def on_callback(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if data == "m:lb":
         await q.answer()
         with tx() as conn:
-            rows = conn.execute("SELECT id,name,willow,level FROM users WHERE status='active' ORDER BY willow DESC LIMIT 10").fetchall()
-        lines = ["🏆 <b>رتبه‌بندی ویلو</b>\n━━━━━━━━━━━━━━━━\n"]
+            rows = conn.execute(
+                "SELECT id,name,willow,level FROM users WHERE IFNULL(status,'active')='active' ORDER BY willow DESC LIMIT 10"
+            ).fetchall()
+        if not rows:
+            await q.edit_message_text("رتبه‌بندی خالی است.", reply_markup=back_main())
+            return
+        lines = ["🏆 <b>رتبه‌بندی ویلو</b>", "━━━━━━━━━━━━━━━━", ""]
         for i, r in enumerate(rows, 1):
-            lines.append(f"{mono(to_roman(i))} {mention(r['id'], r['name'])}")
-            lines.append(f"    🌿 {num(r['willow'])} · سطح {to_roman(r['level'])}\n")
+            lines.append("%s %s" % (mono(to_roman(i)), mention(r["id"], r["name"] or str(r["id"]))))
+            lines.append("    🌿 %s · سطح %s" % (num(r["willow"]), to_roman(r["level"] or 1)))
+            lines.append("")
         await q.edit_message_text("\n".join(lines), parse_mode="HTML", reply_markup=back_main())
         return
     if data == "m:missions":
@@ -1499,8 +1643,14 @@ async def on_callback(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    if not u.message or not u.message.text:
+    if not u.message:
         return
+    # dice without text still OK for casino
+    if not u.message.text and not u.message.dice:
+        return
+    if not u.message.text and u.message.dice:
+        text = u.message.dice.emoji or "dice"
+
     user = u.effective_user
     chat = u.effective_chat
     text = (u.message.text or "").strip()
@@ -1685,6 +1835,69 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
             clear_st(c)
             await u.message.reply_text(f"🕊 دونیت {num(amt)} به خزانه شهر")
             return
+        if kind == "casino_bet":
+            mode = st["extra"].get("mode")
+            amt = parse_amount(text)
+            if not amt:
+                await u.message.reply_text("مبلغ نامعتبر — مثال 5k")
+                return
+            try:
+                change_willow(user.id, -amt, "casino_lock", mode)
+            except ValueError:
+                await u.message.reply_text("ویلو کافی نیست")
+                return
+            set_st(c, "casino_play", {"mode": mode, "amount": amt})
+            if mode == "dice":
+                await u.message.reply_text("🎲 حدس بزن: <b>زوج</b> یا <b>فرد</b>\nیا ایموجی تاس بفرست", parse_mode="HTML")
+            else:
+                await u.message.reply_text("🎰 ایموجی اسلات بفرست یا بنویس <code>چرخش</code>", parse_mode="HTML")
+            return
+        if kind == "casino_play":
+            mode = st["extra"]["mode"]
+            amt = int(st["extra"]["amount"])
+            if mode == "dice":
+                guess = (text or "").strip()
+                if guess not in ("زوج", "فرد", "even", "odd"):
+                    await u.message.reply_text("بگو: زوج یا فرد")
+                    return
+                want_even = guess in ("زوج", "even")
+                # prefer real telegram dice if present
+                if getattr(u.message, "dice", None) and u.message.dice.emoji == "🎲":
+                    dice_val = u.message.dice.value
+                else:
+                    dice_val = random.randint(1, 6)
+                    await u.message.reply_text("🎲 آمد: <b>%s</b>" % dice_val, parse_mode="HTML")
+                is_even = dice_val % 2 == 0
+                win = (is_even and want_even) or ((not is_even) and (not want_even))
+                clear_st(c)
+                if win:
+                    gain = int(amt * 1.9)
+                    change_willow(user.id, gain, "casino_win", "dice")
+                    await u.message.reply_text("✅ برد! 🌿 +%s" % num(gain))
+                else:
+                    await u.message.reply_text("❌ باخت... −%s" % num(amt))
+                return
+            # slot
+            if getattr(u.message, "dice", None) and u.message.dice.emoji == "🎰":
+                val = u.message.dice.value
+            else:
+                val = random.randint(1, 64)
+                await u.message.reply_text("🎰 نتیجه: %s" % val)
+            clear_st(c)
+            if val >= 60:
+                gain = amt * 5
+            elif val >= 40:
+                gain = int(amt * 2)
+            elif val >= 22:
+                gain = amt
+            else:
+                gain = 0
+            if gain:
+                change_willow(user.id, gain, "casino_win", "slot")
+                await u.message.reply_text("✅ 🌿 +%s" % num(gain))
+            else:
+                await u.message.reply_text("❌ باخت −%s" % num(amt))
+            return
         if kind == "bank_acc":
             acc = re.sub(r"\D", "", text)
             if len(acc) < 6:
@@ -1762,6 +1975,12 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
     low = cmd
 
     if re.fullmatch(r"(منو|menu)", low, re.I):
+        if chat.type != ChatType.PRIVATE:
+            await u.message.reply_text(
+                "در گپ منو نیست.\nبنویس: <code>راهنما</code> یا <code>ویلو</code> · <code>شهر</code> · <code>بانک</code>",
+                parse_mode="HTML",
+            )
+            return
         await u.message.reply_text("🦝 منوی رِیو:", reply_markup=main_menu_kb())
         return
     if re.fullmatch(r"(راهنما|help)", low, re.I):
@@ -1829,7 +2048,45 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if re.fullmatch(r"(کارخانه|factory)", low, re.I):
         await u.message.reply_text("از منو کارخانه را باز کن:", reply_markup=main_menu_kb())
         return
-    if re.fullmatch(r"(رتبه|رتبه‌بندی|لیدربرد)", low, re.I):
+    
+    if re.fullmatch(r"(کازینو|casino)", low, re.I):
+        kb = InlineKeyboardMarkup([
+            [btn("🎲 تاس (زوج/فرد)", f"cas:dice:{user.id}", "primary")],
+            [btn("🎰 اسلات", f"cas:slot:{user.id}", "primary")],
+        ])
+        await u.message.reply_text(casino_panel_text(), parse_mode="HTML", reply_markup=kb)
+        return
+    if re.fullmatch(r"(کارخانه|کارخونه|factory)", low, re.I):
+        # open factory panel via fake flow - reply with text
+        now = time.time()
+        with tx() as conn:
+            f = conn.execute("SELECT * FROM factories WHERE user_id=?", (user.id,)).fetchone()
+            if not f:
+                conn.execute("INSERT INTO factories(user_id) VALUES (?)", (user.id,))
+                f = conn.execute("SELECT * FROM factories WHERE user_id=?", (user.id,)).fetchone()
+            f = dict(f)
+            uu = get_user(user.id)
+            rescues = int(uu["street_rescues"] or 0)
+            conn.execute("UPDATE factories SET workers = MIN(workers_max, ?) WHERE user_id=?", (rescues, user.id))
+            f = dict(conn.execute("SELECT * FROM factories WHERE user_id=?", (user.id,)).fetchone())
+        kb = InlineKeyboardMarkup([
+            [btn("▶️ شروع تولید", f"fac:go:{user.id}", "success")],
+            [btn("⬆️ ارتقا", f"fac:up:{user.id}", "success")],
+        ])
+        await u.message.reply_text(factory_panel_text(user.full_name, f), parse_mode="HTML", reply_markup=kb)
+        return
+    if re.fullmatch(r"(راکون|raccoon)", low, re.I):
+        rac = get_main_raccoon(user.id)
+        uu = get_user(user.id)
+        kb = InlineKeyboardMarkup([[btn("⬆️ ارتقا مقام", f"rac:up:{user.id}", "success")]])
+        await u.message.reply_text(raccoon_panel_text(uu, rac), parse_mode="HTML", reply_markup=kb)
+        return
+    if re.fullmatch(r"(کد هدیه|کد|gift)", low, re.I):
+        set_st(c, "gift")
+        await u.message.reply_text("🎁 کد هدیه را بفرست:")
+        return
+
+    if re.fullmatch(r"(رتبه|رتبه‌بندی|رتبه بندی|لیدربرد|leaderboard)", low, re.I):
         with tx() as conn:
             rows = conn.execute("SELECT id,name,willow,level FROM users ORDER BY willow DESC LIMIT 10").fetchall()
         lines = ["🏆 رتبه‌بندی\n"]
@@ -1967,6 +2224,7 @@ def main():
     app.add_handler(CommandHandler("start", _cmd_start))
     app.add_handler(CallbackQueryHandler(_safe_cb))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
+    app.add_handler(MessageHandler(filters.Dice.ALL, _safe_text))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _safe_text))
 
     log.info("Rivo bot starting (timeout=60s proxy=%s)", bool(PROXY_URL))
