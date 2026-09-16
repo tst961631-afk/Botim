@@ -183,6 +183,26 @@ def init_db():
             """
         )
         c.execute("INSERT OR IGNORE INTO admins(user_id) VALUES (?)", (ADMIN_ID,))
+        # soft migrations
+        for sql in [
+            "ALTER TABLE users ADD COLUMN bank_account TEXT DEFAULT ''",
+            "ALTER TABLE users ADD COLUMN bank_name TEXT DEFAULT ''",
+            "ALTER TABLE users ADD COLUMN last_bank_profit REAL DEFAULT 0",
+            "ALTER TABLE cities ADD COLUMN fish INTEGER DEFAULT 0",
+            "ALTER TABLE cities ADD COLUMN population INTEGER DEFAULT 0",
+            "ALTER TABLE factories ADD COLUMN storage INTEGER DEFAULT 0",
+            "ALTER TABLE factories ADD COLUMN storage_cap INTEGER DEFAULT 75000",
+            "ALTER TABLE factories ADD COLUMN workers INTEGER DEFAULT 0",
+            "ALTER TABLE factories ADD COLUMN workers_max INTEGER DEFAULT 14",
+            "ALTER TABLE factories ADD COLUMN machine_lv INTEGER DEFAULT 1",
+            "ALTER TABLE factories ADD COLUMN worker_lv INTEGER DEFAULT 1",
+            "ALTER TABLE factories ADD COLUMN xp INTEGER DEFAULT 0",
+        ]:
+            try:
+                c.execute(sql)
+            except Exception:
+                pass
+
         defaults = {
             "willow_min": "3000",
             "willow_max": "7000",
@@ -199,6 +219,12 @@ def init_db():
             "factory_base_reward": "25000",
             "city_xp_per_willow": "1",
             "currency": "ویلو",
+            "bank_profit_pct": "3",
+            "bank_profit_hour": "6",
+            "market_min_city_lv": "7",
+            "street_tries": "2",
+            "worker_tick_min": "30",
+            "coin_emoji": "🪙",
         }
         for k, v in defaults.items():
             c.execute("INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)", (k, v))
@@ -320,6 +346,39 @@ def to_roman(n):
 
 def mono(s):
     return f"<code>{s}</code>"
+
+
+def fancy_name(name: str) -> str:
+    """Mathematical bold style for display names."""
+    if not name:
+        return "—"
+    out = []
+    for ch in str(name):
+        o = ord(ch)
+        if 65 <= o <= 90:  # A-Z
+            out.append(chr(0x1D5D4 + (o - 65)))
+        elif 97 <= o <= 122:  # a-z
+            out.append(chr(0x1D5EE + (o - 97)))
+        elif 48 <= o <= 57:  # 0-9
+            out.append(chr(0x1D7EC + (o - 48)))
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def bar(cur, need, width=5):
+    need = max(1, int(need))
+    cur = max(0, int(cur))
+    filled = min(width, int(width * cur / need))
+    return "▰" * filled + "▱" * (width - filled)
+
+
+def line(title, value, rank=None):
+    s = f"{title} : {value}"
+    if rank is not None:
+        s += f"\n┘─ 🎖️ رتبه {rank}"
+    return s
+
 
 
 def fmt_time(sec):
@@ -491,6 +550,96 @@ def clear_st(ctx):
 
 
 # ───────────────────────── UI ─────────────────────────
+def city_panel_text(chat, city, mayor_name=None):
+    coin = sget("coin_emoji", "🪙")
+    try:
+        wusers = json.loads(city.get("willow_users") or "[]")
+    except Exception:
+        wusers = []
+    lv = int(city.get("level") or 1)
+    # goals for next level
+    need_w = 50 * lv
+    need_pop = 2 * lv
+    need_fish = 5 * lv
+    need_treas = 5000 * lv
+    mayor = mayor_name or "—"
+    pop = int(city.get("population") or len(wusers))
+    fish = int(city.get("fish") or 0)
+    tre = int(city.get("treasury") or 0)
+    title = city.get("title") or "شهر"
+    return (
+        f"🦝 شهر راکون <b>{title}</b> 🏰\n"
+        f"{mono('CITY')}\n\n"
+        f"🦁 شهردار : <b>{fancy_name(mayor)}</b> (مالک)\n\n"
+        f"⭐️ سطح شهر : {mono(to_roman(lv))}\n\n"
+        f"🌿 ویلو ها : {num(len(wusers))}\n"
+        f"┘─ 🎖️ رتبه فعالیت\n\n"
+        f"🦝 جمعیت : {num(pop)} راکون\n"
+        f"┘─ 🎖️ رتبه جمعیت\n\n"
+        f"🎣 ماهی ها : {num(fish)}\n"
+        f"┘─ 🎖️ رتبه ماهی\n\n"
+        f"🏦 خزانه : {num(tre)} {coin}\n"
+        f"┘─ 🎖️ رتبه خزانه\n\n"
+        f"⏫ باف های شهر ⬇️\n"
+        f"┘─ این شهر هنوز باف فعالی ندارد ❌\n\n"
+        f"🎯 هدف بعدی شهر برای ارتقا سطح ⬇️\n"
+        f"┘─  🌿 ویلو های مورد نیاز : {num(need_w)}\n"
+        f"┘─ 🦝 راکون های مورد نیاز : {num(need_pop)}\n"
+        f"┘─ 🎣 ماهی های مورد نیاز : {num(need_fish)}\n"
+        f"┘─ 🏦 دارایی مورد نیاز خزانه : {num(need_treas)} {coin}"
+    )
+
+
+def bank_panel_text(u):
+    coin = sget("coin_emoji", "🪙")
+    acc = u["bank_account"] if "bank_account" in u.keys() else ""
+    bname = u["bank_name"] if "bank_name" in u.keys() else ""
+    if not acc:
+        acc = str(u["id"])
+    if not bname:
+        bname = u["name"] or "—"
+    pct = sget("bank_profit_pct", "3")
+    # next profit time display simple
+    return (
+        f"🦝 بانک راکون 🏦\n\n"
+        f"💳 شماره حساب : {mono(str(acc))}\n"
+        f"👤 به نام : <b>{bname}</b>\n\n"
+        f"💰 موجودی حساب : <b>{num(u['bank'])}</b> {coin}\n\n"
+        f"🤑 سود بانکی\n"
+        f"┘─ 🛍 درصد سود : {pct}%\n"
+        f"┘─ 📥 موجودی مشمول سود : {num(u['bank'])} {coin}\n\n"
+        f"❗️ برای مدیریت حساب بانکی از گزینه‌های زیر استفاده کنید ⬇️"
+    )
+
+
+def factory_panel_text(user_name, f):
+    coin = sget("coin_emoji", "🪙")
+    lv = int(f.get("level") or 1)
+    xp = int(f.get("xp") or 0)
+    need = 1000 * lv
+    st = int(f.get("storage") or 0)
+    cap = int(f.get("storage_cap") or 75000)
+    w = int(f.get("workers") or 0)
+    wm = int(f.get("workers_max") or 14)
+    prod = max(10, 120 - int(f.get("machine_lv") or 1) * 5)
+    return (
+        f"🦝 کارخونه راکون 🏭\n\n"
+        f"💼 مدیر کارخونه : <b>{user_name}</b>\n\n"
+        f"🧳 انبار کارخونه\n"
+        f"┘─ 🔺 ظرفیت انبار : {num(st)} / {num(cap)} محصول\n"
+        f"┘─ ⭐️ سطح : {int(f.get('level') or 1)}\n\n"
+        f"🦝 کارگران کارخونه\n"
+        f"┘─ 😺 تعداد کارگران : {w} / {wm} راکون\n"
+        f"┘─ ⭐️ سطح : {int(f.get('worker_lv') or 1)}\n\n"
+        f"🖨 دستگاه های تولید\n"
+        f"┘─ ⏳ زمان تولید محصول : {prod} ثانیه\n"
+        f"┘─ ⭐️ سطح : {int(f.get('machine_lv') or 1)}\n\n"
+        f"🌟 سطح کارخونه : {mono(to_roman(lv))}\n"
+        f"┘─ 🌡 {num(xp)}xᴘ / {num(need)}xᴘ {bar(xp, need)}\n\n"
+        f"🧮 شما درحال مدیریت کارخانه خود می‌باشید."
+    )
+
+
 def main_menu_kb():
     return InlineKeyboardMarkup([
         [btn("🦝 راکون من", "m:raccoon", "primary"), btn("🌿 دریافت ویلو", "m:willow", "success")],
@@ -661,7 +810,10 @@ async def do_willow(u: Update, c: ContextTypes.DEFAULT_TYPE, from_cb=False):
     cd = willow_cooldown(user.id, chat.id if chat.type != ChatType.PRIVATE else None)
     left = float(uu["last_willow"] or 0) + cd - time.time()
     if left > 0:
-        text = f"⏳ راکونت هنوز آماده‌ی ویلو نیست.\nزمان باقی: <b>{fmt_time(left)}</b>"
+        text = (
+            f"🦝 هنوز ویلو نمیاد..\n"
+            f"⏳ باید <b>{fmt_time(left)}</b> صبر کنی"
+        )
         if from_cb:
             await u.callback_query.edit_message_text(text, parse_mode="HTML", reply_markup=back_main())
         else:
@@ -696,11 +848,11 @@ async def do_willow(u: Update, c: ContextTypes.DEFAULT_TYPE, from_cb=False):
     new_bal = change_willow(user.id, amount, "willow", "collect")
     with tx() as conn:
         conn.execute("UPDATE users SET last_willow=? WHERE id=?", (time.time(), user.id))
+    coin = sget("coin_emoji", "🪙")
     text = (
-        f"🦝 راکونت دوباره دست به کار شد!\n"
-        f"🌿 <b>+{num(amount)}</b> ویلو\n"
-        f"موجودی: <b>{num(new_bal)}</b>\n"
-        f"⏳ بعدی: <b>{fmt_time(cd)}</b>"
+        f"🦝 <b>{num(amount)}</b> ویلو گرفتی 🌿\n"
+        f"💰 ویلو هات : <b>{num(new_bal)}</b> {coin}\n"
+        f"⏳ بعد از <b>{fmt_time(cd)}</b> می‌تونی دوباره ویلو بگیری"
     )
     if from_cb:
         await u.callback_query.edit_message_text(text, parse_mode="HTML", reply_markup=back_main())
@@ -763,14 +915,12 @@ async def on_callback(u: Update, c: ContextTypes.DEFAULT_TYPE):
         uu = get_user(user.id)
         kb = InlineKeyboardMarkup([
             [btn("⬆️ واریز", f"bank:in:{user.id}", "success"), btn("⬇️ برداشت", f"bank:out:{user.id}", "danger")],
+            [btn("💸 انتقال بانکی", f"bank:tr:{user.id}", "primary")],
+            [btn("💳 تغییر شماره حساب", f"bank:acc:{user.id}", "primary")],
             [btn("📜 تاریخچه", f"bank:log:{user.id}", "primary")],
             [btn("🔙", "m:home", "primary")],
         ])
-        await q.edit_message_text(
-            f"🏦 <b>بانک رِیو</b>\n🌿 کیف: <b>{num(uu['willow'])}</b>\n🏦 بانک: <b>{num(uu['bank'])}</b>\nسقف: {num(sint('bank_cap'))}",
-            parse_mode="HTML",
-            reply_markup=kb,
-        )
+        await q.edit_message_text(bank_panel_text(uu), parse_mode="HTML", reply_markup=kb)
         return
     if data.startswith("bank:in:") or data.startswith("bank:out:"):
         await q.answer()
@@ -804,34 +954,61 @@ async def on_callback(u: Update, c: ContextTypes.DEFAULT_TYPE):
                 conn.execute("INSERT INTO factories(user_id) VALUES (?)", (user.id,))
                 f = conn.execute("SELECT * FROM factories WHERE user_id=?", (user.id,)).fetchone()
             f = dict(f)
-        if float(f["busy_until"] or 0) > now:
-            await q.edit_message_text(
-                f"🏭 در حال تولید...\n⏱ {fmt_time(float(f['busy_until']) - now)}",
-                reply_markup=back_main(),
-            )
-            return
-        if int(f.get("ready") or 0):
-            reward = int(f.get("reward") or 0)
-            change_willow(user.id, reward, "factory", f"lv{f['level']}")
-            with tx() as conn:
-                conn.execute("UPDATE factories SET ready=0, reward=0 WHERE user_id=?", (user.id,))
-            await q.edit_message_text(f"🏭 تحویل شد: 🌿 <b>+{num(reward)}</b>", parse_mode="HTML", reply_markup=back_main())
-            return
-        tsec = sint("factory_base_time", 1800)
-        reward = sint("factory_base_reward", 25000) * int(f["level"])
+        # sync workers from street_rescues
+        uu = get_user(user.id)
+        rescues = int(uu["street_rescues"] or 0)
         with tx() as conn:
             conn.execute(
-                "UPDATE factories SET busy_until=?, ready=1, reward=? WHERE user_id=?",
-                (now + tsec, reward, user.id),
+                "UPDATE factories SET workers = MIN(workers_max, ?) WHERE user_id=?",
+                (rescues, user.id),
             )
-        kb = InlineKeyboardMarkup([
+            f = dict(conn.execute("SELECT * FROM factories WHERE user_id=?", (user.id,)).fetchone())
+        kb_fac = InlineKeyboardMarkup([
+            [btn("▶️ شروع تولید", f"fac:go:{user.id}", "success")],
             [btn("⬆️ ارتقا کارخانه", f"fac:up:{user.id}", "success")],
             [btn("🔙", "m:home", "primary")],
         ])
+        extra = ""
+        if float(f["busy_until"] or 0) > now:
+            extra = f"\n\n⏳ تولید جاری: {fmt_time(float(f['busy_until']) - now)}"
+        elif int(f.get("ready") or 0):
+            extra = f"\n\n✅ محصول آماده — دوباره شروع تولید را بزن تا تحویل شود"
         await q.edit_message_text(
-            f"🏭 تولید شروع شد\nسطح کارخانه: {mono(to_roman(f['level']))}\nپاداش: {num(reward)}\n⏱ {fmt_time(tsec)}",
+            factory_panel_text(user.full_name, f) + extra,
             parse_mode="HTML",
-            reply_markup=kb,
+            reply_markup=kb_fac,
+        )
+        return
+    if data.startswith("fac:go:"):
+        await q.answer()
+        if user.id != int(data.split(":")[2]):
+            return
+        now = time.time()
+        with tx() as conn:
+            f = dict(conn.execute("SELECT * FROM factories WHERE user_id=?", (user.id,)).fetchone())
+        if float(f["busy_until"] or 0) > now:
+            await q.answer("هنوز در حال تولید", show_alert=True)
+            return
+        if int(f.get("ready") or 0):
+            reward = int(f.get("reward") or 0)
+            # workers bonus
+            reward += int(f.get("workers") or 0) * 500
+            change_willow(user.id, reward, "factory", f"lv{f['level']}")
+            with tx() as conn:
+                conn.execute("UPDATE factories SET ready=0, reward=0, storage = MIN(storage_cap, storage + ?) WHERE user_id=?", (max(1, reward // 1000), user.id))
+            await q.edit_message_text(f"🏭 تحویل شد: 🌿 <b>+{num(reward)}</b>", parse_mode="HTML", reply_markup=back_main())
+            return
+        tsec = max(10, sint("factory_base_time", 1800) - int(f.get("machine_lv") or 1) * 5)
+        reward = sint("factory_base_reward", 25000) * int(f["level"])
+        with tx() as conn:
+            conn.execute(
+                "UPDATE factories SET busy_until=?, ready=1, reward=?, xp = xp + 50 WHERE user_id=?",
+                (now + tsec, reward, user.id),
+            )
+        await q.edit_message_text(
+            f"🏭 تولید شروع شد\nپاداش حدودی: {num(reward)}\n⏱ {fmt_time(tsec)}",
+            parse_mode="HTML",
+            reply_markup=back_main(),
         )
         return
     if data.startswith("fac:up:"):
@@ -902,34 +1079,44 @@ async def on_callback(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if data == "m:city":
         await q.answer()
         if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
-            await q.edit_message_text("شهر فقط در گپ معنا دارد.\nربات را به گپ اضافه کن.", reply_markup=back_main())
+            await q.edit_message_text("شهر فقط در گپ معنا دارد. ربات را به گپ اضافه کن.", reply_markup=back_main())
             return
-        city = ensure_city(chat)
+        ensure_city(chat)
         with tx() as conn:
             city = dict(conn.execute("SELECT * FROM cities WHERE chat_id=?", (chat.id,)).fetchone())
+        mayor_name = "—"
+        mayor_id = city.get("mayor_id")
+        try:
+            admins = await c.bot.get_chat_administrators(chat.id)
+            for a in admins:
+                if a.status == "creator":
+                    mayor_name = a.user.full_name
+                    mayor_id = a.user.id
+                    with tx() as conn:
+                        conn.execute("UPDATE cities SET mayor_id=? WHERE chat_id=?", (mayor_id, chat.id))
+                    break
+        except Exception:
+            if mayor_id:
+                urow = get_user(mayor_id)
+                if urow:
+                    mayor_name = urow["name"]
+        # population = unique willow users
         try:
             wusers = json.loads(city.get("willow_users") or "[]")
         except Exception:
             wusers = []
-        # detect mayor = chat creator if possible
-        mayor = city.get("mayor_id")
+        with tx() as conn:
+            conn.execute("UPDATE cities SET population=? WHERE chat_id=?", (len(wusers), chat.id))
+            city["population"] = len(wusers)
         kb = InlineKeyboardMarkup([
             [btn("🕊 دونیت به خزانه", f"don:{chat.id}:{user.id}", "success")],
             [btn("🏙 مارکت شهر", "m:citymarket", "primary")],
-            [btn("🔙", "m:home", "primary")],
+            [btn("🔙 منو", "m:home", "primary")],
         ])
-        await q.edit_message_text(
-            f"🏙 <b>{city['title']}</b>\n━━━━━━━━━━━━━━━━\n"
-            f"👑 سطح شهر  {mono(to_roman(city['level']))}\n"
-            f"✨ XP  {num(city['xp'])}\n"
-            f"💰 خزانه  {num(city['treasury'])}\n"
-            f"👥 ویلو‌زن‌ها  {num(len(wusers))}\n"
-            f"🌿 پاداش ویلو با سطح شهر بیشتر می‌شود",
-            parse_mode="HTML",
-            reply_markup=kb,
-        )
+        await q.edit_message_text(city_panel_text(chat, city, mayor_name), parse_mode="HTML", reply_markup=kb)
         return
     if data.startswith("don:"):
+
         await q.answer()
         parts = data.split(":")
         if user.id != int(parts[2]):
@@ -1033,7 +1220,7 @@ async def on_callback(u: Update, c: ContextTypes.DEFAULT_TYPE):
         cd = sint("gather_cd", 600)
         left = float(uu["last_gather"] or 0) + cd - time.time()
         if left > 0:
-            await q.edit_message_text(f"🎣 هنوز زود است: {fmt_time(left)}", reply_markup=back_main())
+            await q.edit_message_text(f"🦝 ماهیا هنوز خوابن..\n⏳ باید <b>{fmt_time(left)}</b> صبر کنی", parse_mode="HTML", reply_markup=back_main())
             return
         rac = get_main_raccoon(user.id)
         chance = 0.55 + int(rac["luck"]) / 200
@@ -1046,11 +1233,28 @@ async def on_callback(u: Update, c: ContextTypes.DEFAULT_TYPE):
         change_willow(user.id, gain, "gather", "")
         # rare street rescue
         extra = ""
-        if random.random() < 0.06:
+        kb_g = back_main()
+        if random.random() < 0.12:
             with tx() as conn:
                 conn.execute("UPDATE users SET street_rescues = street_rescues + 1 WHERE id=?", (user.id,))
-            extra = "\n🕊 یک راکون خیابانی نجات دادی! کول‌داون ویلو بهتر شد."
-        await q.edit_message_text(f"🎣 جمع‌آوری موفق\n🌿 +{num(gain)}{extra}", parse_mode="HTML", reply_markup=back_main())
+            bonus = random.randint(500, 1200)
+            change_willow(user.id, bonus, "street_rescue", "")
+            # meow-like 3 willows conceptually
+            text = (
+                f"🦝 راکون خیابانی بعد از تلاش با موفقیت نجات یافت و صاحب یک خونه جدید شد 🌿\n\n"
+                f"🦝 {mention(user.id, user.full_name)} با موفقیت راکون خیابانی را نجات داد\n\n"
+                f"💝 پاداش ⬇️\n"
+                f"┘─ +{num(bonus)} 🪙\n"
+                f"┘─ راکون خیابانی براتون ۳ بار ویلو جمع کرد 🌿\n"
+                f"┘─ جمع‌آوری: +{num(gain)}"
+            )
+            kb_g = InlineKeyboardMarkup([
+                [btn("🕊 نجات دوباره", "m:gather", "success")],
+                [btn("🔙", "m:home", "primary")],
+            ])
+            await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb_g)
+            return
+        await q.edit_message_text(f"🎣 جمع‌آوری موفق\n🌿 +{num(gain)}", parse_mode="HTML", reply_markup=kb_g)
         return
 
     if data == "m:gift":
@@ -1097,6 +1301,17 @@ async def on_callback(u: Update, c: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text("مارکت شهر فقط در گپ.", reply_markup=back_main())
             return
         ensure_city(chat)
+        with tx() as conn:
+            clv = conn.execute("SELECT level FROM cities WHERE chat_id=?", (chat.id,)).fetchone()
+            clv = int(clv["level"]) if clv else 1
+        need_lv = sint("market_min_city_lv", 7)
+        if clv < need_lv:
+            await q.edit_message_text(
+                f"🏙 مارکت شهر از سطح {mono(to_roman(need_lv))} باز می‌شود.\nسطح فعلی شهر: {mono(to_roman(clv))}",
+                parse_mode="HTML",
+                reply_markup=back_main(),
+            )
+            return
         with tx() as conn:
             city = dict(conn.execute("SELECT * FROM cities WHERE chat_id=?", (chat.id,)).fetchone())
             streets = conn.execute("SELECT * FROM street_raccoons WHERE active=1").fetchall()
@@ -1470,6 +1685,50 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
             clear_st(c)
             await u.message.reply_text(f"🕊 دونیت {num(amt)} به خزانه شهر")
             return
+        if kind == "bank_acc":
+            acc = re.sub(r"\D", "", text)
+            if len(acc) < 6:
+                await u.message.reply_text("شماره حساب نامعتبر")
+                return
+            with tx() as conn:
+                conn.execute("UPDATE users SET bank_account=?, bank_name=? WHERE id=?", (acc, user.full_name, user.id))
+            clear_st(c)
+            await u.message.reply_text(f"💳 حساب ثبت شد: {mono(acc)}", parse_mode="HTML")
+            return
+        if kind == "bank_tr":
+            parts = text.split()
+            if len(parts) < 2:
+                await u.message.reply_text("شماره_حساب مبلغ")
+                return
+            acc, amt = parts[0], parse_amount(parts[1])
+            if not amt:
+                await u.message.reply_text("مبلغ نامعتبر")
+                return
+            with tx() as conn:
+                target = conn.execute("SELECT id, name FROM users WHERE bank_account=?", (acc,)).fetchone()
+            if not target:
+                await u.message.reply_text("حساب پیدا نشد")
+                return
+            if int(target["id"]) == user.id:
+                await u.message.reply_text("به خودت؟")
+                return
+            uu = get_user(user.id)
+            if int(uu["bank"]) < amt:
+                await u.message.reply_text("موجودی بانک کم")
+                return
+            tax = int(amt * sfloat("transfer_tax", 0.02))
+            send = amt - tax
+            with tx() as conn:
+                conn.execute("UPDATE users SET bank = bank - ? WHERE id=?", (amt, user.id))
+                conn.execute("UPDATE users SET bank = bank + ? WHERE id=?", (send, int(target["id"])))
+            add_tx(user.id, "bank_tr_out", -amt, acc)
+            add_tx(int(target["id"]), "bank_tr_in", send, str(user.id))
+            clear_st(c)
+            await u.message.reply_text(
+                f"💸 انتقال بانکی\nبه: {target['name']}\n{mono(acc)}\n🌿 {num(send)}",
+                parse_mode="HTML",
+            )
+            return
         if kind in ("bank_in", "bank_out"):
             amt = parse_amount(text)
             if not amt:
@@ -1530,9 +1789,17 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
             [btn("🕊 دونیت", f"don:{chat.id}:{user.id}", "success")],
             [btn("🏙 مارکت شهر", "m:citymarket", "primary")],
         ])
+        mayor_name = "—"
+        try:
+            for a in await c.bot.get_chat_administrators(chat.id):
+                if a.status == "creator":
+                    mayor_name = a.user.full_name
+                    break
+        except Exception:
+            pass
+        city["population"] = len(wusers)
         await u.message.reply_text(
-            f"🏙 <b>{city['title']}</b>\n👑 سطح {mono(to_roman(city['level']))}\n"
-            f"💰 خزانه {num(city['treasury'])}\n👥 ویلو‌زن‌ها {num(len(wusers))}",
+            city_panel_text(chat, city, mayor_name),
             parse_mode="HTML",
             reply_markup=kb,
         )
