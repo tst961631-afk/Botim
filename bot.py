@@ -31,7 +31,7 @@ _lock = threading.RLock()
 
 # ───────────────────────── DB ─────────────────────────
 def db():
-    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn = sqlite3.connect(DB_PATH, timeout=60, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
@@ -359,7 +359,13 @@ def ensure_user(user):
     with tx() as c:
         r = c.execute("SELECT id FROM users WHERE id=?", (user.id,)).fetchone()
         if not r:
-            start_w = sint("start_willow", 15000)
+            start_w = 15000
+            try:
+                row = c.execute("SELECT value FROM settings WHERE key=?", ("start_willow",)).fetchone()
+                if row:
+                    start_w = int(float(row["value"]))
+            except Exception:
+                start_w = 15000
             c.execute(
                 """INSERT INTO users(id,username,name,willow,joined_at,last_active)
                    VALUES (?,?,?,?,?,?)""",
@@ -371,8 +377,11 @@ def ensure_user(user):
                 (user.id, "خاکستری", "معمولی", 1, 10, 10, 10, 10, 1000),
             )
             c.execute("INSERT OR IGNORE INTO factories(user_id) VALUES (?)", (user.id,))
-            add_tx(user.id, "start", start_w, "welcome")
-            log_event("join", user.id)
+            c.execute(
+                "INSERT INTO transactions(user_id,kind,amount,meta,ts) VALUES (?,?,?,?,?)",
+                (user.id, "start", start_w, "welcome", now),
+            )
+            c.execute("INSERT INTO logs(kind,detail,ts) VALUES (?,?,?)", ("join", str(user.id), now))
         else:
             c.execute(
                 "UPDATE users SET username=?, name=?, last_active=? WHERE id=?",
@@ -1659,44 +1668,40 @@ def main():
     async def _safe_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await on_text(update, context)
-        except Exception:
+        except Exception as e:
             log.exception("on_text error")
             try:
                 if update.effective_message:
-                    await update.effective_message.reply_text("⚠️ خطای موقت. دوباره امتحان کن.")
+                    await update.effective_message.reply_text("⚠️ خطا: %s" % str(e)[:180])
             except Exception:
                 pass
 
     async def _safe_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await on_callback(update, context)
-        except Exception:
+        except Exception as e:
             log.exception("on_callback error")
             try:
                 if update.callback_query:
-                    await update.callback_query.answer("خطا", show_alert=True)
+                    await update.callback_query.answer(str(e)[:100], show_alert=True)
             except Exception:
                 pass
 
     async def _cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
-            # normalize as /start for on_text referral logic
-            if update.message and update.message.text and not update.message.text.startswith("/start"):
-                update.message.text = "/start"
             await on_text(update, context)
-        except Exception:
+        except Exception as e:
             log.exception("start error")
             try:
-                await update.message.reply_text("raccoon error")
+                await update.message.reply_text("⚠️ استارت: %s" % str(e)[:180])
             except Exception:
                 pass
 
     app.add_handler(CommandHandler("start", _cmd_start))
     app.add_handler(CallbackQueryHandler(_safe_cb))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
-    # همه پیام‌های متنی (با یا بدون /)
-    app.add_handler(MessageHandler(filters.TEXT, _safe_text))
-    app.add_handler(MessageHandler(filters.COMMAND, _safe_text))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _safe_text))
+
     log.info("Rivo bot starting (timeout=60s proxy=%s)", bool(PROXY_URL))
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
