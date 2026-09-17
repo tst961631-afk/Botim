@@ -1,15 +1,14 @@
 # -*- coding: utf-8 -*-
-"""
-ربات قفل عضویت + رفرال + کیف MeowPoint + برداشت پله‌ای
-"""
+"""قفل عضویت + رفرال + کیف + برداشت فقط بر اساس امتیاز"""
 from __future__ import annotations
-import re, time, logging, sqlite3, threading, secrets
+import re, time, logging, sqlite3, threading
 from contextlib import contextmanager
+from urllib.parse import urlparse
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatMember
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, MessageHandler,
-    ContextTypes, filters, ChatMemberHandler,
+    ContextTypes, filters,
 )
 from telegram.constants import ChatType, ChatMemberStatus
 from telegram.request import HTTPXRequest
@@ -22,7 +21,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("lockref")
 _lock = threading.RLock()
 
-# ─── DB ───
 def connect():
     c = sqlite3.connect(DB_PATH, timeout=60, check_same_thread=False)
     c.row_factory = sqlite3.Row
@@ -51,7 +49,6 @@ def init_db():
             name TEXT DEFAULT '',
             wallet INTEGER DEFAULT 0,
             ref_count INTEGER DEFAULT 0,
-            claimable INTEGER DEFAULT 0,
             referred_by INTEGER,
             joined_at REAL,
             last_active REAL,
@@ -60,12 +57,13 @@ def init_db():
         CREATE TABLE IF NOT EXISTS channels (
             chat_id INTEGER PRIMARY KEY,
             title TEXT,
-            chat_type TEXT,
+            username TEXT DEFAULT '',
+            invite_link TEXT DEFAULT '',
+            button_label TEXT DEFAULT 'جوین بده',
             active INTEGER DEFAULT 1
         );
         CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT
+            key TEXT PRIMARY KEY, value TEXT
         );
         CREATE TABLE IF NOT EXISTS admins (
             user_id INTEGER PRIMARY KEY
@@ -74,7 +72,6 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
             card TEXT,
-            ref_count INTEGER,
             amount INTEGER,
             status TEXT DEFAULT 'pending',
             created_at REAL,
@@ -89,28 +86,30 @@ def init_db():
         );
         CREATE TABLE IF NOT EXISTS claim_options (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            kind TEXT NOT NULL,
             threshold INTEGER NOT NULL,
             label TEXT DEFAULT '',
             active INTEGER DEFAULT 1,
             sort_order INTEGER DEFAULT 0
         );
         """)
+        # migrations soft
+        for sql in [
+            "ALTER TABLE channels ADD COLUMN username TEXT DEFAULT ''",
+            "ALTER TABLE channels ADD COLUMN invite_link TEXT DEFAULT ''",
+            "ALTER TABLE channels ADD COLUMN button_label TEXT DEFAULT 'جوین بده'",
+        ]:
+            try:
+                c.execute(sql)
+            except Exception:
+                pass
         c.execute("INSERT OR IGNORE INTO admins(user_id) VALUES (?)", (ADMIN_ID,))
-        defaults = {
-            "lock_enabled": "1",
-            "ref_reward": "100000",
-            "card_len": "12",
-        }
-        for k, v in defaults.items():
+        for k, v in {"lock_enabled": "1", "ref_reward": "100000", "card_len": "12"}.items():
             c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)", (k, v))
-        # default claim options only if empty
-        n = c.execute("SELECT COUNT(*) c FROM claim_options").fetchone()["c"]
-        if n == 0:
-            for i, th in enumerate([6, 8, 12, 16, 18]):
+        if c.execute("SELECT COUNT(*) c FROM claim_options").fetchone()["c"] == 0:
+            for i, th in enumerate([100000, 300000, 600000, 1000000]):
                 c.execute(
-                    "INSERT INTO claim_options(kind,threshold,label,active,sort_order) VALUES (?,?,?,1,?)",
-                    ("ref", th, f"{th} رفرال", i),
+                    "INSERT INTO claim_options(threshold,label,active,sort_order) VALUES (?,?,1,?)",
+                    (th, f"{th // 1000}کا", i),
                 )
 
 def sget(k, d=None):
@@ -129,8 +128,11 @@ def sint(k, d=0):
         return int(d)
 
 def is_admin(uid):
+    uid = int(uid)
+    if uid == ADMIN_ID:
+        return True
     with tx() as c:
-        return bool(c.execute("SELECT 1 FROM admins WHERE user_id=?", (int(uid),)).fetchone()) or int(uid) == ADMIN_ID
+        return bool(c.execute("SELECT 1 FROM admins WHERE user_id=?", (uid,)).fetchone())
 
 def num(n):
     try:
@@ -148,12 +150,12 @@ def parse_amt(text):
     s = (m.group(2) or "").lower().replace("کا", "k").replace("ک", "k")
     if s.startswith("k"):
         v *= 1000
-    elif s.startswith("m") or s.startswith("م"):
+    elif s.startswith("m") or "م" in s:
         v *= 1_000_000
     return int(v)
 
 def btn(text, data, style=None):
-    kw = {"text": str(text)[:64], "callback_data": data}
+    kw = {"text": str(text)[:64], "callback_data": str(data)[:64]}
     if style in ("success", "danger", "primary"):
         kw["style"] = style
     try:
@@ -161,6 +163,12 @@ def btn(text, data, style=None):
     except TypeError:
         kw.pop("style", None)
         return InlineKeyboardButton(**kw)
+
+def back_admin():
+    return InlineKeyboardMarkup([[btn("🔙 بازگشت پنل ادمین", "a:home", "primary")]])
+
+def back_main(uid):
+    return InlineKeyboardMarkup([[btn("🔙 منو", f"m:home:{uid}", "primary")]])
 
 def ensure_user(user):
     if not user or getattr(user, "is_bot", False):
@@ -184,6 +192,7 @@ def get_user(uid):
         return c.execute("SELECT * FROM users WHERE id=?", (int(uid),)).fetchone()
 
 def set_st(ctx, kind, extra=None):
+    # per-user state only (context.user_data is isolated per user)
     ctx.user_data["st"] = {"kind": kind, "extra": extra or {}, "ts": time.time()}
 
 def get_st(ctx):
@@ -198,185 +207,204 @@ def get_st(ctx):
 def clear_st(ctx):
     ctx.user_data.pop("st", None)
 
-def get_claim_options():
-    with tx() as c:
-        return c.execute(
-            "SELECT * FROM claim_options WHERE active=1 ORDER BY sort_order, id"
-        ).fetchall()
-
-def format_need_msg(opt, uu):
-    """پیام کامل وقتی شرط برداشت برقرار نیست."""
-    kind = opt["kind"]
-    th = int(opt["threshold"])
-    if kind == "ref":
-        have = int(uu["ref_count"] or 0)
-        return (
-            f"❌ رفرال شما کافی نیست\n\n"
-            f"📌 گزینه: {opt['label'] or (str(th) + ' رفرال')}\n"
-            f"👥 رفرال شما: <b>{have}</b>\n"
-            f"🎯 نیاز: <b>{th}</b>\n"
-            f"📉 کمبود: <b>{max(0, th - have)}</b>\n\n"
-            f"با دعوت دوستان و تأیید عضویت، رفرال‌ات بیشتر می‌شود."
-        )
-    # points / claimable
-    have = int(uu["claimable"] or 0)
-    return (
-        f"❌ امتیاز قابل‌برداشت شما کافی نیست\n\n"
-        f"📌 گزینه: {opt['label'] or (num(th) + ' میوپوینت')}\n"
-        f"💰 امتیاز شما: <b>{num(have)}</b>\n"
-        f"🎯 نیاز: <b>{num(th)}</b>\n"
-        f"📉 کمبود: <b>{num(max(0, th - have))}</b>\n\n"
-        f"با رفرال‌های جدید امتیاز جمع می‌شود."
-    )
-
+def lock_on():
+    return sget("lock_enabled", "1") == "1"
 
 def active_channels():
     with tx() as c:
         return c.execute("SELECT * FROM channels WHERE active=1").fetchall()
 
-async def not_joined_channels(bot, user_id):
+async def not_joined(bot, user_id):
     missing = []
     for ch in active_channels():
         try:
             m = await bot.get_chat_member(int(ch["chat_id"]), int(user_id))
-            if m.status in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED, "left", "kicked"):
+            st = m.status
+            if st in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED, "left", "kicked"):
                 missing.append(ch)
-            elif m.status == ChatMemberStatus.RESTRICTED and not getattr(m, "is_member", True):
+            elif st == ChatMemberStatus.RESTRICTED and not getattr(m, "is_member", True):
                 missing.append(ch)
         except Exception:
             missing.append(ch)
     return missing
 
-def lock_on():
-    return sget("lock_enabled", "1") == "1"
+def channel_url(ch):
+    if ch["invite_link"]:
+        return ch["invite_link"]
+    if ch["username"]:
+        return f"https://t.me/{ch['username'].lstrip('@')}"
+    return None
 
-async def require_join(update, context) -> bool:
-    """True = اجازه ادامه. False = پیام قفل فرستاده شد."""
-    if not lock_on():
-        return True
-    user = update.effective_user
-    missing = await not_joined_channels(context.bot, user.id)
-    if not missing:
-        return True
+async def send_lock(update, context):
+    missing = await not_joined(context.bot, update.effective_user.id)
     rows = []
     for ch in missing:
-        cid = int(ch["chat_id"])
-        title = ch["title"] or str(cid)
-        # deep link
-        try:
-            chat = await context.bot.get_chat(cid)
-            if chat.username:
-                url = f"https://t.me/{chat.username}"
-            else:
-                url = None
-        except Exception:
-            url = None
+        label = ch["button_label"] or "جوین بده"
+        title = ch["title"] or "کانال"
+        url = channel_url(ch)
         if url:
-            rows.append([InlineKeyboardButton(f"📢 {title}", url=url)])
+            rows.append([InlineKeyboardButton(f"📢 {label}", url=url)])
         else:
-            rows.append([btn(f"📢 {title} (آیدی: {cid})", "noop")])
+            rows.append([btn(f"📢 {title}", "noop")])
     rows.append([btn("✅ عضو شدم — بررسی", "check_join", "success")])
     text = (
-        "🔒 برای استفاده از ربات باید عضو کانال/گپ‌های زیر باشی:\n\n"
+        "🔒 برای استفاده باید عضو کانال/گپ‌های زیر باشی:\n\n"
         + "\n".join(f"• {ch['title'] or ch['chat_id']}" for ch in missing)
         + "\n\nبعد از عضویت دکمه بررسی را بزن."
     )
-    msg = update.effective_message
     if update.callback_query:
         await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(rows))
-    elif msg:
-        await msg.reply_text(text, reply_markup=InlineKeyboardMarkup(rows))
+    elif update.effective_message:
+        await update.effective_message.reply_text(text, reply_markup=InlineKeyboardMarkup(rows))
+
+async def require_join(update, context) -> bool:
+    if not lock_on():
+        return True
+    if not await not_joined(context.bot, update.effective_user.id):
+        return True
+    await send_lock(update, context)
     return False
 
 def main_kb(uid):
     return InlineKeyboardMarkup([
-        [btn("💰 موجودی", f"bal:{uid}", "primary"), btn("🔗 لینک دعوت", f"reflink:{uid}", "success")],
-        [btn("👥 رفرال‌های من", f"myrefs:{uid}", "primary")],
-        [btn("💸 دریافت میوپوینت", f"claim:{uid}", "success")],
-        [btn("📖 راهنما", f"help:{uid}", "primary")],
+        [btn("💰 موجودی", f"m:bal:{uid}", "primary"), btn("🔗 لینک دعوت", f"m:link:{uid}", "success")],
+        [btn("👥 رفرال‌های من", f"m:refs:{uid}", "primary")],
+        [btn("💸 برداشت میوپوینت", f"m:claim:{uid}", "success")],
+        [btn("📖 راهنما", f"m:help:{uid}", "primary")],
     ])
 
 def admin_kb():
     lock = "🟢 قفل روشن" if lock_on() else "🔴 قفل خاموش"
     return InlineKeyboardMarkup([
         [btn(lock, "a:toggle_lock", "primary")],
-        [btn("📢 مدیریت چنل‌ها", "a:channels", "primary")],
+        [btn("📢 مدیریت چنل‌ها", "a:ch", "primary")],
         [btn("💵 پاداش رفرال", "a:reward", "primary")],
-        [btn("⚙️ گزینه‌های برداشت", "a:copt", "primary")],
-        [btn("📥 دریافتی‌ها", "a:claims", "success")],
-        [btn("➕ واریز دستی", "a:add", "success"), btn("➖ کسر", "a:sub", "danger")],
+        [btn("⚙️ گزینه‌های برداشت", "a:opt", "primary")],
+        [btn("📥 صندوق برداشت", "a:claims", "success")],
+        [btn("➕ واریز", "a:add", "success"), btn("➖ کسر", "a:sub", "danger")],
         [btn("👤 ادمین‌ها", "a:admins", "primary"), btn("📊 آمار", "a:stats", "primary")],
         [btn("❌ بستن", "a:close", "danger")],
     ])
 
-# ─── handlers ───
-async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    user = u.effective_user
-    ensure_user(user)
-    text = u.message.text or ""
-    ref_id = None
-    m = re.search(r"ref[_-]?(\d+)", text)
-    if m:
-        ref_id = int(m.group(1))
-
-    # save pending referrer if new
-    if ref_id and ref_id != user.id:
-        with tx() as conn:
-            uu = conn.execute("SELECT referred_by FROM users WHERE id=?", (user.id,)).fetchone()
-            if uu and not uu["referred_by"]:
-                # only set referred_by if not already set; confirm later after join
-                exists = conn.execute("SELECT 1 FROM referrals WHERE referred_id=?", (user.id,)).fetchone()
-                if not exists:
-                    conn.execute(
-                        "INSERT INTO referrals(referrer_id, referred_id, amount, confirmed, created_at) VALUES (?,?,?,0,?)",
-                        (ref_id, user.id, sint("ref_reward", 100000), time.time()),
-                    )
-                    conn.execute("UPDATE users SET referred_by=? WHERE id=?", (ref_id, user.id))
-
-    if not await require_join(u, c):
-        # try confirm referral after they come back via check_join
-        return
-
-    await try_confirm_referral(c.bot, user)
-    await u.message.reply_text(
-        f"سلام <b>{user.full_name}</b> 👋\n"
-        f"به ربات خوش آمدی.\n"
-        f"از منو استفاده کن یا بنویس: <code>منو</code>",
-        parse_mode="HTML",
-        reply_markup=main_kb(user.id),
-    )
-
 async def try_confirm_referral(bot, user):
-    """اگر رفرال در انتظار بود و جوین کامل است، امتیاز بده و به معرف خبر بده."""
     with tx() as c:
         row = c.execute(
             "SELECT * FROM referrals WHERE referred_id=? AND confirmed=0", (user.id,)
         ).fetchone()
     if not row:
         return
-    if lock_on():
-        missing = await not_joined_channels(bot, user.id)
-        if missing:
-            return
+    if lock_on() and await not_joined(bot, user.id):
+        return
     reward = int(row["amount"] or sint("ref_reward", 100000))
     referrer = int(row["referrer_id"])
     with tx() as c:
         c.execute("UPDATE referrals SET confirmed=1, amount=? WHERE referred_id=?", (reward, user.id))
         c.execute(
-            "UPDATE users SET wallet=wallet+?, claimable=claimable+?, ref_count=ref_count+1 WHERE id=?",
-            (reward, reward, referrer),
+            "UPDATE users SET wallet=wallet+?, ref_count=ref_count+1 WHERE id=?",
+            (reward, referrer),
         )
-    # notify referrer
     uname = f"@{user.username}" if user.username else user.full_name
     try:
         await bot.send_message(
             referrer,
-            f"🎉 یک نفر با لینک تو آمد!\n"
-            f"👤 {uname}\n"
-            f"💰 +{num(reward)} میوپوینت به کیف و قابل‌برداشتت اضافه شد.",
+            f"🎉 یک نفر با لینک تو آمد!\n👤 {uname}\n💰 +{num(reward)} میوپوینت",
         )
     except Exception:
         pass
+
+async def resolve_chat_input(bot, text, message=None):
+    """لینک عمومی/خصوصی یا @یوزرنیم → chat object. None اگر نامعتبر."""
+    text = (text or "").strip()
+    # forward
+    if message and message.forward_from_chat:
+        return message.forward_from_chat
+    # @username
+    m = re.match(r"^@?([A-Za-z][A-Za-z0-9_]{3,})$", text)
+    if m:
+        try:
+            return await bot.get_chat(f"@{m.group(1)}")
+        except Exception:
+            return None
+    # t.me links
+    if "t.me/" in text or "telegram.me/" in text:
+        if not text.startswith("http"):
+            text = "https://" + text.lstrip("/")
+        try:
+            path = urlparse(text).path.strip("/")
+        except Exception:
+            return None
+        # private invite: +xxx or joinchat/xxx
+        if path.startswith("+") or path.lower().startswith("joinchat/"):
+            try:
+                return await bot.get_chat(text)
+            except Exception:
+                return None
+        # public username
+        uname = path.split("/")[0]
+        if uname:
+            try:
+                return await bot.get_chat(f"@{uname}")
+            except Exception:
+                return None
+    # numeric id fallback
+    try:
+        cid = int(text)
+        return await bot.get_chat(cid)
+    except Exception:
+        return None
+
+async def bot_is_admin_in(bot, chat_id):
+    try:
+        me = await bot.get_me()
+        m = await bot.get_chat_member(chat_id, me.id)
+        return m.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER, "administrator", "creator")
+    except Exception:
+        return False
+
+# ── handlers ──
+async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    user = u.effective_user
+    ensure_user(user)
+    text = u.message.text or ""
+    m = re.search(r"ref[_-]?(\d+)", text)
+    if m:
+        ref_id = int(m.group(1))
+        if ref_id != user.id:
+            with tx() as conn:
+                uu = conn.execute("SELECT referred_by FROM users WHERE id=?", (user.id,)).fetchone()
+                if uu and not uu["referred_by"]:
+                    if not conn.execute("SELECT 1 FROM referrals WHERE referred_id=?", (user.id,)).fetchone():
+                        conn.execute(
+                            "INSERT INTO referrals(referrer_id,referred_id,amount,confirmed,created_at) VALUES (?,?,?,0,?)",
+                            (ref_id, user.id, sint("ref_reward", 100000), time.time()),
+                        )
+                        conn.execute("UPDATE users SET referred_by=? WHERE id=?", (ref_id, user.id))
+    if not await require_join(u, c):
+        return
+    await try_confirm_referral(c.bot, user)
+    await u.message.reply_text(
+        f"سلام <b>{user.full_name}</b> 👋\nاز منو استفاده کن.",
+        parse_mode="HTML",
+        reply_markup=main_kb(user.id),
+    )
+
+async def open_admin(u, c):
+    clear_st(c)
+    user = u.effective_user
+    if not is_admin(user.id):
+        if u.message:
+            await u.message.reply_text("دسترسی نداری.")
+        return
+    if u.effective_chat.type != ChatType.PRIVATE:
+        if u.message:
+            await u.message.reply_text("پنل فقط در پیوی ربات.")
+        return
+    text = "🎛 پنل ادمین"
+    kb = admin_kb()
+    if u.callback_query:
+        await u.callback_query.edit_message_text(text, reply_markup=kb)
+    else:
+        await u.message.reply_text(text, reply_markup=kb)
 
 async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
     q = u.callback_query
@@ -388,206 +416,141 @@ async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await q.answer()
         return
     if data == "a:close":
+        clear_st(c)
         await q.answer()
         try:
             await q.message.delete()
         except Exception:
             pass
         return
+    if data == "a:home":
+        await q.answer()
+        clear_st(c)
+        await q.edit_message_text("🎛 پنل ادمین", reply_markup=admin_kb())
+        return
 
     if data == "check_join":
         await q.answer()
-        missing = await not_joined_channels(c.bot, user.id) if lock_on() else []
-        if missing:
+        if lock_on() and await not_joined(c.bot, user.id):
             await q.answer("هنوز همه را جوین نکردی", show_alert=True)
+            await send_lock(u, c)
             return
         await try_confirm_referral(c.bot, user)
-        await q.edit_message_text(
-            "✅ عضویت تأیید شد. از منو استفاده کن.",
-            reply_markup=main_kb(user.id),
-        )
+        await q.edit_message_text("✅ عضویت تأیید شد.", reply_markup=main_kb(user.id))
         return
 
-    # player panels ownership
-    if ":" in data and data.split(":")[0] in ("bal", "reflink", "myrefs", "claim", "help", "ctier", "copt"):
+    # ownership
+    if data.startswith("m:"):
         try:
             owner = int(data.split(":")[-1])
-            if owner != user.id and not data.startswith("ctier:"):
-                # ctier has format ctier:TIER:UID
-                pass
-            if data.startswith("ctier:") or data.startswith("copt:"):
-                owner = int(data.split(":")[2])
             if owner != user.id:
                 await q.answer("این پنل برای تو نیست", show_alert=True)
                 return
         except Exception:
             pass
-
-    # force join for non-admin player actions
-    if not data.startswith("a:") and data != "check_join":
-        if lock_on():
-            missing = await not_joined_channels(c.bot, user.id)
-            if missing:
-                await q.answer()
-                # rebuild lock message
-                class Fake:
-                    effective_user = user
-                    effective_message = q.message
-                    callback_query = q
-                await require_join(Fake(), c)
-                return
+        if lock_on() and await not_joined(c.bot, user.id):
+            await q.answer()
+            await send_lock(u, c)
+            return
 
     await q.answer()
 
-    if data.startswith("help:"):
+    # user menu
+    if data.startswith("m:home:"):
+        await q.edit_message_text("منو:", reply_markup=main_kb(user.id))
+        return
+    if data.startswith("m:help:"):
         await q.edit_message_text(
-            "📖 <b>راهنما</b>\n\n"
-            "🔗 <b>لینک دعوت:</b> بفرست برای دوستات؛ با جوین (و عبور از قفل) امتیاز می‌گیری.\n"
-            "💰 <b>موجودی:</b> کیف + امتیاز قابل برداشت.\n"
-            "💸 <b>دریافت:</b> با رسیدن به تعداد رفرال مشخص، درخواست کارت بده.\n"
-            "🔒 اگر قفل فعال باشد تا عضو چنل‌ها نشوی رفرال ثبت نمی‌شود.",
-            parse_mode="HTML",
+            "🔗 لینک دعوت بفرست → بعد از جوین دوستت امتیاز می‌گیری.\n"
+            "💸 برداشت فقط با رسیدن به سقف امتیاز کیف پول.\n"
+            "🔒 اگر قفل روشن باشد تا عضو نشوی کار نمی‌کند.",
             reply_markup=main_kb(user.id),
         )
         return
-
-    if data.startswith("bal:"):
+    if data.startswith("m:bal:"):
         uu = get_user(user.id)
         await q.edit_message_text(
-            f"💰 <b>کیف پول</b>\n"
-            f"موجودی: <b>{num(uu['wallet'])}</b>\n"
-            f"قابل برداشت (رفرال): <b>{num(uu['claimable'])}</b>\n"
-            f"تعداد رفرال: <b>{num(uu['ref_count'])}</b>",
+            f"💰 موجودی کیف: <b>{num(uu['wallet'])}</b>\n👥 رفرال تأییدشده: <b>{uu['ref_count']}</b>",
             parse_mode="HTML",
             reply_markup=main_kb(user.id),
         )
         return
-
-    if data.startswith("reflink:"):
+    if data.startswith("m:link:"):
         me = await c.bot.get_me()
         link = f"https://t.me/{me.username}?start=ref{user.id}"
-        reward = num(sint("ref_reward", 100000))
         await q.edit_message_text(
-            f"🔗 <b>لینک دعوت تو</b>\n\n"
-            f"<code>{link}</code>\n\n"
-            f"کپی کن و برای رفیقات بفرست.\n"
-            f"هر دعوت تأییدشده: <b>{reward}</b> میوپوینت",
+            f"🔗 لینک دعوت:\n<code>{link}</code>\n\nهر دعوت تأییدشده: <b>{num(sint('ref_reward',100000))}</b>",
             parse_mode="HTML",
             reply_markup=main_kb(user.id),
         )
         return
-
-    if data.startswith("myrefs:"):
-        uu = get_user(user.id)
+    if data.startswith("m:refs:"):
         with tx() as conn:
             rows = conn.execute(
-                "SELECT referred_id, amount, confirmed FROM referrals WHERE referrer_id=? ORDER BY created_at DESC LIMIT 30",
+                "SELECT referred_id,amount,confirmed FROM referrals WHERE referrer_id=? ORDER BY created_at DESC LIMIT 30",
                 (user.id,),
             ).fetchall()
-        lines = [
-            f"👥 <b>رفرال‌های تو</b>",
-            f"تعداد تأییدشده: <b>{uu['ref_count']}</b>",
-            f"قابل برداشت: <b>{num(uu['claimable'])}</b>\n",
-        ]
+        lines = [f"👥 رفرال‌ها ({get_user(user.id)['ref_count']})\n"]
         for r in rows:
-            st = "✅" if r["confirmed"] else "⏳"
-            lines.append(f"{st} <code>{r['referred_id']}</code> — {num(r['amount'])}")
-        if not rows:
-            lines.append("هنوز کسی با لینک تو نیامده.")
-        await q.edit_message_text(
-            "\n".join(lines),
-            parse_mode="HTML",
-            reply_markup=main_kb(user.id),
-        )
+            lines.append(f"{'✅' if r['confirmed'] else '⏳'} <code>{r['referred_id']}</code> {num(r['amount'])}")
+        if len(lines) == 1:
+            lines.append("خالی")
+        await q.edit_message_text("\n".join(lines), parse_mode="HTML", reply_markup=main_kb(user.id))
         return
-
-    if data.startswith("claim:") and not data.startswith("copt:"):
-        uu = get_user(user.id)
+    if data.startswith("m:claim:"):
         with tx() as conn:
-            pend = conn.execute(
-                "SELECT id FROM claims WHERE user_id=? AND status='pending'", (user.id,)
-            ).fetchone()
-        if pend:
-            await q.edit_message_text(
-                "یک درخواست در انتظار تأیید ادمین داری. صبر کن.",
-                reply_markup=main_kb(user.id),
-            )
-            return
-        opts = get_claim_options()
+            if conn.execute("SELECT 1 FROM claims WHERE user_id=? AND status='pending'", (user.id,)).fetchone():
+                await q.edit_message_text("یک درخواست در انتظار ادمین داری.", reply_markup=main_kb(user.id))
+                return
+            opts = conn.execute(
+                "SELECT * FROM claim_options WHERE active=1 ORDER BY sort_order,id"
+            ).fetchall()
         if not opts:
-            await q.edit_message_text(
-                "هنوز گزینه‌ای برای برداشت از طرف ادمین ثبت نشده.",
-                reply_markup=main_kb(user.id),
-            )
+            await q.edit_message_text("گزینه برداشتی ثبت نشده.", reply_markup=main_kb(user.id))
             return
-        rows = []
-        for o in opts:
-            if o["kind"] == "ref":
-                label = o["label"] or f"{o['threshold']} رفرال"
-            else:
-                label = o["label"] or f"{num(o['threshold'])} میوپوینت"
-            rows.append([btn(label, f"copt:{o['id']}:{user.id}", "success")])
-        rows.append([btn("🔙", f"bal:{user.id}", "primary")])
+        uu = get_user(user.id)
+        rows = [[btn(o["label"] or num(o["threshold"]), f"m:opt:{o['id']}:{user.id}", "success")] for o in opts]
+        rows.append([btn("🔙", f"m:home:{user.id}", "primary")])
         await q.edit_message_text(
-            f"💸 <b>دریافت میوپوینت</b>\n\n"
-            f"👥 رفرال تأییدشده: <b>{uu['ref_count']}</b>\n"
-            f"💰 امتیاز قابل برداشت: <b>{num(uu['claimable'])}</b>\n\n"
-            f"یک گزینه را انتخاب کن:",
+            f"💸 <b>برداشت میوپوینت</b>\nموجودی: <b>{num(uu['wallet'])}</b>\nیک سقف را انتخاب کن:",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(rows),
         )
         return
-
-    if data.startswith("copt:"):
+    if data.startswith("m:opt:"):
         parts = data.split(":")
-        oid, owner = int(parts[1]), int(parts[2])
+        oid, owner = int(parts[2]), int(parts[3])
         if user.id != owner:
-            await q.answer("برای تو نیست", show_alert=True)
             return
         with tx() as conn:
             opt = conn.execute("SELECT * FROM claim_options WHERE id=? AND active=1", (oid,)).fetchone()
         if not opt:
-            await q.answer("گزینه نامعتبر", show_alert=True)
+            await q.edit_message_text("گزینه نامعتبر.", reply_markup=back_main(user.id))
             return
         uu = get_user(user.id)
-        ok = False
-        if opt["kind"] == "ref":
-            ok = int(uu["ref_count"] or 0) >= int(opt["threshold"])
-        else:
-            ok = int(uu["claimable"] or 0) >= int(opt["threshold"])
-        if not ok:
-            # پیام کامل داخل چت (مثل پاپ‌آپ واضح)
+        need = int(opt["threshold"])
+        have = int(uu["wallet"] or 0)
+        if have < need:
             await q.edit_message_text(
-                format_need_msg(opt, uu),
+                f"❌ امتیاز شما کافی نیست\n\n"
+                f"📌 {opt['label']}\n"
+                f"💰 موجودی: <b>{num(have)}</b>\n"
+                f"🎯 نیاز: <b>{num(need)}</b>\n"
+                f"📉 کمبود: <b>{num(need - have)}</b>",
                 parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup([
-                    [btn("🔙 بازگشت به گزینه‌ها", f"claim:{user.id}", "primary")],
-                    [btn("🏠 منو", f"bal:{user.id}", "primary")],
+                    [btn("🔙 گزینه‌ها", f"m:claim:{user.id}", "primary")],
+                    [btn("🏠 منو", f"m:home:{user.id}", "primary")],
                 ]),
             )
             return
-        if int(uu["claimable"] or 0) <= 0:
-            await q.edit_message_text(
-                "❌ امتیاز قابل‌برداشت شما صفر است.\nبا رفرال جدید امتیاز جمع می‌شود.",
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup([[btn("🔙", f"claim:{user.id}", "primary")]]),
-            )
-            return
-        with tx() as conn:
-            if conn.execute(
-                "SELECT 1 FROM claims WHERE user_id=? AND status='pending'", (user.id,)
-            ).fetchone():
-                await q.answer("درخواست قبلی در انتظاره", show_alert=True)
-                return
-        amount = int(uu["claimable"])
-        set_st(c, "card", {"opt_id": oid, "amount": amount, "kind": opt["kind"], "threshold": int(opt["threshold"])})
+        set_st(c, "card", {"opt_id": oid, "amount": need})
         await q.edit_message_text(
-            f"✅ شرایط برقرار است\n\n"
-            f"📌 {opt['label'] or opt['kind']}\n"
-            f"💰 مبلغ قابل دریافت: <b>{num(amount)}</b>\n\n"
-            f"شماره کارت میویی را بفرست (فقط عدد، ۱۲ رقم)\n"
+            f"✅ قابل برداشت: <b>{num(need)}</b>\n\n"
+            f"شماره کارت میویی را بفرست (۱۲ رقم)\n"
             f"مثال: <code>109658451189</code>",
             parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[btn("🔙 انصراف", f"m:claim:{user.id}", "danger")]]),
         )
         return
 
@@ -597,33 +560,35 @@ async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "a:toggle_lock":
-        cur = lock_on()
-        sset("lock_enabled", "0" if cur else "1")
-        await q.edit_message_text("تنظیم قفل عوض شد.", reply_markup=admin_kb())
+        sset("lock_enabled", "0" if lock_on() else "1")
+        await q.edit_message_text("قفل به‌روز شد.", reply_markup=admin_kb())
         return
 
-    if data == "a:channels":
+    if data == "a:ch":
         with tx() as conn:
             rows = conn.execute("SELECT * FROM channels").fetchall()
-        lines = ["📢 چنل/گپ‌های قفل\n"]
-        kb_rows = []
+        lines = ["📢 چنل‌های قفل\n"]
+        kb = []
         for r in rows:
             st = "✅" if r["active"] else "❌"
-            lines.append(f"{st} {r['title'] or r['chat_id']} — <code>{r['chat_id']}</code>")
-            kb_rows.append([
-                btn(("خاموش" if r["active"] else "روشن"), f"a:ch_tog:{r['chat_id']}", "primary"),
+            lines.append(f"{st} {r['title']} | دکمه: {r['button_label']}")
+            kb.append([
+                btn("خاموش" if r["active"] else "روشن", f"a:ch_tog:{r['chat_id']}", "primary"),
                 btn("حذف", f"a:ch_del:{r['chat_id']}", "danger"),
             ])
-        kb_rows.append([btn("➕ افزودن (فوروارد از چنل)", "a:ch_add", "success")])
-        kb_rows.append([btn("🔙", "a:home", "primary")])
-        await q.edit_message_text("\n".join(lines), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb_rows))
+        kb.append([btn("➕ افزودن چنل", "a:ch_add", "success")])
+        kb.append([btn("🔙", "a:home", "primary")])
+        await q.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(kb))
         return
 
     if data == "a:ch_add":
-        set_st(c, "a_ch_add")
+        set_st(c, "a_ch_link")
         await q.edit_message_text(
-            "یک پیام از چنل/گپ را <b>فوروارد</b> کن، یا آیدی عددی را بفرست (مثل <code>-100123</code>).",
+            "لینک عمومی یا خصوصی چنل/گپ را بفرست\n"
+            "مثال:\n<code>https://t.me/mychannel</code>\n<code>https://t.me/+xxxx</code>\n<code>@channel</code>\n\n"
+            "ربات باید ادمین آن چنل باشد.",
             parse_mode="HTML",
+            reply_markup=back_admin(),
         )
         return
 
@@ -633,13 +598,8 @@ async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
             cur = conn.execute("SELECT active FROM channels WHERE chat_id=?", (cid,)).fetchone()
             if cur:
                 conn.execute("UPDATE channels SET active=? WHERE chat_id=?", (0 if cur["active"] else 1, cid))
-        await q.answer("عوض شد")
-        # refresh
-        data = "a:channels"
-        # fallthrough by re-calling logic - simple message
-        await q.edit_message_text("انجام شد. دوباره «مدیریت چنل‌ها» را بزن.", reply_markup=admin_kb())
+        await q.edit_message_text("عوض شد.", reply_markup=admin_kb())
         return
-
     if data.startswith("a:ch_del:"):
         cid = int(data.split(":")[2])
         with tx() as conn:
@@ -650,53 +610,46 @@ async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if data == "a:reward":
         set_st(c, "a_reward")
         await q.edit_message_text(
-            f"پاداش فعلی هر رفرال: <b>{num(sint('ref_reward', 100000))}</b>\n"
-            f"مقدار جدید را بفرست (مثال: <code>100k</code> یا <code>200000</code>)",
+            f"پاداش فعلی: <b>{num(sint('ref_reward',100000))}</b>\nمقدار جدید (مثل 100k):",
             parse_mode="HTML",
+            reply_markup=back_admin(),
         )
         return
 
-    if data == "a:copt":
+    if data == "a:opt":
         with tx() as conn:
-            opts = conn.execute("SELECT * FROM claim_options ORDER BY sort_order, id").fetchall()
-        lines = ["⚙️ <b>گزینه‌های برداشت</b>\n", "هر گزینه یا بر اساس رفرال است یا امتیاز.\n"]
-        kb_rows = []
+            opts = conn.execute("SELECT * FROM claim_options ORDER BY sort_order,id").fetchall()
+        lines = ["⚙️ گزینه‌های برداشت (فقط امتیاز کیف)\n"]
+        kb = []
         for o in opts:
             st = "✅" if o["active"] else "❌"
-            if o["kind"] == "ref":
-                info = f"{st} رفرال ≥ {o['threshold']} | {o['label']}"
-            else:
-                info = f"{st} امتیاز ≥ {num(o['threshold'])} | {o['label']}"
-            lines.append(info)
-            kb_rows.append([
-                btn(("خاموش" if o["active"] else "روشن"), f"a:copt_tog:{o['id']}", "primary"),
-                btn("حذف", f"a:copt_del:{o['id']}", "danger"),
+            lines.append(f"{st} {o['label']} — نیاز {num(o['threshold'])}")
+            kb.append([
+                btn("خاموش" if o["active"] else "روشن", f"a:opt_tog:{o['id']}", "primary"),
+                btn("حذف", f"a:opt_del:{o['id']}", "danger"),
             ])
-        kb_rows.append([btn("➕ افزودن گزینه", "a:copt_add", "success")])
-        kb_rows.append([btn("🔙", "a:home", "primary")])
-        await q.edit_message_text("\n".join(lines), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb_rows))
+        kb.append([btn("➕ افزودن گزینه", "a:opt_add", "success")])
+        kb.append([btn("🔙", "a:home", "primary")])
+        await q.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(kb))
         return
 
-    if data == "a:copt_add":
-        set_st(c, "a_copt_add")
+    if data == "a:opt_add":
+        set_st(c, "a_opt_label")
         await q.edit_message_text(
-            "گزینه جدید را این‌طور بفرست:\n\n"
-            "<b>رفرال</b>:\n<code>رفرال 6</code>\n<code>رفرال 6 شش رفرال</code>\n\n"
-            "<b>امتیاز</b>:\n<code>امتیاز 600000</code>\n<code>امتیاز 600k برداشت 600کا</code>",
+            "نام دکمه را بفرست (مثلاً: <code>۶۰۰کا</code>)",
             parse_mode="HTML",
+            reply_markup=back_admin(),
         )
         return
-
-    if data.startswith("a:copt_tog:"):
+    if data.startswith("a:opt_tog:"):
         oid = int(data.split(":")[2])
         with tx() as conn:
             cur = conn.execute("SELECT active FROM claim_options WHERE id=?", (oid,)).fetchone()
             if cur:
                 conn.execute("UPDATE claim_options SET active=? WHERE id=?", (0 if cur["active"] else 1, oid))
-        await q.edit_message_text("عوض شد. دوباره گزینه‌ها را باز کن.", reply_markup=admin_kb())
+        await q.edit_message_text("عوض شد.", reply_markup=admin_kb())
         return
-
-    if data.startswith("a:copt_del:"):
+    if data.startswith("a:opt_del:"):
         oid = int(data.split(":")[2])
         with tx() as conn:
             conn.execute("DELETE FROM claim_options WHERE id=?", (oid,))
@@ -706,24 +659,25 @@ async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if data == "a:claims":
         with tx() as conn:
             rows = conn.execute(
-                "SELECT * FROM claims WHERE status='pending' ORDER BY id ASC LIMIT 20"
+                "SELECT * FROM claims WHERE status='pending' ORDER BY id ASC LIMIT 25"
             ).fetchall()
         if not rows:
-            await q.edit_message_text("درخواست معلقی نیست.", reply_markup=admin_kb())
+            await q.edit_message_text("صندوق خالی است.", reply_markup=admin_kb())
             return
-        lines = ["📥 <b>دریافتی‌های در انتظار</b>\n"]
-        kb_rows = []
+        lines = ["📥 صندوق برداشت\n"]
+        kb = []
         for r in rows:
-            urow = get_user(r["user_id"])
-            uname = f"@{urow['username']}" if urow and urow["username"] else str(r["user_id"])
+            ur = get_user(r["user_id"])
+            uname = f"@{ur['username']}" if ur and ur["username"] else "—"
+            name = ur["name"] if ur else "—"
             lines.append(
-                f"#{r['id']} | {uname}\n"
+                f"#{r['id']} {name} ({uname})\n"
                 f"کارت: <code>{r['card']}</code>\n"
-                f"رفرال: {r['ref_count']} | مبلغ: {num(r['amount'])}\n"
+                f"مبلغ: {num(r['amount'])}\n"
             )
-            kb_rows.append([btn(f"✅ انجام شد #{r['id']}", f"a:done:{r['id']}", "success")])
-        kb_rows.append([btn("🔙", "a:home", "primary")])
-        await q.edit_message_text("\n".join(lines), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb_rows))
+            kb.append([btn(f"✅ انجام شد #{r['id']}", f"a:done:{r['id']}", "success")])
+        kb.append([btn("🔙", "a:home", "primary")])
+        await q.edit_message_text("\n".join(lines), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
         return
 
     if data.startswith("a:done:"):
@@ -731,18 +685,11 @@ async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
         with tx() as conn:
             cl = conn.execute("SELECT * FROM claims WHERE id=? AND status='pending'", (cid,)).fetchone()
             if not cl:
-                await q.answer("پیدا نشد", show_alert=True)
+                await q.answer("نیست", show_alert=True)
                 return
-            conn.execute(
-                "UPDATE claims SET status='done', done_at=? WHERE id=?",
-                (time.time(), cid),
-            )
-            # claimable already reduced on submit; ensure zero leftover for that claim
+            conn.execute("UPDATE claims SET status='done', done_at=? WHERE id=?", (time.time(), cid))
         try:
-            await c.bot.send_message(
-                int(cl["user_id"]),
-                f"✅ سفارش برداشتت انجام شد.\nمبلغ: {num(cl['amount'])}",
-            )
+            await c.bot.send_message(int(cl["user_id"]), f"✅ برداشتت انجام شد.\nمبلغ: {num(cl['amount'])}")
         except Exception:
             pass
         await q.edit_message_text(f"#{cid} انجام شد.", reply_markup=admin_kb())
@@ -750,22 +697,36 @@ async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
     if data == "a:add":
         set_st(c, "a_add")
-        await q.edit_message_text("آیدی و مبلغ:\n<code>123456 50k</code>", parse_mode="HTML")
+        await q.edit_message_text("آیدی مبلغ:\n<code>123 50k</code>", parse_mode="HTML", reply_markup=back_admin())
         return
     if data == "a:sub":
         set_st(c, "a_sub")
-        await q.edit_message_text("آیدی و مبلغ کسر:\n<code>123456 10k</code>", parse_mode="HTML")
+        await q.edit_message_text("آیدی مبلغ کسر:", reply_markup=back_admin())
         return
+
     if data == "a:admins":
-        set_st(c, "a_admins")
         with tx() as conn:
             ads = conn.execute("SELECT user_id FROM admins").fetchall()
+        lines = ["👤 ادمین‌ها\n"] + [f"• <code>{a['user_id']}</code>" for a in ads]
         await q.edit_message_text(
-            "ادمین‌ها:\n" + "\n".join(str(a["user_id"]) for a in ads)
-            + "\n\n<code>ادمین + آیدی</code>\n<code>ادمین - آیدی</code>",
+            "\n".join(lines),
             parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [btn("➕ افزودن ادمین", "a:adm_add", "success")],
+                [btn("➖ حذف ادمین", "a:adm_del", "danger")],
+                [btn("🔙", "a:home", "primary")],
+            ]),
         )
         return
+    if data == "a:adm_add":
+        set_st(c, "a_adm_add")
+        await q.edit_message_text("آیدی عددی ادمین جدید را بفرست:", reply_markup=back_admin())
+        return
+    if data == "a:adm_del":
+        set_st(c, "a_adm_del")
+        await q.edit_message_text("آیدی ادمینی که حذف شود:", reply_markup=back_admin())
+        return
+
     if data == "a:stats":
         with tx() as conn:
             uc = conn.execute("SELECT COUNT(*) c FROM users").fetchone()["c"]
@@ -773,12 +734,9 @@ async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
             pc = conn.execute("SELECT COUNT(*) c FROM claims WHERE status='pending'").fetchone()["c"]
             tw = conn.execute("SELECT SUM(wallet) s FROM users").fetchone()["s"] or 0
         await q.edit_message_text(
-            f"👥 کاربران: {num(uc)}\n✅ رفرال‌ها: {num(rc)}\n📥 در انتظار: {num(pc)}\n💰 مجموع کیف: {num(tw)}",
+            f"کاربران: {num(uc)}\nرفرال: {num(rc)}\nدر انتظار: {num(pc)}\nمجموع کیف: {num(tw)}",
             reply_markup=admin_kb(),
         )
-        return
-    if data == "a:home":
-        await q.edit_message_text("🎛 پنل ادمین", reply_markup=admin_kb())
         return
 
 async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -788,163 +746,161 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
     chat = u.effective_chat
     text = u.message.text.strip()
     ensure_user(user)
-    st = get_st(c)
-    low = re.sub(r"^/", "", text).strip()
+    low = re.sub(r"^/", "", text).strip().lower()
 
-    # card input for claim
+    # /admin always opens fresh panel
+    if low in ("admin", "پنل", "panel"):
+        await open_admin(u, c)
+        return
+
+    st = get_st(c)
+
+    # card claim
     if st and st["kind"] == "card":
         card = re.sub(r"\D", "", text)
-        need_len = sint("card_len", 12)
-        if len(card) != need_len:
-            await u.message.reply_text(f"شماره کارت باید دقیقاً {need_len} رقم باشد.\nمثال: 109658451189")
+        if len(card) != sint("card_len", 12):
+            await u.message.reply_text(
+                f"❌ شماره کارت اشتباه است.\nباید دقیقاً {sint('card_len',12)} رقم باشد.",
+                reply_markup=InlineKeyboardMarkup([[btn("🔙 انصراف", f"m:claim:{user.id}", "danger")]]),
+            )
             return
+        amount = int(st["extra"].get("amount") or 0)
         uu = get_user(user.id)
-        amount = int(uu["claimable"] or 0)
-        if amount <= 0:
+        if int(uu["wallet"]) < amount:
             clear_st(c)
-            await u.message.reply_text("امتیاز قابل برداشت صفر است.")
+            await u.message.reply_text("موجودی کافی نیست.", reply_markup=main_kb(user.id))
             return
-        # re-validate option
-        opt_id = st["extra"].get("opt_id")
-        if opt_id:
-            with tx() as conn:
-                opt = conn.execute("SELECT * FROM claim_options WHERE id=? AND active=1", (opt_id,)).fetchone()
-            if not opt:
-                clear_st(c)
-                await u.message.reply_text("گزینه دیگر فعال نیست.")
-                return
-            if opt["kind"] == "ref" and int(uu["ref_count"] or 0) < int(opt["threshold"]):
-                clear_st(c)
-                await u.message.reply_text("رفرال کافی نیست.")
-                return
-            if opt["kind"] == "points" and int(uu["claimable"] or 0) < int(opt["threshold"]):
-                clear_st(c)
-                await u.message.reply_text("امتیاز کافی نیست.")
-                return
         with tx() as conn:
-            pend = conn.execute(
-                "SELECT 1 FROM claims WHERE user_id=? AND status='pending'", (user.id,)
-            ).fetchone()
-            if pend:
+            if conn.execute("SELECT 1 FROM claims WHERE user_id=? AND status='pending'", (user.id,)).fetchone():
                 clear_st(c)
                 await u.message.reply_text("درخواست قبلی در انتظاره.")
                 return
+            # کسر از کیف
+            conn.execute("UPDATE users SET wallet=wallet-? WHERE id=?", (amount, user.id))
             conn.execute(
-                "INSERT INTO claims(user_id,card,ref_count,amount,status,created_at) VALUES (?,?,?,?,'pending',?)",
-                (user.id, card, int(uu["ref_count"]), amount, time.time()),
+                "INSERT INTO claims(user_id,card,amount,status,created_at) VALUES (?,?,?,'pending',?)",
+                (user.id, card, amount, time.time()),
             )
-            # صفر کردن claimable — رفرال می‌ماند
-            conn.execute("UPDATE users SET claimable=0 WHERE id=?", (user.id,))
         clear_st(c)
-        await u.message.reply_text(
-            "✅ درخواستت برای ادمین ارسال شد.\nبعد از انجام، پیام می‌گیری."
-        )
-        # notify admins
+        await u.message.reply_text("✅ درخواست برای ادمین ارسال شد.")
         with tx() as conn:
             ads = [r["user_id"] for r in conn.execute("SELECT user_id FROM admins").fetchall()]
-        uname = f"@{user.username}" if user.username else user.full_name
+        uname = f"@{user.username}" if user.username else "—"
         for aid in ads:
             try:
                 await c.bot.send_message(
                     int(aid),
-                    f"📥 درخواست برداشت جدید\n"
-                    f"کاربر: {uname} (<code>{user.id}</code>)\n"
+                    f"📥 برداشت جدید\n"
+                    f"اسم: {user.full_name}\n"
+                    f"یوزرنیم: {uname}\n"
+                    f"آیدی: <code>{user.id}</code>\n"
                     f"کارت: <code>{card}</code>\n"
-                    f"رفرال: {uu['ref_count']}\n"
-                    f"مبلغ: {num(amount)}\n"
-                    f"از پنل → دریافتی‌ها",
+                    f"مبلغ: {num(amount)}",
                     parse_mode="HTML",
                 )
             except Exception:
                 pass
         return
 
-    # admin states
+    # admin states — isolated per admin via user_data
     if st and is_admin(user.id) and chat.type == ChatType.PRIVATE:
         kind = st["kind"]
-        if kind == "a_ch_add":
-            cid = None
-            title = None
-            if u.message.forward_from_chat:
-                cid = u.message.forward_from_chat.id
-                title = u.message.forward_from_chat.title
-            else:
-                try:
-                    cid = int(text.strip())
-                except ValueError:
-                    await u.message.reply_text("آیدی عددی یا فوروارد از چنل بفرست")
-                    return
-                try:
-                    ch = await c.bot.get_chat(cid)
-                    title = ch.title or str(cid)
-                except Exception:
-                    title = str(cid)
-            with tx() as conn:
-                cnt = conn.execute("SELECT COUNT(*) c FROM channels").fetchone()["c"]
-                if cnt >= 10:
-                    await u.message.reply_text("حداکثر ۱۰ چنل/گپ")
-                    clear_st(c)
-                    return
-                conn.execute(
-                    "INSERT OR REPLACE INTO channels(chat_id,title,chat_type,active) VALUES (?,?,?,1)",
-                    (cid, title, "channel"),
+
+        if kind == "a_ch_link":
+            chat_obj = await resolve_chat_input(c.bot, text, u.message)
+            if not chat_obj:
+                await u.message.reply_text(
+                    "❌ لینک/یوزرنیم اشتباه است یا ربات به آن دسترسی ندارد.",
+                    reply_markup=back_admin(),
                 )
-            clear_st(c)
-            await u.message.reply_text(f"ثبت شد: {title}\n<code>{cid}</code>", parse_mode="HTML", reply_markup=admin_kb())
-            return
-        if kind == "a_copt_add":
-            # رفرال 6 [label...]  |  امتیاز 600k [label...]
-            m = re.match(r"^(رفرال|امتیاز)\s+(\S+)(?:\s+(.+))?$", text.strip(), re.I)
-            if not m:
-                await u.message.reply_text("فرمت: رفرال 6 یا امتیاز 600k")
                 return
-            kind_fa, th_raw, label = m.group(1), m.group(2), (m.group(3) or "").strip()
-            kind = "ref" if kind_fa == "رفرال" else "points"
-            if kind == "ref":
-                try:
-                    th = int(th_raw)
-                except ValueError:
-                    await u.message.reply_text("تعداد رفرال عدد باشد")
+            if not await bot_is_admin_in(c.bot, chat_obj.id):
+                await u.message.reply_text(
+                    "❌ ربات ادمین این چنل/گپ نیست. اول ربات را ادمین کن.",
+                    reply_markup=back_admin(),
+                )
+                return
+            with tx() as conn:
+                if conn.execute("SELECT COUNT(*) c FROM channels").fetchone()["c"] >= 10:
+                    clear_st(c)
+                    await u.message.reply_text("حداکثر ۱۰ چنل.", reply_markup=admin_kb())
                     return
-                if not label:
-                    label = f"{th} رفرال"
-            else:
-                th = parse_amt(th_raw)
-                if not th:
-                    await u.message.reply_text("مبلغ نامعتبر")
-                    return
-                if not label:
-                    label = f"{num(th)} میوپوینت"
+            set_st(c, "a_ch_label", {
+                "chat_id": chat_obj.id,
+                "title": chat_obj.title or str(chat_obj.id),
+                "username": getattr(chat_obj, "username", None) or "",
+                "invite": text if ("t.me/+" in text or "joinchat" in text.lower()) else "",
+            })
+            await u.message.reply_text(
+                f"✅ چنل پیدا شد: <b>{chat_obj.title}</b>\n"
+                f"اسم دکمه قفل را بفرست (مثلاً: جوین بده)",
+                parse_mode="HTML",
+                reply_markup=back_admin(),
+            )
+            return
+
+        if kind == "a_ch_label":
+            label = text.strip()[:32] or "جوین بده"
+            ex = st["extra"]
             with tx() as conn:
                 conn.execute(
-                    "INSERT INTO claim_options(kind,threshold,label,active,sort_order) VALUES (?,?,?,1,?)",
-                    (kind, th, label, 99),
+                    """INSERT OR REPLACE INTO channels(chat_id,title,username,invite_link,button_label,active)
+                       VALUES (?,?,?,?,?,1)""",
+                    (ex["chat_id"], ex["title"], ex.get("username") or "", ex.get("invite") or "", label),
                 )
             clear_st(c)
-            await u.message.reply_text(f"✅ ثبت شد: {label}", reply_markup=admin_kb())
+            await u.message.reply_text(
+                f"✅ قفل تأیید شد\nچنل: {ex['title']}\nدکمه: {label}",
+                reply_markup=admin_kb(),
+            )
             return
+
         if kind == "a_reward":
             amt = parse_amt(text)
             if not amt:
-                await u.message.reply_text("مبلغ نامعتبر")
+                await u.message.reply_text("❌ مبلغ اشتباه.", reply_markup=back_admin())
                 return
             sset("ref_reward", str(amt))
             clear_st(c)
             await u.message.reply_text(f"پاداش رفرال: {num(amt)}", reply_markup=admin_kb())
             return
+
+        if kind == "a_opt_label":
+            set_st(c, "a_opt_amount", {"label": text.strip()[:40] or "برداشت"})
+            await u.message.reply_text(
+                "امتیاز مورد نیاز را بفرست (مثلاً 600k):",
+                reply_markup=back_admin(),
+            )
+            return
+
+        if kind == "a_opt_amount":
+            amt = parse_amt(text)
+            if not amt:
+                await u.message.reply_text("❌ مبلغ اشتباه.", reply_markup=back_admin())
+                return
+            label = st["extra"].get("label") or num(amt)
+            with tx() as conn:
+                conn.execute(
+                    "INSERT INTO claim_options(threshold,label,active,sort_order) VALUES (?,?,1,99)",
+                    (amt, label),
+                )
+            clear_st(c)
+            await u.message.reply_text(f"✅ گزینه ثبت شد: {label} / {num(amt)}", reply_markup=admin_kb())
+            return
+
         if kind in ("a_add", "a_sub"):
             parts = text.split()
             if len(parts) < 2:
-                await u.message.reply_text("آیدی مبلغ")
+                await u.message.reply_text("❌ آیدی مبلغ", reply_markup=back_admin())
                 return
             try:
                 tid = int(parts[0])
             except ValueError:
-                await u.message.reply_text("آیدی عددی")
+                await u.message.reply_text("❌ آیدی عددی باشد.", reply_markup=back_admin())
                 return
             amt = parse_amt(parts[1])
             if not amt:
-                await u.message.reply_text("مبلغ؟")
+                await u.message.reply_text("❌ مبلغ اشتباه.", reply_markup=back_admin())
                 return
             ensure_user(type("U", (), {"id": tid, "username": "", "full_name": str(tid), "is_bot": False})())
             with tx() as conn:
@@ -953,65 +909,80 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
                 else:
                     conn.execute("UPDATE users SET wallet=MAX(0,wallet-?) WHERE id=?", (amt, tid))
             clear_st(c)
-            await u.message.reply_text("OK", reply_markup=admin_kb())
-            return
-        if kind == "a_admins":
-            m = re.match(r"ادمین\s*([+-])\s*(\d+)", text)
-            if m:
-                op, aid = m.group(1), int(m.group(2))
-                with tx() as conn:
-                    if op == "+":
-                        conn.execute("INSERT OR IGNORE INTO admins(user_id) VALUES (?)", (aid,))
-                    elif int(user.id) == ADMIN_ID and aid != ADMIN_ID:
-                        conn.execute("DELETE FROM admins WHERE user_id=?", (aid,))
-                clear_st(c)
-                await u.message.reply_text("OK", reply_markup=admin_kb())
+            await u.message.reply_text("✅ انجام شد.", reply_markup=admin_kb())
             return
 
-    # plain commands
-    if re.fullmatch(r"(منو|menu|start)", low, re.I):
+        if kind == "a_adm_add":
+            try:
+                aid = int(re.sub(r"\D", "", text) or "0")
+            except Exception:
+                aid = 0
+            if aid < 1000:
+                await u.message.reply_text("❌ آیدی نامعتبر.", reply_markup=back_admin())
+                return
+            with tx() as conn:
+                conn.execute("INSERT OR IGNORE INTO admins(user_id) VALUES (?)", (aid,))
+            clear_st(c)
+            await u.message.reply_text(
+                f"✅ ادمین <code>{aid}</code> اضافه شد.\n"
+                f"آن فرد در پیوی ربات بزند: <code>پنل</code> یا <code>/admin</code>",
+                parse_mode="HTML",
+                reply_markup=admin_kb(),
+            )
+            try:
+                await c.bot.send_message(aid, "شما ادمین ربات شدی.\nدر پیوی بزن: پنل")
+            except Exception:
+                pass
+            return
+
+        if kind == "a_adm_del":
+            try:
+                aid = int(re.sub(r"\D", "", text) or "0")
+            except Exception:
+                aid = 0
+            if aid == ADMIN_ID:
+                await u.message.reply_text("ادمین اصلی حذف نمی‌شود.", reply_markup=back_admin())
+                return
+            if aid < 1000:
+                await u.message.reply_text("❌ آیدی نامعتبر.", reply_markup=back_admin())
+                return
+            with tx() as conn:
+                conn.execute("DELETE FROM admins WHERE user_id=?", (aid,))
+            clear_st(c)
+            await u.message.reply_text("حذف شد.", reply_markup=admin_kb())
+            return
+
+    # user commands
+    if low in ("منو", "menu"):
         if not await require_join(u, c):
             return
         await try_confirm_referral(c.bot, user)
         await u.message.reply_text("منو:", reply_markup=main_kb(user.id))
         return
-    if re.fullmatch(r"(پنل|admin)", low, re.I):
-        if chat.type == ChatType.PRIVATE and is_admin(user.id):
-            await u.message.reply_text("🎛 پنل ادمین", reply_markup=admin_kb())
-        return
-    if re.fullmatch(r"(موجودی|بالانس|balance)", low, re.I):
+    if low in ("موجودی", "balance"):
         if not await require_join(u, c):
             return
         uu = get_user(user.id)
-        await u.message.reply_text(
-            f"💰 کیف: {num(uu['wallet'])}\n💸 قابل برداشت: {num(uu['claimable'])}\n👥 رفرال: {uu['ref_count']}"
-        )
+        await u.message.reply_text(f"💰 {num(uu['wallet'])}\n👥 رفرال: {uu['ref_count']}")
         return
-    if re.fullmatch(r"(لینک|دعوت|رفرال)", low, re.I):
+    if low in ("لینک", "دعوت", "رفرال"):
         if not await require_join(u, c):
             return
         me = await c.bot.get_me()
-        link = f"https://t.me/{me.username}?start=ref{user.id}"
-        await u.message.reply_text(f"🔗 لینک دعوت:\n<code>{link}</code>", parse_mode="HTML")
-        return
-    if re.fullmatch(r"(راهنما|help)", low, re.I):
         await u.message.reply_text(
-            "لینک دعوت بگیر → بفرست → بعد از جوین دوستت (و عبور از قفل) امتیاز می‌گیری.\n"
-            "با رسیدن به پله رفرال از «دریافت میوپوینت» درخواست بده."
+            f"<code>https://t.me/{me.username}?start=ref{user.id}</code>",
+            parse_mode="HTML",
         )
+        return
+    if low in ("راهنما", "help"):
+        await u.message.reply_text("لینک دعوت · موجودی · برداشت · پنل (ادمین)")
         return
 
 def main():
     init_db()
     req = HTTPXRequest(connect_timeout=60.0, read_timeout=60.0, write_timeout=60.0, pool_timeout=60.0)
     get_req = HTTPXRequest(connect_timeout=60.0, read_timeout=60.0, write_timeout=60.0, pool_timeout=60.0)
-    app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .request(req)
-        .get_updates_request(get_req)
-        .build()
-    )
+    app = Application.builder().token(BOT_TOKEN).request(req).get_updates_request(get_req).build()
 
     async def safe_cb(update, context):
         try:
@@ -1031,15 +1002,20 @@ def main():
             log.exception("text")
             try:
                 if update.effective_message:
-                    await update.effective_message.reply_text("⚠️ %s" % str(e)[:150])
+                    await update.effective_message.reply_text(
+                        f"⚠️ {str(e)[:120]}",
+                        reply_markup=InlineKeyboardMarkup([[btn("🔙 پنل ادمین", "a:home", "primary")]])
+                        if is_admin(update.effective_user.id) else None,
+                    )
             except Exception:
                 pass
 
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("admin", open_admin))
     app.add_handler(CallbackQueryHandler(safe_cb))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, safe_text))
     app.add_handler(MessageHandler(filters.COMMAND, safe_text))
-    log.info("Lock+Ref bot started")
+    log.info("bot up")
     app.run_polling(allowed_updates=Update.ALL_TYPES, bootstrap_retries=10, drop_pending_updates=True)
 
 if __name__ == "__main__":
