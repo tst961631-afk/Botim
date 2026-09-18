@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""بات ویس کامل: چند زبان، فروشگاه، قمار، استیکر، خوش‌آمد/خداحافظی"""
+"""بات ویس کامل: چندزبان، فروشگاه، قمار، استیکر، خوش‌آمد/خداحافظی"""
 from __future__ import annotations
 import os, re, time, logging, sqlite3, threading, tempfile, random, io, json
 from contextlib import contextmanager
@@ -273,6 +273,36 @@ def mono(s):
     return "<code>%s</code>" % str(s).replace("<", "").replace(">", "")
 
 
+VARS_HELP = (
+    "متغیرها:\n"
+    + mono("{mention}") + " تگ قابل‌کلیک\n"
+    + mono("{name}") + " اسم\n"
+    + mono("{username}") + " یوزرنیم\n"
+    + mono("{id}") + " آیدی عددی\n"
+    + mono("{gender}") + " نام صدا\n"
+    + mono("{speed}") + " سرعت\n"
+    + mono("{date}") + " تاریخ\n"
+    + mono("{time}") + " ساعت\n"
+    + mono("{chat}") + " اسم گپ\n"
+    + mono("{tokens}") + " توکن\n"
+    + mono("{emoji}") + " ایموجی توکن\n"
+    + mono("{level}") + " سطح\n"
+    + mono("{points}") + " امتیاز"
+)
+
+SETTINGS_HELP = (
+    "تنظیمات — این‌طور بفرست:\n"
+    + mono("daily_tokens 20") + " توکن روزانه\n"
+    + mono("token_cost 1") + " هزینه هر ویس\n"
+    + mono("max_chars 400") + " سقف طول متن\n"
+    + mono("spam_sec 5") + " فاصله دو ویس (ثانیه)\n"
+    + mono("points_per_voice 2") + " امتیاز هر ویس\n"
+    + mono("ref_tokens 5") + " پاداش دعوت\n"
+    + mono("gender_lock 0") + " 0 آزاد / 1 قفل صدا\n"
+    + mono("locked_gender fa_f") + " صدا وقتی قفل روشن است"
+)
+
+
 def apply_style(text, style):
     style = (style or "none").lower()
     if style == "bold":
@@ -456,8 +486,8 @@ def enabled_langs():
 
 def pm_kb(uid):
     return InlineKeyboardMarkup([
-        [btn("🌐 زبان", "pm:lang:%s" % uid, "primary"), btn("🎭 صدا", "pm:voice:%s" % uid, "primary")],
-        [btn("⚡ سرعت", "pm:speed:%s" % uid, "primary"), btn("💎 توکن‌های من", "pm:tok:%s" % uid, "success")],
+        [btn("🎭 صدا", "pm:voice:%s" % uid, "primary"), btn("⚡ سرعت", "pm:speed:%s" % uid, "primary")],
+        [btn("💎 توکن‌های من", "pm:tok:%s" % uid, "success")],
         [btn("🛒 فروشگاه", "pm:shop:%s" % uid, "success"), btn("🎰 قمار", "pm:gamble:%s" % uid, "danger")],
         [btn("🔗 دعوت", "pm:ref:%s" % uid, "primary"), btn("🎁 کد هدیه", "pm:gift:%s" % uid, "success")],
         [btn("📖 راهنما", "pm:help:%s" % uid, "primary")],
@@ -466,7 +496,7 @@ def pm_kb(uid):
 
 def admin_kb():
     return InlineKeyboardMarkup([
-        [btn("⚙️ تنظیمات", "a:settings", "primary"), btn("🌐 زبان‌ها", "a:langs", "primary")],
+        [btn("⚙️ تنظیمات", "a:settings", "primary")],
         [btn("🛒 فروشگاه", "a:shop", "success"), btn("🎰 قمار", "a:gamble", "danger")],
         [btn("📢 گپ‌ها", "a:groups", "primary"), btn("🎁 کد هدیه", "a:gift", "success")],
         [btn("📝 کپشن", "a:caption", "primary"), btn("🎨 استایل کپشن", "a:cstyle", "primary")],
@@ -684,7 +714,7 @@ async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if data.startswith("pm:lang:"):
+    if False and data.startswith("pm:lang:"):
         rows = []
         for code in enabled_langs():
             rows.append([btn(LANGS[code], "pm:setl:%s:%s" % (code, user.id), "primary")])
@@ -692,7 +722,7 @@ async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("زبان منو:", reply_markup=InlineKeyboardMarkup(rows))
         return
 
-    if data.startswith("pm:setl:"):
+    if False and data.startswith("pm:setl:"):
         code = data.split(":")[2]
         if code in enabled_langs():
             with tx() as conn:
@@ -818,11 +848,15 @@ async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if data == "a:settings":
         set_st(c, "a_set")
         keys = ("daily_tokens", "token_cost", "max_chars", "spam_sec", "points_per_voice", "ref_tokens", "gender_lock", "locked_gender")
-        await q.edit_message_text("کلید مقدار بفرست\n" + "\n".join("%s=%s" % (k, sget(k)) for k in keys),
-                                  reply_markup=InlineKeyboardMarkup([[btn("🔙", "a:home", "danger")]]))
+        cur = "\n".join(mono("%s %s" % (k, sget(k))) for k in keys)
+        await q.edit_message_text(
+            SETTINGS_HELP + "\n\nمقادیر فعلی:\n" + cur + "\n\nمثال: " + mono("spam_sec 8"),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[btn("🔙", "a:home", "danger")]]),
+        )
         return
 
-    if data == "a:langs":
+    if False and data == "a:langs":
         rows = []
         for code, label in LANGS.items():
             on = sget("lang_" + code, "1") == "1"
@@ -831,7 +865,7 @@ async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("قفل/آزاد زبان‌ها:", reply_markup=InlineKeyboardMarkup(rows))
         return
 
-    if data.startswith("a:ltog:"):
+    if False and data.startswith("a:ltog:"):
         code = data.split(":")[2]
         cur = sget("lang_" + code, "1")
         sset("lang_" + code, "0" if cur == "1" else "1")
@@ -870,8 +904,11 @@ async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
     if data == "a:caption":
         set_st(c, "a_cap")
-        await q.edit_message_text("کپشن جدید را بفرست.\nفعلی:\n" + sget("caption", ""),
-                                  reply_markup=InlineKeyboardMarkup([[btn("🔙", "a:home", "danger")]]))
+        await q.edit_message_text(
+            "📝 قالب کپشن ویس\n\n" + VARS_HELP + "\n\nفعلی:\n" + mono(sget("caption", "")) + "\n\nقالب جدید را بفرست.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[btn("🔙", "a:home", "danger")]]),
+        )
         return
 
     if data == "a:cstyle":
