@@ -550,6 +550,99 @@ async def cmd_help(u, c):
     await u.message.reply_text(h)
 
 
+
+async def start_gamble(u: Update, c: ContextTypes.DEFAULT_TYPE, amount: int):
+    """قمار مبلغ → انتخاب ضریب → انیمیشن → نتیجه"""
+    user = u.effective_user
+    ensure_user(user)
+    uu = get_user(user.id)
+    if not uu or int(uu["blocked"] or 0):
+        return
+    if amount < 1:
+        await u.effective_message.reply_text("مبلغ نامعتبر")
+        return
+    if int(uu["tokens"]) < amount:
+        await u.effective_message.reply_text("توکن کافی نیست. موجودی: %s" % uu["tokens"])
+        return
+    with tx() as conn:
+        opts = conn.execute("SELECT * FROM gamble_opts WHERE active=1 ORDER BY id").fetchall()
+    if not opts:
+        await u.effective_message.reply_text("قمار فعال نیست. ادمین ضریب تعریف کند.")
+        return
+    rows = []
+    for o in opts:
+        rows.append([btn(
+            "%s | برد x%s | باخت -1 | %s%%" % (o["title"], o["multiplier"], o["win_chance"]),
+            "g:run:%s:%s:%s" % (o["id"], amount, user.id),
+            "danger",
+        )])
+    rows.append([btn("لغو", "g:cancel:%s" % user.id, "primary")])
+    await u.effective_message.reply_text(
+        "🎰 شرط: <b>%s</b> توکن\nیک ضریب را انتخاب کن:\n• ضریب برد = سود در صورت برد\n• باخت = از دست دادن همان مبلغ" % amount,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+async def run_gamble_animation(q, context, opt_id, amount, user_id):
+    import asyncio
+    user = q.from_user
+    if int(user.id) != int(user_id):
+        await q.answer("این قمار برای تو نیست", show_alert=True)
+        return
+    with tx() as conn:
+        opt = conn.execute("SELECT * FROM gamble_opts WHERE id=? AND active=1", (opt_id,)).fetchone()
+        uu = conn.execute("SELECT tokens FROM users WHERE id=?", (user_id,)).fetchone()
+    if not opt:
+        await q.edit_message_text("این ضریب دیگر فعال نیست.")
+        return
+    if not uu or int(uu["tokens"]) < amount:
+        await q.edit_message_text("توکن کافی نیست.")
+        return
+
+    # انیمیشن ادیت
+    for dots in (".", "..", "...", "...."):
+        try:
+            await q.edit_message_text("🎰 در حال انجام شرط\n" + dots)
+        except Exception:
+            pass
+        await asyncio.sleep(0.45)
+
+    win = random.random() * 100 < float(opt["win_chance"])
+    mult = float(opt["multiplier"])
+    with tx() as conn:
+        # اول مبلغ را کم کن
+        conn.execute("UPDATE users SET tokens=tokens-? WHERE id=? AND tokens>=?", (amount, user_id, amount))
+        ch = conn.execute("SELECT changes() AS c").fetchone()["c"]
+        if not ch:
+            await q.edit_message_text("توکن کافی نیست.")
+            return
+        if win:
+            # برگشت مبلغ * ضریب
+            gain = int(amount * mult)
+            conn.execute("UPDATE users SET tokens=tokens+? WHERE id=?", (gain, user_id))
+            result_line = "✅ <b>برد</b>\nضریب برد: <code>x%s</code>\nبرداشت: <b>+%s</b>" % (mult, gain)
+        else:
+            result_line = "❌ <b>باخت</b>\nضریب باخت: <code>x-1</code>\nاز دست رفت: <b>-%s</b>" % amount
+        left = conn.execute("SELECT tokens FROM users WHERE id=?", (user_id,)).fetchone()["tokens"]
+
+    emoji = sget("token_emoji", "💎")
+    text = (
+        "🎰 نتیجه قمار\n"
+        + "بسته: <b>%s</b>\n" % (opt["title"],)
+        + "شرط: <code>%s</code>\n" % amount
+        + result_line
+        + "\n%s موجودی: <b>%s</b>" % (emoji, left)
+    )
+    await q.edit_message_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [btn("%s %s" % (emoji, left), "noop", "success")],
+        ]),
+    )
+
+
 async def do_voice(update, context, body):
     msg = update.message or update.effective_message
     user = update.effective_user
@@ -840,6 +933,21 @@ async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if data == "noop":
         return
 
+    if data.startswith("g:cancel:"):
+        uid = int(data.split(":")[2])
+        if user.id != uid:
+            await q.answer("برای تو نیست", show_alert=True)
+            return
+        await q.edit_message_text("قمار لغو شد.")
+        return
+
+    if data.startswith("g:run:"):
+        parts = data.split(":")
+        opt_id, amount, uid = int(parts[2]), int(parts[3]), int(parts[4])
+        await run_gamble_animation(q, c, opt_id, amount, uid)
+        return
+
+
     # admin
     if data.startswith("a:") and not is_admin(user.id):
         await q.answer("نه", show_alert=True)
@@ -888,7 +996,7 @@ async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
         set_st(c, "a_gamble")
         with tx() as conn:
             opts = conn.execute("SELECT * FROM gamble_opts ORDER BY id").fetchall()
-        lines = ["قمار — افزودن:", mono("عنوان ضریب شانس"), "مثال: " + mono("ریسک 2.5 40"), "\n"]
+        lines = ["قمار — افزودن:", mono("عنوان ضریب_برد شانس"), "مثال: " + mono("ریسک 2.5 40"), "\nضریب برد در برد؛ باخت = از دست دادن مبلغ (x-1)\n"]
         for o in opts:
             lines.append("#%s %s x%s %s%%" % (o["id"], o["title"], o["multiplier"], o["win_chance"]))
         lines.append("\nحذف: " + mono("del آیدی"))
@@ -1083,19 +1191,14 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
                 ]),
             )
             return
+        # قمار 2500
+        mg = re.match(r"^(?:قمار|gamble)\s+([\d,]+)\s*$", text.strip(), re.I)
+        if mg:
+            amount = int(mg.group(1).replace(",", ""))
+            await start_gamble(u, c, amount)
+            return
         if low in ("قمار", "gamble"):
-            with tx() as conn:
-                opts = conn.execute("SELECT * FROM gamble_opts WHERE active=1 ORDER BY id").fetchall()
-            if not opts:
-                await u.message.reply_text("قمار فعال نیست.")
-                return
-            rows = [[btn("%s | x%s | %s%%" % (o["title"], o["multiplier"], o["win_chance"]),
-                         "pm:gopt:%s:%s" % (o["id"], user.id), "danger")] for o in opts]
-            uu = get_user(user.id)
-            await u.message.reply_text(
-                "🎰 قمار — موجودی: %s\nضریب را بزن و مبلغ را بفرست." % uu["tokens"],
-                reply_markup=InlineKeyboardMarkup(rows),
-            )
+            await u.message.reply_text("فرمت:\n<code>قمار 2500</code>", parse_mode="HTML")
             return
         body = parse_voice_cmd(text)
         if body:
@@ -1111,6 +1214,11 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
         return
     if low in ("منو", "menu"):
         await u.message.reply_text("منو:", reply_markup=pm_kb(user.id))
+        return
+
+    mg = re.match(r"^(?:قمار|gamble)\s+([\d,]+)\s*$", text.strip(), re.I)
+    if mg:
+        await start_gamble(u, c, int(mg.group(1).replace(",", "")))
         return
 
     st = get_st(c)
