@@ -152,6 +152,8 @@ def init_db():
             "member_leave": "خداحافظ {name} 👋",
             "welcome_media_type": "",
             "welcome_media_id": "",
+            "leave_media_type": "",
+            "leave_media_id": "",
             "token_emoji": "💎",
             "token_msg": "{emoji} موجودی توکن شما",
             "lang_fa": "1", "lang_en": "1", "lang_tr": "1", "lang_ru": "1", "lang_ja": "1",
@@ -336,13 +338,48 @@ def render_tpl(template, user, gender_label="", speed_label="", tokens_left="", 
         "{tokens_left}": str(tokens_left),
         "{tokens}": str(tokens_left),
         "{emoji}": sget("token_emoji", "💎"),
+        "{level}": "",
+        "{points}": "",
     }
     for k, v in rep.items():
         t = t.replace(k, str(v))
     return apply_style(t, sget("caption_style", "none"))
 
 
+
+def translate_text(text, target_lang):
+    """ترجمه متن به زبان کاربر. fa نیاز به ترجمه ندارد."""
+    target_lang = (target_lang or "fa").lower()
+    if target_lang == "fa" or not text:
+        return text
+    try:
+        from deep_translator import GoogleTranslator
+        # deep-translator codes
+        code = {"en": "en", "tr": "tr", "ru": "ru", "ja": "ja", "fa": "fa"}.get(target_lang, "en")
+        out = GoogleTranslator(source="auto", target=code).translate(text)
+        return out or text
+    except Exception as e:
+        log.warning("translate fail: %s", e)
+        return text
+
+
+def voice_for_lang(lang, current_gender):
+    """صدای مناسب زبان؛ جنسیت را تا حد ممکن حفظ می‌کند."""
+    lang = (lang or "fa").lower()
+    male = str(current_gender or "").endswith("_m") or str(current_gender or "").startswith("m")
+    suffix = "_m" if male else "_f"
+    vid = lang + suffix
+    if vid in ENGINE:
+        return vid
+    # fallback any voice of that lang
+    for k in ENGINE:
+        if k.startswith(lang + "_"):
+            return k
+    return current_gender if current_gender in ENGINE else "fa_f"
+
+
 def rate_for_speed(speed):
+
     if speed == "fast":
         return "+25%"
     if speed == "slow":
@@ -510,9 +547,15 @@ async def do_voice(update, context, body):
             pass
         return
     body = body[: sint("max_chars", 400)]
+    user_lang = (uu["lang"] if "lang" in uu.keys() else None) or "fa"
+    # ترجمه متن به زبان انتخابی کاربر
+    body = translate_text(body, user_lang)
     gender = uu["gender"] or "fa_f"
     if sget("gender_lock", "0") == "1":
         gender = sget("locked_gender", "fa_f")
+    else:
+        # صدای مطابق زبان منو
+        gender = voice_for_lang(user_lang, gender)
     speed = uu["speed"] or "normal"
     target = getattr(msg, "reply_to_message", None)
     path = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False).name
@@ -871,6 +914,7 @@ async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
             [btn("خوش‌آمد " + ("🟢" if sget("welcome_enabled") == "1" else "🔴"), "a:wtog", "success")],
             [btn("لفت " + ("🟢" if sget("leave_enabled") == "1" else "🔴"), "a:ltog2", "success")],
             [btn("متن خوش‌آمد", "a:weltxt", "primary"), btn("متن لفت", "a:leavetxt", "primary")],
+            [btn("مدیا لفت", "a:leavemedia", "primary")],
             [btn("🔙", "a:home", "danger")],
         ]))
         return
@@ -885,15 +929,24 @@ async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
         return
     if data == "a:weltxt":
         set_st(c, "a_weltxt")
-        await q.edit_message_text("متن خوش‌آمد:", reply_markup=InlineKeyboardMarkup([[btn("🔙", "a:home", "danger")]]))
+        await q.edit_message_text("متن خوش‌آمد را بفرست:\n" + VARS_HELP + "\n\nفعلی:\n" + sget("member_welcome", ""),
+                                  parse_mode="HTML",
+                                  reply_markup=InlineKeyboardMarkup([[btn("🔙", "a:home", "danger")]]))
         return
     if data == "a:leavetxt":
         set_st(c, "a_leavetxt")
-        await q.edit_message_text("متن لفت:", reply_markup=InlineKeyboardMarkup([[btn("🔙", "a:home", "danger")]]))
+        await q.edit_message_text("متن لفت را بفرست:\n" + VARS_HELP + "\n\nفعلی:\n" + sget("member_leave", ""),
+                                  parse_mode="HTML",
+                                  reply_markup=InlineKeyboardMarkup([[btn("🔙", "a:home", "danger")]]))
         return
     if data == "a:welmedia":
         set_st(c, "a_welmedia")
-        await q.edit_message_text("عکس یا گیف خوش‌آمد را بفرست", reply_markup=InlineKeyboardMarkup([[btn("🔙", "a:home", "danger")]]))
+        await q.edit_message_text("عکس یا گیف خوش‌آمد را بفرست\n" + VARS_HELP, parse_mode="HTML",
+                                  reply_markup=InlineKeyboardMarkup([[btn("🔙", "a:home", "danger")]]))
+        return
+    if data == "a:leavemedia":
+        set_st(c, "a_leavemedia")
+        await q.edit_message_text("عکس یا گیف لفت را بفرست", reply_markup=InlineKeyboardMarkup([[btn("🔙", "a:home", "danger")]]))
         return
 
     if data == "a:stick":
@@ -985,6 +1038,33 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
     # groups / private voice
     if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+        if low in ("موجودی", "توکن", "balance", "tokens"):
+            uu = get_user(user.id)
+            cost = max(1, sint("token_cost", 1))
+            can = int(uu["tokens"]) // cost
+            emoji = sget("token_emoji", "💎")
+            await u.message.reply_text(
+                "%s موجودی: *%s*\n🎙 می‌توانی حدود *%s* ویس بسازی" % (emoji, uu["tokens"], can),
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [btn("%s %s" % (emoji, uu["tokens"]), "noop", "success")],
+                ]),
+            )
+            return
+        if low in ("قمار", "gamble"):
+            with tx() as conn:
+                opts = conn.execute("SELECT * FROM gamble_opts WHERE active=1 ORDER BY id").fetchall()
+            if not opts:
+                await u.message.reply_text("قمار فعال نیست.")
+                return
+            rows = [[btn("%s | x%s | %s%%" % (o["title"], o["multiplier"], o["win_chance"]),
+                         "pm:gopt:%s:%s" % (o["id"], user.id), "danger")] for o in opts]
+            uu = get_user(user.id)
+            await u.message.reply_text(
+                "🎰 قمار — موجودی: %s\nضریب را بزن و مبلغ را بفرست." % uu["tokens"],
+                reply_markup=InlineKeyboardMarkup(rows),
+            )
+            return
         body = parse_voice_cmd(text)
         if body:
             await do_voice(u, c, body)
@@ -1211,8 +1291,23 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
                 ensure_user(type("U", (), {"id": tid, "username": "", "full_name": str(tid), "is_bot": False})())
                 with tx() as conn:
                     conn.execute("UPDATE users SET tokens=tokens+? WHERE id=?", (amt, tid))
+                    new_bal = conn.execute("SELECT tokens FROM users WHERE id=?", (tid,)).fetchone()["tokens"]
                 clear_st(c)
                 await u.message.reply_text("OK", reply_markup=admin_kb())
+                # پیام به کاربر
+                try:
+                    emoji = sget("token_emoji", "💎")
+                    admin_mention = mention_html(user)
+                    await c.bot.send_message(
+                        tid,
+                        "✅ %s توکن از طرف %s واریز شد" % (amt, admin_mention),
+                        parse_mode="HTML",
+                        reply_markup=InlineKeyboardMarkup([
+                            [btn("%s %s" % (emoji, new_bal), "pm:tok:%s" % tid, "success")],
+                        ]),
+                    )
+                except Exception:
+                    pass
             return
         if kind == "a_block":
             tid = int(re.sub(r"\D", "", text) or "0")
@@ -1248,17 +1343,18 @@ async def on_media(u, c):
     st = get_st(c)
     if not st:
         return
-    if st["kind"] == "a_welmedia":
+    if st["kind"] in ("a_welmedia", "a_leavemedia"):
+        prefix = "welcome" if st["kind"] == "a_welmedia" else "leave"
         if u.message.photo:
-            sset("welcome_media_type", "photo")
-            sset("welcome_media_id", u.message.photo[-1].file_id)
+            sset(prefix + "_media_type", "photo")
+            sset(prefix + "_media_id", u.message.photo[-1].file_id)
             clear_st(c)
-            await u.message.reply_text("عکس خوش‌آمد OK", reply_markup=admin_kb())
+            await u.message.reply_text("عکس ذخیره شد", reply_markup=admin_kb())
         elif u.message.animation:
-            sset("welcome_media_type", "animation")
-            sset("welcome_media_id", u.message.animation.file_id)
+            sset(prefix + "_media_type", "animation")
+            sset(prefix + "_media_id", u.message.animation.file_id)
             clear_st(c)
-            await u.message.reply_text("گیف خوش‌آمد OK", reply_markup=admin_kb())
+            await u.message.reply_text("گیف ذخیره شد", reply_markup=admin_kb())
         return
     if st["kind"] == "a_stick" and u.message.sticker:
         with tx() as conn:
@@ -1301,8 +1397,14 @@ async def on_left_member(u, c):
     if mem.is_bot:
         return
     text = render_tpl(sget("member_leave", "خداحافظ {name}"), mem, chat_title=u.effective_chat.title or "")
+    mtype, mid = (sget("leave_media_type") or "").strip(), (sget("leave_media_id") or "").strip()
     try:
-        await c.bot.send_message(u.effective_chat.id, text, parse_mode="HTML")
+        if mtype == "photo" and mid:
+            await c.bot.send_photo(u.effective_chat.id, mid, caption=text, parse_mode="HTML")
+        elif mtype == "animation" and mid:
+            await c.bot.send_animation(u.effective_chat.id, mid, caption=text, parse_mode="HTML")
+        else:
+            await c.bot.send_message(u.effective_chat.id, text, parse_mode="HTML")
     except Exception:
         pass
 
