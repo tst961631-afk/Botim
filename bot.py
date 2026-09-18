@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""بات ویس کامل: چندزبان، فروشگاه، قمار، استیکر، خوش‌آمد/خداحافظی"""
+"""بات ویس کامل: چند زبان، فروشگاه، قمار، استیکر، خوش‌آمد/خداحافظی"""
 from __future__ import annotations
 import os, re, time, logging, sqlite3, threading, tempfile, random, io, json
 from contextlib import contextmanager
