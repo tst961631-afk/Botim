@@ -292,39 +292,59 @@ def admin_kb():
 
 # ─── handlers ───
 async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    user = u.effective_user
-    ensure_user(user)
-    text = u.message.text or ""
-    m = re.search(r"ref[_-]?(\d+)", text)
-    if m:
-        ref = int(m.group(1))
-        if ref != user.id:
-            with tx() as conn:
-                uu = conn.execute("SELECT referred_by FROM users WHERE id=?", (user.id,)).fetchone()
-                if uu and not uu["referred_by"]:
-                    conn.execute("UPDATE users SET referred_by=? WHERE id=?", (ref, user.id))
-                    reward = sint("ref_tokens", 5)
-                    conn.execute(
-                        "UPDATE users SET tokens=tokens+? WHERE id=?", (reward, ref)
-                    )
-            try:
-                await c.bot.send_message(ref, f"🎉 دعوت موفق! +{sint('ref_tokens',5)} توکن")
-            except Exception:
-                pass
+    try:
+        if not u.message:
+            return
+        user = u.effective_user
+        if not user:
+            return
+        # اول یک جواب سریع تا معلوم شود ربات زنده است
+        try:
+            await u.message.reply_text("⏳ در حال آماده‌سازی...")
+        except Exception as e:
+            log.error("cannot reply: %s", e)
+            return
 
-    if u.effective_chat.type != ChatType.PRIVATE:
-        await u.message.reply_text("تنظیمات در پیوی ربات است. پیوی را استارت کن.")
-        return
+        ensure_user(user)
+        text = u.message.text or ""
+        m = re.search(r"ref[_-]?(\d+)", text)
+        if m:
+            ref = int(m.group(1))
+            if ref != user.id:
+                with tx() as conn:
+                    uu = conn.execute("SELECT referred_by FROM users WHERE id=?", (user.id,)).fetchone()
+                    if uu and not uu["referred_by"]:
+                        conn.execute("UPDATE users SET referred_by=? WHERE id=?", (ref, user.id))
+                        reward = sint("ref_tokens", 5)
+                        conn.execute(
+                            "UPDATE users SET tokens=tokens+? WHERE id=?", (reward, ref)
+                        )
+                try:
+                    await c.bot.send_message(ref, "🎉 دعوت موفق! +" + str(sint("ref_tokens", 5)) + " توکن")
+                except Exception:
+                    pass
 
-    welcome = sget("default_welcome", "سلام!")
-    uu = get_user(user.id)
-    await u.message.reply_text(
-        f"{welcome}\n\n"
-        f"💎 توکن: {uu['tokens']} | ⭐ امتیاز: {uu['points']} | 📶 سطح: {uu['level']}\n"
-        f"در گپ بنویس: <code>-متن ویس</code>",
-        parse_mode="HTML",
-        reply_markup=pm_kb(user.id),
-    )
+        if u.effective_chat.type != ChatType.PRIVATE:
+            await u.message.reply_text("تنظیمات در پیوی ربات است. پیوی را استارت کن.")
+            return
+
+        welcome = sget("default_welcome", "سلام!")
+        uu = get_user(user.id)
+        tokens = uu["tokens"] if uu else 0
+        points = uu["points"] if uu else 0
+        level = uu["level"] if uu else 1
+        await u.message.reply_text(
+            welcome + "\n\n"
+            "💎 توکن: " + str(tokens) + " | ⭐ امتیاز: " + str(points) + " | 📶 سطح: " + str(level) + "\n"
+            "در گپ بنویس: -متن ویس",
+            reply_markup=pm_kb(user.id),
+        )
+    except Exception:
+        log.exception("cmd_start")
+        try:
+            await u.message.reply_text("⚠️ خطا در استارت. لاگ سرور را چک کن.")
+        except Exception:
+            pass
 
 
 async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -735,8 +755,11 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await u.message.reply_text("🎛 پنل ادمین", reply_markup=admin_kb())
         return
 
-    if low in ("منو", "start"):
+    if low in ("منو", "menu"):
         await u.message.reply_text("منو:", reply_markup=pm_kb(user.id))
+        return
+    if low in ("start", "استارت") or text.startswith("/start"):
+        await cmd_start(u, c)
         return
 
     if st and st["kind"] == "gift":
@@ -893,6 +916,23 @@ async def cmd_addgroup(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text("گپ به لیست مجاز اضافه شد.")
 
 
+async def open_admin_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    if not u.effective_user or not is_admin(u.effective_user.id):
+        return
+    if u.effective_chat.type != ChatType.PRIVATE:
+        return
+    await u.message.reply_text("🎛 پنل ادمین", reply_markup=admin_kb())
+
+
+async def post_init(app_):
+    try:
+        await app_.bot.delete_webhook(drop_pending_updates=True)
+    except Exception as e:
+        log.warning("delete_webhook: %s", e)
+    me = await app_.bot.get_me()
+    log.info("bot identity: @%s id=%s", me.username, me.id)
+
+
 def main():
     init_db()
     req = HTTPXRequest(connect_timeout=60.0, read_timeout=90.0, write_timeout=90.0, pool_timeout=60.0)
@@ -902,6 +942,7 @@ def main():
         .token(BOT_TOKEN)
         .request(req)
         .get_updates_request(get_req)
+        .post_init(post_init)
         .build()
     )
 
@@ -925,21 +966,17 @@ def main():
             except Exception:
                 pass
 
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("addgroup", cmd_addgroup))
-    app.add_handler(CommandHandler("admin", lambda u, c: open_admin_cmd(u, c)))
-    app.add_handler(CallbackQueryHandler(safe_cb))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, safe_text))
-    log.info("voice bot up")
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True, bootstrap_retries=10)
-
-
-async def open_admin_cmd(u, c):
-    if not is_admin(u.effective_user.id):
-        return
-    if u.effective_chat.type != ChatType.PRIVATE:
-        return
-    await u.message.reply_text("🎛 پنل ادمین", reply_markup=admin_kb())
+    app.add_handler(CommandHandler("start", cmd_start), group=0)
+    app.add_handler(CommandHandler("addgroup", cmd_addgroup), group=0)
+    app.add_handler(CommandHandler("admin", open_admin_cmd), group=0)
+    app.add_handler(CallbackQueryHandler(safe_cb), group=0)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, safe_text), group=1)
+    log.info("voice bot up — polling...")
+    app.run_polling(
+        allowed_updates=["message", "callback_query"],
+        drop_pending_updates=True,
+        bootstrap_retries=10,
+    )
 
 
 if __name__ == "__main__":
