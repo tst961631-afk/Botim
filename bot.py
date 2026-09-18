@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""بات ویس گروهی + پیوی تنظیمات + توکن/امتیاز/رفرال/مدیریت گپ"""
+"""بات ویس گروه + پیوی تنظیمات + توکن/امتیاز/رفرال/مدیریت گپ"""
 from __future__ import annotations
 import os, re, time, logging, sqlite3, threading, tempfile, secrets
 from contextlib import contextmanager
