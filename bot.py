@@ -1,16 +1,16 @@
 # -*- coding: utf-8 -*-
-"""بات ویس گروهی + پیوی تنظیمات + توکن/امتیاز/رفرال/مدیریت گپ"""
+"""بات ویس گروهی + پیوی تنظیمات + توکن/امتیاز/رفرال + خوش‌آمد"""
 from __future__ import annotations
 import os, re, time, logging, sqlite3, threading, tempfile
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, MessageHandler,
-    ChatMemberHandler, ContextTypes, filters,
+    ContextTypes, filters,
 )
-from telegram.constants import ChatType, ChatMemberStatus
+from telegram.constants import ChatType
 from telegram.request import HTTPXRequest
 
 BOT_TOKEN = "8932340319:AAEEKFbUFWBo_3Bc3NSYy_r8QhrVvXBy1Uk"
@@ -100,12 +100,13 @@ def init_db():
             "ref_tokens": "5",
             "gender_lock": "0",
             "locked_gender": "f1",
-            "mod_enabled": "1",
             "welcome_enabled": "1",
             "caption": "🎙 این ویس از طرف {mention}",
             "default_welcome": "سلام! از پیوی جنسیت و سرعت را تنظیم کن، بعد در گپ با - متن ویس بساز.",
             "help_text": "",
             "member_welcome": "سلام {mention} به گروه خوش آمدی 👋",
+            "welcome_media_type": "",
+            "welcome_media_id": "",
             "voice_f1": "زن ۱",
             "voice_f2": "زن ۲",
             "voice_m1": "مرد ۱",
@@ -147,10 +148,6 @@ def today_str():
 
 def voice_label(vid):
     return sget("voice_" + vid, vid) or vid
-
-
-def voice_map():
-    return {k: (ENGINE[k], voice_label(k)) for k in ENGINE}
 
 
 def ensure_user(user):
@@ -227,17 +224,17 @@ def mono(s):
 
 
 VARS_HELP = (
-    "متغیرهای کپشن / خوش‌آمد (حالت Mono):\n"
-    + mono("{mention}") + " — تگ قابل کلیک اسم\n"
-    + mono("{name}") + " — اسم بدون لینک\n"
-    + mono("{username}") + " — یوزرنیم با @\n"
-    + mono("{id}") + " — آیدی عددی\n"
-    + mono("{gender}") + " — اسم صدای انتخابی\n"
-    + mono("{speed}") + " — سرعت (آرام/عادی/سریع)\n"
-    + mono("{date}") + " — تاریخ تهران\n"
-    + mono("{time}") + " — ساعت تهران\n"
-    + mono("{chat}") + " — اسم گپ\n"
-    + mono("{tokens_left}") + " — توکن باقیمانده"
+    "متغیرها (Mono):\n"
+    + mono("{mention}") + " تگ قابل‌کلیک\n"
+    + mono("{name}") + " اسم\n"
+    + mono("{username}") + " یوزرنیم\n"
+    + mono("{id}") + " آیدی\n"
+    + mono("{gender}") + " صدا\n"
+    + mono("{speed}") + " سرعت\n"
+    + mono("{date}") + " تاریخ\n"
+    + mono("{time}") + " ساعت\n"
+    + mono("{chat}") + " اسم گپ\n"
+    + mono("{tokens_left}") + " توکن باقی"
 )
 
 
@@ -268,35 +265,15 @@ def rate_for_speed(speed):
     return "+0%"
 
 
-async def is_group_admin(bot, chat_id, user_id):
-    try:
-        m = await bot.get_chat_member(chat_id, user_id)
-        return m.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER, "administrator", "creator")
-    except Exception:
-        return False
-
-
 async def bot_can_delete(bot, chat_id):
     try:
+        from telegram.constants import ChatMemberStatus
         me = await bot.get_me()
         m = await bot.get_chat_member(chat_id, me.id)
         if m.status in (ChatMemberStatus.OWNER, "creator"):
             return True
         if m.status in (ChatMemberStatus.ADMINISTRATOR, "administrator"):
             return bool(getattr(m, "can_delete_messages", False))
-    except Exception:
-        pass
-    return False
-
-
-async def bot_can_restrict(bot, chat_id):
-    try:
-        me = await bot.get_me()
-        m = await bot.get_chat_member(chat_id, me.id)
-        if m.status in (ChatMemberStatus.OWNER, "creator"):
-            return True
-        if m.status in (ChatMemberStatus.ADMINISTRATOR, "administrator"):
-            return bool(getattr(m, "can_restrict_members", False))
     except Exception:
         pass
     return False
@@ -319,36 +296,33 @@ async def tts_save(text, voice_id, speed, path):
         await communicate.save(path)
         return
     except ImportError:
-        log.warning("edge_tts missing, fallback gTTS")
+        log.warning("edge_tts missing")
     except Exception as e:
         log.warning("edge_tts failed: %s", e)
     try:
         from gtts import gTTS
-        tts = gTTS(text=text, lang="fa")
-        tts.save(path)
+        gTTS(text=text, lang="fa").save(path)
     except ImportError:
-        raise RuntimeError("هیچ موتور ویسی نصب نیست. در requirements.txt بگذار: edge-tts")
+        raise RuntimeError("موتور ویس نصب نیست: pip install edge-tts")
 
 
 def parse_voice_cmd(text: str):
-    """فقط اگر اول پیام - یا -س باشد."""
     if not text:
         return None
     raw = text
-    # -س متن  |  - س متن  |  -متن
     m = re.match(r"^-\s*س\s+(.*)$", raw)
     if m:
-        body = m.group(1).strip()
-        return body or None
+        return m.group(1).strip() or None
     m = re.match(r"^-\s+(.*)$", raw)
     if m:
-        body = m.group(1).strip()
-        return body or None
+        return m.group(1).strip() or None
     m = re.match(r"^-(.*)$", raw)
     if m:
         body = m.group(1).strip()
-        if body.startswith("س ") or body == "س":
-            body = body[1:].strip()
+        if body.startswith("س "):
+            body = body[2:].strip()
+        elif body == "س":
+            return None
         return body or None
     return None
 
@@ -358,13 +332,12 @@ def default_help():
     if custom:
         return custom
     return (
-        "📖 راهنما\n\n"
-        "در گپ اول پیام بنویس:\n"
-        + mono("-سلام خوبی") + "\n"
+        "📖 راهنما\n\nدر گپ اول پیام:\n"
+        + mono("-سلام") + "\n"
         + mono("- س سلام") + "\n"
         + mono("-س سلام") + "\n\n"
-        "تنظیم صدا و سرعت فقط در پیوی ربات.\n"
-        "هر ویس توکن مصرف می‌کند و امتیاز می‌دهد."
+        "ریپلای روی کسی + -متن → ویس روی همان پیام او\n"
+        "تنظیم صدا/سرعت در پیوی ربات"
     )
 
 
@@ -374,23 +347,21 @@ def pm_kb(uid):
         [btn("⚡ سرعت", "pm:speed:%s" % uid, "primary")],
         [btn("💎 وضعیت من", "pm:status:%s" % uid, "success")],
         [btn("🛒 خرید توکن", "pm:buy:%s" % uid, "success")],
-        [btn("🔗 لینک دعوت", "pm:ref:%s" % uid, "primary"), btn("🎁 کد هدیه", "pm:gift:%s" % uid, "success")],
+        [btn("🔗 دعوت", "pm:ref:%s" % uid, "primary"), btn("🎁 کد هدیه", "pm:gift:%s" % uid, "success")],
         [btn("📖 راهنما", "pm:help:%s" % uid, "primary")],
     ])
 
 
 def admin_kb():
-    mod = sget("mod_enabled", "1") == "1"
     wel = sget("welcome_enabled", "1") == "1"
     return InlineKeyboardMarkup([
         [btn("⚙️ تنظیمات", "a:settings", "primary"), btn("📢 گپ‌ها", "a:groups", "primary")],
         [btn("🎁 کد هدیه", "a:gift", "success"), btn("🚫 بلک‌لیست", "a:block", "danger")],
-        [btn("📝 کپشن ویس", "a:caption", "primary")],
-        [btn("🎭 اسم صداها", "a:vnames", "primary")],
-        [btn("🛡 مدیریت: " + ("روشن" if mod else "خاموش"), "a:mod", "success" if mod else "danger")],
-        [btn("👋 خوش‌آمد ممبر: " + ("روشن" if wel else "خاموش"), "a:wel", "success" if wel else "danger")],
+        [btn("📝 کپشن ویس", "a:caption", "primary"), btn("🎭 اسم صداها", "a:vnames", "primary")],
+        [btn("👋 خوش‌آمد: " + ("روشن" if wel else "خاموش"), "a:wel", "success" if wel else "danger")],
+        [btn("💬 متن خوش‌آمد", "a:weltxt", "primary"), btn("🖼 عکس/گیف خوش‌آمد", "a:welmedia", "primary")],
+        [btn("🗑 پاک کردن مدیا خوش‌آمد", "a:welclear", "danger")],
         [btn("📄 متن راهنما", "a:help", "primary"), btn("💬 متن استارت", "a:startw", "primary")],
-        [btn("👋 متن خوش‌آمد گپ", "a:weltxt", "primary")],
         [btn("➕ واریز توکن", "a:addtok", "success"), btn("👤 ادمین", "a:adm", "primary")],
         [btn("📊 آمار", "a:stats", "primary"), btn("❌ بستن", "a:close", "danger")],
     ])
@@ -477,8 +448,7 @@ async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
         lock = sget("gender_lock", "0") == "1"
         rows = []
         if lock:
-            lg = sget("locked_gender", "f1")
-            rows.append([btn("قفل: " + voice_label(lg), "noop", "danger")])
+            rows.append([btn("قفل: " + voice_label(sget("locked_gender", "f1")), "noop", "danger")])
         else:
             for vid in ENGINE:
                 rows.append([btn(voice_label(vid), "pm:setv:%s:%s" % (vid, user.id), "primary")])
@@ -529,7 +499,7 @@ async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
         price = sint("token_price_points", 10)
         uu = get_user(user.id)
         if int(uu["points"]) < price:
-            await q.answer("امتیاز کم است (نیاز %s)" % price, show_alert=True)
+            await q.answer("امتیاز کم (نیاز %s)" % price, show_alert=True)
             return
         with tx() as conn:
             conn.execute("UPDATE users SET points=points-?, tokens=tokens+1 WHERE id=?", (price, user.id))
@@ -564,33 +534,17 @@ async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await q.answer("دسترسی نداری", show_alert=True)
         return
 
-    if data == "a:mod":
-        cur = sget("mod_enabled", "1") == "1"
-        sset("mod_enabled", "0" if cur else "1")
-        now = sget("mod_enabled", "1") == "1"
-        await q.edit_message_text(
-            "🛡 مدیریت گپ الان: " + ("🟢 روشن" if now else "🔴 خاموش")
-            + "\nسیک / بن / سکوت فقط وقتی روشن باشد.",
-            reply_markup=admin_kb(),
-        )
-        return
-
     if data == "a:wel":
         cur = sget("welcome_enabled", "1") == "1"
         sset("welcome_enabled", "0" if cur else "1")
         now = sget("welcome_enabled", "1") == "1"
-        await q.edit_message_text(
-            "👋 خوش‌آمد ممبر: " + ("🟢 روشن" if now else "🔴 خاموش"),
-            reply_markup=admin_kb(),
-        )
+        await q.edit_message_text("👋 خوش‌آمد: " + ("🟢 روشن" if now else "🔴 خاموش"), reply_markup=admin_kb())
         return
 
     if data == "a:caption":
         set_st(c, "a_cap")
         await q.edit_message_text(
-            "📝 قالب کپشن ویس\nفعلی:\n%s\n\n%s\n\nقالب جدید را همین‌جا بفرست." % (
-                sget("caption", ""), VARS_HELP
-            ),
+            "📝 کپشن ویس\nفعلی:\n%s\n\n%s\n\nقالب جدید را بفرست." % (sget("caption", ""), VARS_HELP),
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[btn("🔙 پنل", "a:home", "danger")]]),
         )
@@ -599,9 +553,7 @@ async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if data == "a:vnames":
         set_st(c, "a_vname")
         await q.edit_message_text(
-            "اسم صداها:\n"
-            "f1 = %s\nf2 = %s\nm1 = %s\nm2 = %s\n\n"
-            "بفرست مثل:\n%s" % (
+            "اسم صداها:\nf1=%s\nf2=%s\nm1=%s\nm2=%s\n\nبفرست: %s" % (
                 voice_label("f1"), voice_label("f2"), voice_label("m1"), voice_label("m2"),
                 mono("f1 نازنین"),
             ),
@@ -613,7 +565,7 @@ async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if data == "a:help":
         set_st(c, "a_help")
         await q.edit_message_text(
-            "متن راهنما را بفرست (خالی=پیش‌فرض).\nفعلی:\n%s" % (sget("help_text") or "—"),
+            "متن راهنما را بفرست.\nفعلی:\n%s" % (sget("help_text") or "—"),
             reply_markup=InlineKeyboardMarkup([[btn("🔙 پنل", "a:home", "danger")]]),
         )
         return
@@ -621,7 +573,7 @@ async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if data == "a:startw":
         set_st(c, "a_startw")
         await q.edit_message_text(
-            "متن استارت پیوی را بفرست.\nفعلی:\n%s" % sget("default_welcome", ""),
+            "متن استارت را بفرست.\nفعلی:\n%s" % sget("default_welcome", ""),
             reply_markup=InlineKeyboardMarkup([[btn("🔙 پنل", "a:home", "danger")]]),
         )
         return
@@ -629,10 +581,25 @@ async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if data == "a:weltxt":
         set_st(c, "a_weltxt")
         await q.edit_message_text(
-            "متن خوش‌آمد ممبر جدید را بفرست.\n%s\n\nفعلی:\n%s" % (VARS_HELP, sget("member_welcome", "")),
+            "متن خوش‌آمد ممبر:\n%s\n\nفعلی:\n%s" % (VARS_HELP, sget("member_welcome", "")),
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[btn("🔙 پنل", "a:home", "danger")]]),
         )
+        return
+
+    if data == "a:welmedia":
+        set_st(c, "a_welmedia")
+        mt = sget("welcome_media_type") or "—"
+        await q.edit_message_text(
+            "🖼 یک عکس یا گیف برای خوش‌آمد بفرست.\nنوع فعلی: %s" % mt,
+            reply_markup=InlineKeyboardMarkup([[btn("🔙 پنل", "a:home", "danger")]]),
+        )
+        return
+
+    if data == "a:welclear":
+        sset("welcome_media_type", "")
+        sset("welcome_media_id", "")
+        await q.edit_message_text("مدیا خوش‌آمد پاک شد.", reply_markup=admin_kb())
         return
 
     if data == "a:settings":
@@ -666,8 +633,7 @@ async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if data == "a:gift":
         set_st(c, "a_gift")
         await q.edit_message_text(
-            "فرمت:\n" + mono("کد مبلغ تعداد روز") + "\n"
-            + "گپ خاص:\n" + mono("کد مبلغ تعداد روز chat_id"),
+            "فرمت:\n" + mono("کد مبلغ تعداد روز") + "\nگپ خاص:\n" + mono("کد مبلغ تعداد روز chat_id"),
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[btn("🔙 پنل", "a:home", "danger")]]),
         )
@@ -730,7 +696,13 @@ async def do_voice(update: Update, context: ContextTypes.DEFAULT_TYPE, body: str
     if sget("gender_lock", "0") == "1":
         gender = sget("locked_gender", "f1")
     speed = uu["speed"] or "normal"
-    reply_to = msg.reply_to_message.message_id if msg.reply_to_message else msg.message_id
+
+    # ریپلای حتماً روی پیام هدف (کسی که روش ریپلای شده)
+    if msg.reply_to_message is not None:
+        reply_to = msg.reply_to_message.message_id
+    else:
+        reply_to = msg.message_id
+
     tmp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
     path = tmp.name
     tmp.close()
@@ -743,10 +715,18 @@ async def do_voice(update: Update, context: ContextTypes.DEFAULT_TYPE, body: str
             )
         uu2 = get_user(user.id)
         sl = {"slow": "آرام", "fast": "سریع"}.get(speed, "عادی")
-        cap = render_tpl(sget("caption", "🎙 این ویس از طرف {mention}"), user, voice_label(gender), sl, uu2["tokens"], getattr(chat, "title", "") or "")
+        cap = render_tpl(
+            sget("caption", "🎙 این ویس از طرف {mention}"),
+            user, voice_label(gender), sl, uu2["tokens"], getattr(chat, "title", "") or "",
+        )
         with open(path, "rb") as f:
             sent = await context.bot.send_voice(
-                chat_id=chat.id, voice=f, caption=cap, parse_mode="HTML", reply_to_message_id=reply_to,
+                chat_id=chat.id,
+                voice=f,
+                caption=cap,
+                parse_mode="HTML",
+                reply_to_message_id=reply_to,
+                allow_sending_without_reply=True,
             )
         try:
             await context.bot.set_message_reaction(chat.id, sent.message_id, reaction="🎙")
@@ -770,56 +750,6 @@ async def do_voice(update: Update, context: ContextTypes.DEFAULT_TYPE, body: str
             pass
 
 
-async def handle_mod(update, context) -> bool:
-    if sget("mod_enabled", "1") != "1":
-        return False
-    msg = update.effective_message
-    chat = update.effective_chat
-    user = update.effective_user
-    if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
-        return False
-    text = (msg.text or "").strip()
-    low = text.lower()
-    if low in ("سیک", "بن", "ban"):
-        cmd = "ban"
-    elif low in ("سکوت", "mute"):
-        cmd = "mute"
-    else:
-        return False
-    if not await is_group_admin(context.bot, chat.id, user.id):
-        return True
-    if not await bot_can_restrict(context.bot, chat.id):
-        return True
-    if not msg.reply_to_message or not msg.reply_to_message.from_user:
-        return True
-    target = msg.reply_to_message.from_user
-    if target.is_bot:
-        return True
-    if await is_group_admin(context.bot, chat.id, target.id):
-        try:
-            await msg.reply_text("این فرد ادمین است.")
-        except Exception:
-            pass
-        return True
-    try:
-        if cmd == "ban":
-            await context.bot.ban_chat_member(chat.id, target.id)
-            await msg.reply_text("بن شد.")
-        else:
-            await context.bot.restrict_chat_member(
-                chat.id, target.id,
-                permissions=ChatPermissions(can_send_messages=False),
-                until_date=int(time.time()) + 3600,
-            )
-            await msg.reply_text("یک ساعت سکوت.")
-    except Exception as e:
-        try:
-            await msg.reply_text("خطا: " + str(e)[:100])
-        except Exception:
-            pass
-    return True
-
-
 async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not u.message or not u.message.text:
         return
@@ -834,8 +764,6 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
         return
 
     if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
-        if await handle_mod(u, c):
-            return
         body = parse_voice_cmd(text)
         if body:
             await do_voice(u, c, body)
@@ -885,14 +813,14 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
         if kind == "a_cap":
             sset("caption", text)
             clear_st(c)
-            await u.message.reply_text("✅ کپشن ذخیره شد:\n" + text, reply_markup=admin_kb())
+            await u.message.reply_text("✅ کپشن ذخیره شد", reply_markup=admin_kb())
             return
         if kind == "a_vname":
             parts = text.split(None, 1)
             if len(parts) == 2 and parts[0] in ENGINE:
                 sset("voice_" + parts[0], parts[1][:32])
                 clear_st(c)
-                await u.message.reply_text("✅ اسم %s شد: %s" % (parts[0], parts[1][:32]), reply_markup=admin_kb())
+                await u.message.reply_text("✅ %s = %s" % (parts[0], parts[1][:32]), reply_markup=admin_kb())
             else:
                 await u.message.reply_text("فرمت: f1 اسم")
             return
@@ -904,12 +832,15 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
         if kind == "a_startw":
             sset("default_welcome", text)
             clear_st(c)
-            await u.message.reply_text("✅ متن استارت ذخیره شد", reply_markup=admin_kb())
+            await u.message.reply_text("✅ استارت ذخیره شد", reply_markup=admin_kb())
             return
         if kind == "a_weltxt":
             sset("member_welcome", text)
             clear_st(c)
-            await u.message.reply_text("✅ خوش‌آمد ذخیره شد", reply_markup=admin_kb())
+            await u.message.reply_text("✅ متن خوش‌آمد ذخیره شد", reply_markup=admin_kb())
+            return
+        if kind == "a_welmedia":
+            await u.message.reply_text("عکس یا گیف بفرست (نه متن).")
             return
         if kind == "a_set":
             m = re.match(r"(\w+)\s+(.+)", text)
@@ -1003,27 +934,65 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await do_voice(u, c, body)
 
 
+async def on_media(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """عکس/گیف برای خوش‌آمد از ادمین."""
+    if not u.message or not u.effective_user:
+        return
+    if not is_admin(u.effective_user.id):
+        return
+    if u.effective_chat.type != ChatType.PRIVATE:
+        return
+    st = get_st(c)
+    if not st or st["kind"] != "a_welmedia":
+        return
+    msg = u.message
+    if msg.photo:
+        fid = msg.photo[-1].file_id
+        sset("welcome_media_type", "photo")
+        sset("welcome_media_id", fid)
+        clear_st(c)
+        await msg.reply_text("✅ عکس خوش‌آمد ذخیره شد", reply_markup=admin_kb())
+        return
+    if msg.animation:
+        sset("welcome_media_type", "animation")
+        sset("welcome_media_id", msg.animation.file_id)
+        clear_st(c)
+        await msg.reply_text("✅ گیف خوش‌آمد ذخیره شد", reply_markup=admin_kb())
+        return
+    if msg.document and (msg.document.mime_type or "").startswith("image/"):
+        sset("welcome_media_type", "photo")
+        sset("welcome_media_id", msg.document.file_id)
+        clear_st(c)
+        await msg.reply_text("✅ تصویر ذخیره شد", reply_markup=admin_kb())
+        return
+    await msg.reply_text("فقط عکس یا گیف بفرست.")
+
+
 async def on_new_member(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if sget("welcome_enabled", "1") != "1":
         return
     chat = u.effective_chat
     if not chat or chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         return
-    tpl = sget("member_welcome", "سلام {mention} خوش آمدی")
-    members = []
-    if u.message and u.message.new_chat_members:
-        members = u.message.new_chat_members
-    if not members:
+    if not u.message or not u.message.new_chat_members:
         return
-    for mem in members:
+    tpl = sget("member_welcome", "سلام {mention} خوش آمدی")
+    mtype = (sget("welcome_media_type") or "").strip()
+    mid = (sget("welcome_media_id") or "").strip()
+    for mem in u.message.new_chat_members:
         if mem.is_bot:
             continue
         ensure_user(mem)
         text = render_tpl(tpl, mem, chat_title=chat.title or "")
         try:
-            await c.bot.send_message(chat.id, text, parse_mode="HTML")
+            if mtype == "photo" and mid:
+                await c.bot.send_photo(chat.id, mid, caption=text, parse_mode="HTML")
+            elif mtype == "animation" and mid:
+                await c.bot.send_animation(chat.id, mid, caption=text, parse_mode="HTML")
+            else:
+                await c.bot.send_message(chat.id, text, parse_mode="HTML")
         except Exception:
-            pass
+            log.exception("welcome")
 
 
 async def cmd_addgroup(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -1034,7 +1003,10 @@ async def cmd_addgroup(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await u.message.reply_text("فقط در گپ")
         return
     with tx() as conn:
-        conn.execute("INSERT OR REPLACE INTO groups(chat_id,title,active) VALUES (?,?,1)", (chat.id, chat.title or str(chat.id)))
+        conn.execute(
+            "INSERT OR REPLACE INTO groups(chat_id,title,active) VALUES (?,?,1)",
+            (chat.id, chat.title or str(chat.id)),
+        )
     await u.message.reply_text("گپ اضافه شد.")
 
 
@@ -1089,12 +1061,19 @@ def main():
             except Exception:
                 pass
 
+    async def safe_media(update, context):
+        try:
+            await on_media(update, context)
+        except Exception:
+            log.exception("media")
+
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("addgroup", cmd_addgroup))
     app.add_handler(CommandHandler("admin", open_admin_cmd))
     app.add_handler(CallbackQueryHandler(safe_cb))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_member))
+    app.add_handler(MessageHandler(filters.PHOTO | filters.ANIMATION | filters.Document.IMAGE, safe_media))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, safe_text))
     log.info("voice bot up")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True, bootstrap_retries=10)
