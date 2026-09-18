@@ -664,13 +664,31 @@ async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
         return
 
 
+def resolve_reply_to(msg):
+    """آیدی پیامی که باید ویس روی آن ریپلای شود."""
+    if not msg:
+        return None
+    # ریپلای معمولی تلگرام
+    rtm = getattr(msg, "reply_to_message", None)
+    if rtm is not None and getattr(rtm, "message_id", None):
+        return int(rtm.message_id)
+    # ریپلای خارجی (نسخه‌های جدید API)
+    ext = getattr(msg, "external_reply", None)
+    if ext is not None and getattr(ext, "message_id", None):
+        return int(ext.message_id)
+    return None
+
+
 async def do_voice(update: Update, context: ContextTypes.DEFAULT_TYPE, body: str):
-    msg = update.effective_message
+    # همیشه از message اصلی استفاده کن نه effective_message جایگزین
+    msg = update.message or update.effective_message
     user = update.effective_user
     chat = update.effective_chat
+    if not msg or not user or not chat:
+        return
     ensure_user(user)
     uu = get_user(user.id)
-    if int(uu["blocked"] or 0):
+    if not uu or int(uu["blocked"] or 0):
         return
     if chat.type != ChatType.PRIVATE and not group_allowed(chat.id):
         return
@@ -697,11 +715,19 @@ async def do_voice(update: Update, context: ContextTypes.DEFAULT_TYPE, body: str
         gender = sget("locked_gender", "f1")
     speed = uu["speed"] or "normal"
 
-    # ریپلای حتماً روی پیام هدف (کسی که روش ریپلای شده)
-    if msg.reply_to_message is not None:
-        reply_to = msg.reply_to_message.message_id
-    else:
-        reply_to = msg.message_id
+    # اگر روی کسی ریپلای شده → ویس روی همان پیام او
+    # اگر نه → روی پیام خود فرستنده
+    target_reply_id = resolve_reply_to(msg)
+    if target_reply_id is None:
+        target_reply_id = int(msg.message_id)
+
+    log.info(
+        "voice reply_to=%s has_reply=%s chat=%s from=%s",
+        target_reply_id,
+        bool(getattr(msg, "reply_to_message", None)),
+        chat.id,
+        user.id,
+    )
 
     tmp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
     path = tmp.name
@@ -715,26 +741,50 @@ async def do_voice(update: Update, context: ContextTypes.DEFAULT_TYPE, body: str
             )
         uu2 = get_user(user.id)
         sl = {"slow": "آرام", "fast": "سریع"}.get(speed, "عادی")
+        # کپشن همچنان از طرف سازنده ویس (کسی که - زد)
         cap = render_tpl(
             sget("caption", "🎙 این ویس از طرف {mention}"),
             user, voice_label(gender), sl, uu2["tokens"], getattr(chat, "title", "") or "",
         )
+
+        send_kw = dict(
+            chat_id=chat.id,
+            caption=cap,
+            parse_mode="HTML",
+            reply_to_message_id=target_reply_id,
+            allow_sending_without_reply=True,
+        )
+        # تاپیک‌ها / فروم
+        thread_id = getattr(msg, "message_thread_id", None)
+        if thread_id:
+            send_kw["message_thread_id"] = thread_id
+
         with open(path, "rb") as f:
-            sent = await context.bot.send_voice(
-                chat_id=chat.id,
-                voice=f,
-                caption=cap,
-                parse_mode="HTML",
-                reply_to_message_id=reply_to,
-                allow_sending_without_reply=True,
-            )
+            send_kw["voice"] = f
+            try:
+                sent = await context.bot.send_voice(**send_kw)
+            except TypeError:
+                # نسخه‌های قدیمی‌تر بدون allow_sending_without_reply
+                send_kw.pop("allow_sending_without_reply", None)
+                f.seek(0)
+                sent = await context.bot.send_voice(**send_kw)
+            except Exception as e:
+                # اگر ریپلای روی پیام هدف خطا داد، یک‌بار بدون ریپلای هدف روی همان چت بفرست
+                log.warning("send_voice reply failed: %s — retry", e)
+                send_kw.pop("reply_to_message_id", None)
+                send_kw.pop("allow_sending_without_reply", None)
+                f.seek(0)
+                sent = await context.bot.send_voice(**send_kw)
+
         try:
             await context.bot.set_message_reaction(chat.id, sent.message_id, reaction="🎙")
         except Exception:
             pass
+
+        # حذف پیام -متن بعد از ارسال ویس (نیاز به ادمین بودن ربات)
         if chat.type != ChatType.PRIVATE and await bot_can_delete(context.bot, chat.id):
             try:
-                await msg.delete()
+                await context.bot.delete_message(chat.id, msg.message_id)
             except Exception:
                 pass
     except Exception as e:
