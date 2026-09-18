@@ -1,28 +1,34 @@
 # -*- coding: utf-8 -*-
-"""ربات ردیابی کلیک لینک — چند لینک، آمار، اعلان لحظه‌ای"""
+"""بات ویس گروهی + پیوی تنظیمات + توکن/امتیاز/رفرال/مدیریت گپ"""
 from __future__ import annotations
-import re, time, logging, sqlite3, threading, secrets, string
+import os, re, time, logging, sqlite3, threading, tempfile, secrets
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 
-from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    ReplyKeyboardMarkup, KeyboardButton, InputFile,
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, MessageHandler,
     ContextTypes, filters,
 )
-from telegram.constants import ChatType
+from telegram.constants import ChatType, ChatMemberStatus
 from telegram.request import HTTPXRequest
 
-BOT_TOKEN = "8948581158:AAF7KaVHQf4wu_CIJi9XxVD5cNF3LNycXU0"
+BOT_TOKEN = "8932340319:AAEEKFbUFWBo_3Bc3NSYy_r8QhrVvXBy1Uk"
 ADMIN_ID = 7530457395
-DB_PATH = "clicks.db"
+DB_PATH = "voice_bot.db"
 TZ = timezone(timedelta(hours=3, minutes=30))
 
+VOICES = {
+    "f1": ("fa-IR-DilaraNeural", "زن ۱ — دلارا"),
+    "f2": ("fa-IR-DilaraNeural", "زن ۲ — دلارا"),
+    "m1": ("fa-IR-FaridNeural", "مرد ۱ — فرید"),
+    "m2": ("fa-IR-FaridNeural", "مرد ۲ — فرید"),
+}
+FEMALE = {"f1", "f2"}
+MALE = {"m1", "m2"}
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("clicks")
+log = logging.getLogger("voicebot")
 _lock = threading.RLock()
 
 # ─── DB ───
@@ -48,48 +54,60 @@ def tx():
 def init_db():
     with tx() as c:
         c.executescript("""
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY, value TEXT
-        );
-        CREATE TABLE IF NOT EXISTS admins (
-            user_id INTEGER PRIMARY KEY
-        );
-        CREATE TABLE IF NOT EXISTS links (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            code TEXT UNIQUE NOT NULL,
-            name TEXT NOT NULL,
-            welcome TEXT DEFAULT '',
-            active INTEGER DEFAULT 1,
-            created_at REAL
-        );
-        CREATE TABLE IF NOT EXISTS clicks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            link_id INTEGER NOT NULL,
-            user_id INTEGER NOT NULL,
+        CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE IF NOT EXISTS admins (user_id INTEGER PRIMARY KEY);
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY,
             username TEXT DEFAULT '',
             name TEXT DEFAULT '',
-            bio TEXT DEFAULT '',
-            photo_file_id TEXT DEFAULT '',
-            click_count INTEGER DEFAULT 1,
-            first_at REAL,
-            last_at REAL,
-            UNIQUE(link_id, user_id)
+            gender TEXT DEFAULT 'f1',
+            speed TEXT DEFAULT 'normal',
+            tokens INTEGER DEFAULT 0,
+            tokens_day TEXT DEFAULT '',
+            points INTEGER DEFAULT 0,
+            voices_total INTEGER DEFAULT 0,
+            level INTEGER DEFAULT 1,
+            last_voice REAL DEFAULT 0,
+            referred_by INTEGER,
+            blocked INTEGER DEFAULT 0,
+            joined_at REAL
+        );
+        CREATE TABLE IF NOT EXISTS groups (
+            chat_id INTEGER PRIMARY KEY,
+            title TEXT,
+            active INTEGER DEFAULT 1
+        );
+        CREATE TABLE IF NOT EXISTS gift_codes (
+            code TEXT PRIMARY KEY,
+            amount INTEGER,
+            uses_left INTEGER,
+            expires REAL,
+            only_chat_id INTEGER,
+            active INTEGER DEFAULT 1
+        );
+        CREATE TABLE IF NOT EXISTS gift_uses (
+            code TEXT, user_id INTEGER, PRIMARY KEY(code, user_id)
         );
         """)
         c.execute("INSERT OR IGNORE INTO admins(user_id) VALUES (?)", (ADMIN_ID,))
-        c.execute(
-            "INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)",
-            ("default_welcome", "سلام! به ربات خوش آمدی."),
-        )
+        defaults = {
+            "daily_tokens": "20",
+            "token_cost": "1",
+            "max_chars": "400",
+            "spam_sec": "5",
+            "points_per_voice": "2",
+            "token_price_points": "10",
+            "ref_tokens": "5",
+            "gender_lock": "0",
+            "locked_gender": "f1",
+            "mod_enabled": "1",
+            "caption": "🎙 این ویس از طرف {mention}",
+            "default_welcome": "سلام! از پیوی جنسیت و سرعت را تنظیم کن، بعد در گپ با -متن ویس بساز.",
+        }
+        for k, v in defaults.items():
+            c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)", (k, v))
 
-def is_admin(uid):
-    uid = int(uid)
-    if uid == ADMIN_ID:
-        return True
-    with tx() as c:
-        return bool(c.execute("SELECT 1 FROM admins WHERE user_id=?", (uid,)).fetchone())
-
-def sget(k, d=""):
+def sget(k, d=None):
     with tx() as c:
         r = c.execute("SELECT value FROM settings WHERE key=?", (k,)).fetchone()
         return r["value"] if r else d
@@ -98,30 +116,55 @@ def sset(k, v):
     with tx() as c:
         c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES (?,?)", (k, str(v)))
 
-def now_ts():
-    return time.time()
+def sint(k, d=0):
+    try:
+        return int(float(sget(k, d)))
+    except Exception:
+        return int(d)
 
-def fmt_dt(ts):
-    if not ts:
-        return "—"
-    return datetime.fromtimestamp(float(ts), TZ).strftime("%Y/%m/%d %H:%M:%S")
+def is_admin(uid):
+    uid = int(uid)
+    if uid == ADMIN_ID:
+        return True
+    with tx() as c:
+        return bool(c.execute("SELECT 1 FROM admins WHERE user_id=?", (uid,)).fetchone())
 
-def gen_code(n=8):
-    alphabet = string.ascii_letters + string.digits
-    return "".join(secrets.choice(alphabet) for _ in range(n))
+def today_str():
+    return datetime.now(TZ).strftime("%Y-%m-%d")
+
+def ensure_user(user):
+    if not user or getattr(user, "is_bot", False):
+        return
+    now = time.time()
+    day = today_str()
+    daily = sint("daily_tokens", 20)
+    with tx() as c:
+        r = c.execute("SELECT * FROM users WHERE id=?", (user.id,)).fetchone()
+        if not r:
+            c.execute(
+                """INSERT INTO users(id,username,name,tokens,tokens_day,joined_at)
+                   VALUES (?,?,?,?,?,?)""",
+                (user.id, user.username or "", user.full_name or str(user.id), daily, day, now),
+            )
+        else:
+            c.execute(
+                "UPDATE users SET username=?, name=? WHERE id=?",
+                (user.username or "", user.full_name or str(user.id), user.id),
+            )
+            if (r["tokens_day"] or "") != day:
+                # سطح روی سقف روزانه اثر دارد
+                bonus = max(0, (int(r["level"] or 1) - 1) * 2)
+                c.execute(
+                    "UPDATE users SET tokens=?, tokens_day=? WHERE id=?",
+                    (daily + bonus, day, user.id),
+                )
+
+def get_user(uid):
+    with tx() as c:
+        return c.execute("SELECT * FROM users WHERE id=?", (int(uid),)).fetchone()
 
 def btn(text, data):
     return InlineKeyboardButton(str(text)[:64], callback_data=str(data)[:64])
-
-def admin_reply_kb():
-    return ReplyKeyboardMarkup(
-        [
-            [KeyboardButton("📊 آمار"), KeyboardButton("🔗 لینک‌ها")],
-            [KeyboardButton("👆 کلیک‌ها"), KeyboardButton("⚙️ تنظیم متن")],
-            [KeyboardButton("➕ لینک جدید"), KeyboardButton("👤 ادمین‌ها")],
-        ],
-        resize_keyboard=True,
-    )
 
 def set_st(ctx, kind, extra=None):
     ctx.user_data["st"] = {"kind": kind, "extra": extra or {}, "ts": time.time()}
@@ -138,472 +181,722 @@ def get_st(ctx):
 def clear_st(ctx):
     ctx.user_data.pop("st", None)
 
-def user_label(username, name, user_id=None):
-    if username:
-        return f"@{username}"
-    if name:
-        return name
-    return str(user_id) if user_id else "—"
+def calc_level(voices_total):
+    # هر ۵۰ ویس یک سطح
+    return max(1, int(voices_total) // 50 + 1)
 
-def link_url(bot_username, code):
-    return f"https://t.me/{bot_username}?start={code}"
+def mention_html(user):
+    name = user.full_name or str(user.id)
+    return f'<a href="tg://user?id={user.id}">{name}</a>'
 
-async def fetch_profile(bot, user_id):
-    """عکس و بیو تا حد ممکن."""
-    photo_id = ""
-    bio = ""
+def render_caption(template, user, gender_label, speed_label, tokens_left, chat_title=""):
+    t = template or "🎙 این ویس از طرف {mention}"
+    rep = {
+        "{mention}": mention_html(user),
+        "{name}": user.full_name or "",
+        "{username}": ("@" + user.username) if user.username else "",
+        "{id}": str(user.id),
+        "{gender}": gender_label,
+        "{speed}": speed_label,
+        "{date}": datetime.now(TZ).strftime("%Y/%m/%d"),
+        "{time}": datetime.now(TZ).strftime("%H:%M"),
+        "{chat}": chat_title or "",
+        "{tokens_left}": str(tokens_left),
+    }
+    for k, v in rep.items():
+        t = t.replace(k, v)
+    return t
+
+def rate_for_speed(speed):
+    if speed == "fast":
+        return "+25%"
+    if speed == "slow":
+        return "-20%"
+    return "+0%"
+
+async def is_group_admin(bot, chat_id, user_id):
     try:
-        photos = await bot.get_user_profile_photos(user_id, limit=1)
-        if photos.total_count and photos.photos:
-            photo_id = photos.photos[0][-1].file_id
+        m = await bot.get_chat_member(chat_id, user_id)
+        return m.status in (
+            ChatMemberStatus.ADMINISTRATOR,
+            ChatMemberStatus.OWNER,
+            "administrator",
+            "creator",
+        )
+    except Exception:
+        return False
+
+async def bot_can_delete(bot, chat_id):
+    try:
+        me = await bot.get_me()
+        m = await bot.get_chat_member(chat_id, me.id)
+        if m.status in (ChatMemberStatus.OWNER, "creator"):
+            return True
+        if m.status in (ChatMemberStatus.ADMINISTRATOR, "administrator"):
+            return bool(getattr(m, "can_delete_messages", False))
     except Exception:
         pass
+    return False
+
+async def bot_can_restrict(bot, chat_id):
     try:
-        ch = await bot.get_chat(user_id)
-        bio = (getattr(ch, "bio", None) or "")[:300]
+        me = await bot.get_me()
+        m = await bot.get_chat_member(chat_id, me.id)
+        if m.status in (ChatMemberStatus.OWNER, "creator"):
+            return True
+        if m.status in (ChatMemberStatus.ADMINISTRATOR, "administrator"):
+            return bool(getattr(m, "can_restrict_members", False))
     except Exception:
         pass
-    return photo_id, bio
+    return False
+
+def group_allowed(chat_id):
+    with tx() as c:
+        n = c.execute("SELECT COUNT(*) c FROM groups WHERE active=1").fetchone()["c"]
+        if n == 0:
+            return True  # اگر لیست خالی باشد همه گپ‌ها آزاد
+        r = c.execute(
+            "SELECT 1 FROM groups WHERE chat_id=? AND active=1", (int(chat_id),)
+        ).fetchone()
+        return bool(r)
+
+async def tts_save(text, voice_id, speed, path):
+    import edge_tts
+    voice = VOICES.get(voice_id, VOICES["f1"])[0]
+    rate = rate_for_speed(speed)
+    communicate = edge_tts.Communicate(text, voice, rate=rate)
+    await communicate.save(path)
+
+# ─── UI ───
+def pm_kb(uid):
+    u = get_user(uid)
+    g = u["gender"] if u else "f1"
+    s = u["speed"] if u else "normal"
+    return InlineKeyboardMarkup([
+        [btn("🎭 جنسیت / صدا", f"pm:voice:{uid}")],
+        [btn("⚡ سرعت", f"pm:speed:{uid}")],
+        [btn("💎 وضعیت من", f"pm:status:{uid}")],
+        [btn("🛒 خرید توکن با امتیاز", f"pm:buy:{uid}")],
+        [btn("🔗 لینک دعوت", f"pm:ref:{uid}")],
+        [btn("🎁 کد هدیه", f"pm:gift:{uid}")],
+    ])
+
+def admin_kb():
+    return InlineKeyboardMarkup([
+        [btn("⚙️ تنظیمات", "a:settings"), btn("📢 گپ‌ها", "a:groups")],
+        [btn("🎁 کد هدیه", "a:gift"), btn("🚫 بلک‌لیست", "a:block")],
+        [btn("📝 قالب کپشن", "a:caption"), btn("🛡 مدیریت گپ", "a:mod")],
+        [btn("➕ واریز توکن", "a:addtok"), btn("👤 ادمین", "a:adm")],
+        [btn("📊 آمار", "a:stats"), btn("❌ بستن", "a:close")],
+    ])
 
 # ─── handlers ───
 async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
     user = u.effective_user
+    ensure_user(user)
     text = u.message.text or ""
-    parts = text.split(maxsplit=1)
-    payload = parts[1].strip() if len(parts) > 1 else ""
-
-    # ادمین بدون payload → پنل
-    if is_admin(user.id) and not payload:
-        await u.message.reply_text(
-            "🎛 پنل ادمین آماده است.",
-            reply_markup=admin_reply_kb(),
-        )
-        return
-
-    # پیدا کردن لینک
-    link = None
-    if payload:
-        with tx() as conn:
-            link = conn.execute(
-                "SELECT * FROM links WHERE code=? AND active=1", (payload,)
-            ).fetchone()
-            if not link:
-                # شاید code عددی/قدیمی
-                link = conn.execute(
-                    "SELECT * FROM links WHERE code=?", (payload,)
-                ).fetchone()
-
-    if not link:
-        # استارت عادی بدون لینک فعال
-        welcome = sget("default_welcome", "سلام! به ربات خوش آمدی.")
-        if is_admin(user.id):
-            await u.message.reply_text(welcome, reply_markup=admin_reply_kb())
-        else:
-            await u.message.reply_text(welcome)
-        return
-
-    if not int(link["active"]):
-        await u.message.reply_text("این لینک غیرفعال است.")
-        return
-
-    photo_id, bio = await fetch_profile(c.bot, user.id)
-    ts = now_ts()
-    is_new = False
-    click_count = 1
-
-    with tx() as conn:
-        row = conn.execute(
-            "SELECT * FROM clicks WHERE link_id=? AND user_id=?",
-            (link["id"], user.id),
-        ).fetchone()
-        if row:
-            conn.execute(
-                """UPDATE clicks SET
-                    username=?, name=?, bio=?, photo_file_id=COALESCE(NULLIF(?, ''), photo_file_id),
-                    click_count=click_count+1, last_at=?
-                   WHERE link_id=? AND user_id=?""",
-                (
-                    user.username or "",
-                    user.full_name or "",
-                    bio or row["bio"] or "",
-                    photo_id,
-                    ts,
-                    link["id"],
-                    user.id,
-                ),
-            )
-            click_count = int(row["click_count"]) + 1
-            is_new = False
-        else:
-            conn.execute(
-                """INSERT INTO clicks
-                (link_id,user_id,username,name,bio,photo_file_id,click_count,first_at,last_at)
-                VALUES (?,?,?,?,?,?,1,?,?)""",
-                (
-                    link["id"],
-                    user.id,
-                    user.username or "",
-                    user.full_name or "",
-                    bio,
-                    photo_id,
-                    ts,
-                    ts,
-                ),
-            )
-            is_new = True
-            click_count = 1
-
-    # متن خوش‌آمد (per لینک یا پیش‌فرض)
-    welcome = (link["welcome"] or "").strip() or sget("default_welcome", "سلام! به ربات خوش آمدی.")
-    if is_admin(user.id):
-        await u.message.reply_text(welcome, reply_markup=admin_reply_kb())
-    else:
-        await u.message.reply_text(welcome)
-
-    # اعلان به ادمین‌ها
-    label = user_label(user.username, user.full_name, user.id)
-    kind = "🆕 کلیک جدید" if is_new else "🔄 کلیک مجدد"
-    msg = (
-        f"{kind}\n"
-        f"🔗 لینک: <b>{link['name']}</b>\n"
-        f"👤 {label}\n"
-        f"📛 اسم: {user.full_name or '—'}\n"
-        f"🆔 <code>{user.id}</code>\n"
-        f"📝 بیو: {bio or '—'}\n"
-        f"👆 تعداد کلیک: <b>{click_count}</b>\n"
-        f"🕐 {fmt_dt(ts)}"
-    )
-    with tx() as conn:
-        admins = [r["user_id"] for r in conn.execute("SELECT user_id FROM admins").fetchall()]
-    if ADMIN_ID not in admins:
-        admins.append(ADMIN_ID)
-    for aid in admins:
-        try:
-            if photo_id:
-                await c.bot.send_photo(int(aid), photo_id, caption=msg, parse_mode="HTML")
-            else:
-                await c.bot.send_message(int(aid), msg, parse_mode="HTML")
-        except Exception:
+    m = re.search(r"ref[_-]?(\d+)", text)
+    if m:
+        ref = int(m.group(1))
+        if ref != user.id:
+            with tx() as conn:
+                uu = conn.execute("SELECT referred_by FROM users WHERE id=?", (user.id,)).fetchone()
+                if uu and not uu["referred_by"]:
+                    conn.execute("UPDATE users SET referred_by=? WHERE id=?", (ref, user.id))
+                    reward = sint("ref_tokens", 5)
+                    conn.execute(
+                        "UPDATE users SET tokens=tokens+? WHERE id=?", (reward, ref)
+                    )
             try:
-                await c.bot.send_message(int(aid), msg, parse_mode="HTML")
+                await c.bot.send_message(ref, f"🎉 دعوت موفق! +{sint('ref_tokens',5)} توکن")
             except Exception:
                 pass
 
-
-async def show_stats(u, c):
-    with tx() as conn:
-        unique = conn.execute("SELECT COUNT(*) c FROM clicks").fetchone()["c"]
-        total = conn.execute("SELECT COALESCE(SUM(click_count),0) s FROM clicks").fetchone()["s"]
-        day_start = datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
-        today = conn.execute(
-            "SELECT COUNT(*) c FROM clicks WHERE last_at>=?", (day_start,)
-        ).fetchone()["c"]
-        links = conn.execute("SELECT * FROM links ORDER BY id DESC").fetchall()
-    lines = [
-        "📊 <b>آمار کلی</b>",
-        f"👥 کاربران یکتا: <b>{unique}</b>",
-        f"👆 مجموع کلیک: <b>{total}</b>",
-        f"📅 فعال امروز: <b>{today}</b>",
-        "",
-        "🔗 به‌ازای هر لینک:",
-    ]
-    with tx() as conn:
-        for lk in links:
-            st = "🟢" if lk["active"] else "🔴"
-            uq = conn.execute(
-                "SELECT COUNT(*) c FROM clicks WHERE link_id=?", (lk["id"],)
-            ).fetchone()["c"]
-            sm = conn.execute(
-                "SELECT COALESCE(SUM(click_count),0) s FROM clicks WHERE link_id=?",
-                (lk["id"],),
-            ).fetchone()["s"]
-            lines.append(f"{st} <b>{lk['name']}</b> — یکتا {uq} | کلیک {sm}")
-    await u.message.reply_text("\n".join(lines), parse_mode="HTML", reply_markup=admin_reply_kb())
-
-
-async def show_links(u, c):
-    me = await c.bot.get_me()
-    with tx() as conn:
-        links = conn.execute("SELECT * FROM links ORDER BY id DESC").fetchall()
-    if not links:
-        await u.message.reply_text(
-            "لینکی نیست. «➕ لینک جدید» را بزن.",
-            reply_markup=admin_reply_kb(),
-        )
+    if u.effective_chat.type != ChatType.PRIVATE:
+        await u.message.reply_text("تنظیمات در پیوی ربات است. پیوی را استارت کن.")
         return
-    for lk in links:
-        url = link_url(me.username, lk["code"])
-        st = "🟢 فعال" if lk["active"] else "🔴 خاموش"
-        text = (
-            f"🔗 <b>{lk['name']}</b>\n"
-            f"{st}\n"
-            f"کد: <code>{lk['code']}</code>\n"
-            f"لینک:\n<code>{url}</code>"
-        )
-        kb = InlineKeyboardMarkup([
-            [
-                btn("📋 کپی لینک", f"l:copy:{lk['id']}"),
-                btn("📤 خروجی", f"l:export:{lk['id']}"),
-            ],
-            [
-                btn("👆 کلیک‌ها", f"l:clicks:{lk['id']}"),
-                btn("🟢/🔴", f"l:tog:{lk['id']}"),
-            ],
-            [btn("🗑 حذف", f"l:del:{lk['id']}")],
-        ])
-        await u.message.reply_text(text, parse_mode="HTML", reply_markup=kb)
 
-
-async def show_clicks(u, c, link_id=None, page=0):
-    limit = 8
-    offset = page * limit
-    with tx() as conn:
-        if link_id:
-            rows = conn.execute(
-                "SELECT * FROM clicks WHERE link_id=? ORDER BY last_at DESC LIMIT ? OFFSET ?",
-                (link_id, limit, offset),
-            ).fetchall()
-            total = conn.execute(
-                "SELECT COUNT(*) c FROM clicks WHERE link_id=?", (link_id,)
-            ).fetchone()["c"]
-            lk = conn.execute("SELECT name FROM links WHERE id=?", (link_id,)).fetchone()
-            title = lk["name"] if lk else "—"
-        else:
-            rows = conn.execute(
-                "SELECT c.*, l.name AS link_name FROM clicks c LEFT JOIN links l ON l.id=c.link_id ORDER BY c.last_at DESC LIMIT ? OFFSET ?",
-                (limit, offset),
-            ).fetchall()
-            total = conn.execute("SELECT COUNT(*) c FROM clicks").fetchone()["c"]
-            title = "همه"
-    if not rows:
-        await u.message.reply_text("کلیکی ثبت نشده.", reply_markup=admin_reply_kb())
-        return
-    lines = [f"👆 کلیک‌ها — {title} (صفحه {page+1})\n"]
-    for r in rows:
-        label = user_label(r["username"], r["name"], r["user_id"])
-        lname = r["link_name"] if "link_name" in r.keys() else ""
-        extra = f" | 🔗 {lname}" if lname else ""
-        lines.append(
-            f"• {label}{extra}\n"
-            f"  👆 {r['click_count']} بار | آخرین: {fmt_dt(r['last_at'])}\n"
-            f"  اولین: {fmt_dt(r['first_at'])}"
-        )
-    kb_rows = []
-    nav = []
-    if page > 0:
-        nav.append(btn("◀️ قبل", f"c:page:{link_id or 0}:{page-1}"))
-    if offset + limit < total:
-        nav.append(btn("بعد ▶️", f"c:page:{link_id or 0}:{page+1}"))
-    if nav:
-        kb_rows.append(nav)
+    welcome = sget("default_welcome", "سلام!")
+    uu = get_user(user.id)
     await u.message.reply_text(
-        "\n".join(lines),
-        reply_markup=InlineKeyboardMarkup(kb_rows) if kb_rows else admin_reply_kb(),
+        f"{welcome}\n\n"
+        f"💎 توکن: {uu['tokens']} | ⭐ امتیاز: {uu['points']} | 📶 سطح: {uu['level']}\n"
+        f"در گپ بنویس: <code>-متن ویس</code>",
+        parse_mode="HTML",
+        reply_markup=pm_kb(user.id),
     )
-
-
-async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    if not u.message or not u.message.text:
-        return
-    user = u.effective_user
-    text = u.message.text.strip()
-    chat = u.effective_chat
-
-    if not is_admin(user.id):
-        # غیر ادمین فقط استارت
-        return
-
-    if chat.type != ChatType.PRIVATE:
-        return
-
-    st = get_st(c)
-
-    # state machine
-    if st:
-        kind = st["kind"]
-        if kind == "new_link_name":
-            set_st(c, "new_link_welcome", {"name": text[:64]})
-            await u.message.reply_text(
-                "متن خوش‌آمد این لینک را بفرست (یا بفرست: - برای متن پیش‌فرض):",
-                reply_markup=admin_reply_kb(),
-            )
-            return
-        if kind == "new_link_welcome":
-            name = st["extra"]["name"]
-            welcome = "" if text.strip() == "-" else text[:1000]
-            code = gen_code(10)
-            with tx() as conn:
-                # کد یکتا
-                for _ in range(5):
-                    try:
-                        conn.execute(
-                            "INSERT INTO links(code,name,welcome,active,created_at) VALUES (?,?,?,1,?)",
-                            (code, name, welcome, now_ts()),
-                        )
-                        break
-                    except sqlite3.IntegrityError:
-                        code = gen_code(10)
-            clear_st(c)
-            me = await c.bot.get_me()
-            url = link_url(me.username, code)
-            await u.message.reply_text(
-                f"✅ لینک ساخته شد\n"
-                f"نام: <b>{name}</b>\n"
-                f"<code>{url}</code>",
-                parse_mode="HTML",
-                reply_markup=admin_reply_kb(),
-            )
-            return
-        if kind == "set_welcome":
-            sset("default_welcome", text[:1000])
-            clear_st(c)
-            await u.message.reply_text("✅ متن پیش‌فرض ذخیره شد.", reply_markup=admin_reply_kb())
-            return
-        if kind == "add_admin":
-            try:
-                aid = int(re.sub(r"\D", "", text) or "0")
-            except Exception:
-                aid = 0
-            if aid < 1000:
-                await u.message.reply_text("آیدی نامعتبر.", reply_markup=admin_reply_kb())
-                return
-            with tx() as conn:
-                conn.execute("INSERT OR IGNORE INTO admins(user_id) VALUES (?)", (aid,))
-            clear_st(c)
-            await u.message.reply_text(f"✅ ادمین {aid} اضافه شد.", reply_markup=admin_reply_kb())
-            return
-
-    # menu
-    if text in ("📊 آمار", "آمار"):
-        await show_stats(u, c)
-        return
-    if text in ("🔗 لینک‌ها", "لینک‌ها", "لینک ها"):
-        await show_links(u, c)
-        return
-    if text in ("👆 کلیک‌ها", "کلیک‌ها", "کلیک ها"):
-        await show_clicks(u, c)
-        return
-    if text in ("➕ لینک جدید", "لینک جدید"):
-        set_st(c, "new_link_name")
-        await u.message.reply_text("نام لینک را بفرست (مثلاً: استوری۱):")
-        return
-    if text in ("⚙️ تنظیم متن", "تنظیم متن"):
-        set_st(c, "set_welcome")
-        await u.message.reply_text(
-            f"متن فعلی:\n{sget('default_welcome')}\n\nمتن جدید را بفرست:"
-        )
-        return
-    if text in ("👤 ادمین‌ها", "ادمین‌ها"):
-        with tx() as conn:
-            ads = conn.execute("SELECT user_id FROM admins").fetchall()
-        await u.message.reply_text(
-            "ادمین‌ها:\n" + "\n".join(str(a["user_id"]) for a in ads),
-            reply_markup=InlineKeyboardMarkup([
-                [btn("➕ افزودن ادمین", "adm:add")],
-            ]),
-        )
-        return
-    if text in ("پنل", "/admin", "admin"):
-        await u.message.reply_text("🎛 پنل ادمین", reply_markup=admin_reply_kb())
-        return
 
 
 async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
     q = u.callback_query
     data = q.data or ""
     user = u.effective_user
-    if not is_admin(user.id):
-        await q.answer("دسترسی نداری", show_alert=True)
+    ensure_user(user)
+
+    if data == "a:close":
+        await q.answer()
+        try:
+            await q.message.delete()
+        except Exception:
+            pass
         return
+
+    # ownership pm
+    if data.startswith("pm:"):
+        try:
+            if int(data.split(":")[-1]) != user.id:
+                await q.answer("برای تو نیست", show_alert=True)
+                return
+        except Exception:
+            pass
+
     await q.answer()
 
-    if data == "adm:add":
-        set_st(c, "add_admin")
-        await q.message.reply_text("آیدی عددی ادمین جدید:")
+    if data.startswith("pm:voice:"):
+        lock = sget("gender_lock", "0") == "1"
+        rows = []
+        if lock:
+            lg = sget("locked_gender", "f1")
+            rows.append([btn("قفل ادمین: " + VOICES.get(lg, VOICES["f1"])[1], "noop")])
+        else:
+            for vid, (_, label) in VOICES.items():
+                rows.append([btn(label, f"pm:setv:{vid}:{user.id}")])
+        rows.append([btn("🔙", f"pm:home:{user.id}")])
+        await q.edit_message_text("صدا / جنسیت:", reply_markup=InlineKeyboardMarkup(rows))
         return
 
-    if data.startswith("l:copy:"):
-        lid = int(data.split(":")[2])
-        me = await c.bot.get_me()
-        with tx() as conn:
-            lk = conn.execute("SELECT * FROM links WHERE id=?", (lid,)).fetchone()
-        if not lk:
-            await q.answer("نیست", show_alert=True)
+    if data.startswith("pm:setv:"):
+        parts = data.split(":")
+        vid, uid = parts[2], int(parts[3])
+        if user.id != uid:
             return
-        url = link_url(me.username, lk["code"])
-        await q.message.reply_text(
-            f"📋 لینک <b>{lk['name']}</b>:\n<code>{url}</code>",
+        if sget("gender_lock", "0") == "1":
+            await q.answer("جنسیت توسط ادمین قفل است", show_alert=True)
+            return
+        if vid not in VOICES:
+            return
+        with tx() as conn:
+            conn.execute("UPDATE users SET gender=? WHERE id=?", (vid, user.id))
+        await q.edit_message_text("✅ صدا تنظیم شد: " + VOICES[vid][1], reply_markup=pm_kb(user.id))
+        return
+
+    if data.startswith("pm:speed:"):
+        rows = [
+            [btn("🐢 آرام", f"pm:sets:slow:{user.id}")],
+            [btn("🚶 عادی", f"pm:sets:normal:{user.id}")],
+            [btn("⚡ سریع", f"pm:sets:fast:{user.id}")],
+            [btn("🔙", f"pm:home:{user.id}")],
+        ]
+        await q.edit_message_text("سرعت حرف زدن:", reply_markup=InlineKeyboardMarkup(rows))
+        return
+
+    if data.startswith("pm:sets:"):
+        parts = data.split(":")
+        sp, uid = parts[2], int(parts[3])
+        if user.id != uid:
+            return
+        with tx() as conn:
+            conn.execute("UPDATE users SET speed=? WHERE id=?", (sp, user.id))
+        await q.edit_message_text("✅ سرعت تنظیم شد.", reply_markup=pm_kb(user.id))
+        return
+
+    if data.startswith("pm:status:"):
+        uu = get_user(user.id)
+        gl = VOICES.get(uu["gender"], VOICES["f1"])[1]
+        sl = {"slow": "آرام", "fast": "سریع"}.get(uu["speed"], "عادی")
+        await q.edit_message_text(
+            f"💎 توکن: <b>{uu['tokens']}</b>\n"
+            f"⭐ امتیاز: <b>{uu['points']}</b>\n"
+            f"📶 سطح: <b>{uu['level']}</b>\n"
+            f"🎙 ویس کل: <b>{uu['voices_total']}</b>\n"
+            f"🎭 {gl}\n⚡ {sl}",
             parse_mode="HTML",
+            reply_markup=pm_kb(user.id),
         )
         return
 
-    if data.startswith("l:tog:"):
-        lid = int(data.split(":")[2])
+    if data.startswith("pm:buy:"):
+        price = sint("token_price_points", 10)
+        uu = get_user(user.id)
+        if int(uu["points"]) < price:
+            await q.answer(f"امتیاز کم است (نیاز {price})", show_alert=True)
+            return
         with tx() as conn:
-            cur = conn.execute("SELECT active,name FROM links WHERE id=?", (lid,)).fetchone()
-            if cur:
-                conn.execute(
-                    "UPDATE links SET active=? WHERE id=?",
-                    (0 if cur["active"] else 1, lid),
-                )
-                st = "خاموش" if cur["active"] else "روشن"
-                await q.message.reply_text(f"لینک «{cur['name']}» {st} شد.")
-        return
-
-    if data.startswith("l:del:"):
-        lid = int(data.split(":")[2])
-        with tx() as conn:
-            conn.execute("DELETE FROM clicks WHERE link_id=?", (lid,))
-            conn.execute("DELETE FROM links WHERE id=?", (lid,))
-        await q.message.reply_text("لینک و کلیک‌هایش حذف شد.")
-        return
-
-    if data.startswith("l:export:"):
-        lid = int(data.split(":")[2])
-        with tx() as conn:
-            lk = conn.execute("SELECT name FROM links WHERE id=?", (lid,)).fetchone()
-            rows = conn.execute(
-                "SELECT user_id,username,name,click_count,first_at,last_at,bio FROM clicks WHERE link_id=? ORDER BY last_at DESC",
-                (lid,),
-            ).fetchall()
-        lines = [f"# خروجی لینک: {lk['name'] if lk else lid}", f"# تعداد: {len(rows)}", ""]
-        for r in rows:
-            label = user_label(r["username"], r["name"], r["user_id"])
-            lines.append(
-                f"{label} | id={r['user_id']} | clicks={r['click_count']} | "
-                f"first={fmt_dt(r['first_at'])} | last={fmt_dt(r['last_at'])}"
+            conn.execute(
+                "UPDATE users SET points=points-?, tokens=tokens+1 WHERE id=?",
+                (price, user.id),
             )
-        text = "\n".join(lines)
-        if len(text) < 3500:
-            await q.message.reply_text(f"<code>{text}</code>", parse_mode="HTML")
+        await q.answer("۱ توکن خریدی", show_alert=True)
+        uu = get_user(user.id)
+        await q.edit_message_text(
+            f"✅ خرید انجام شد\n💎 {uu['tokens']} | ⭐ {uu['points']}",
+            reply_markup=pm_kb(user.id),
+        )
+        return
+
+    if data.startswith("pm:ref:"):
+        me = await c.bot.get_me()
+        link = f"https://t.me/{me.username}?start=ref{user.id}"
+        await q.edit_message_text(
+            f"🔗 لینک دعوت:\n<code>{link}</code>\nپاداش: {sint('ref_tokens',5)} توکن",
+            parse_mode="HTML",
+            reply_markup=pm_kb(user.id),
+        )
+        return
+
+    if data.startswith("pm:gift:"):
+        set_st(c, "gift")
+        await q.edit_message_text("کد هدیه را بفرست:")
+        return
+
+    if data.startswith("pm:home:"):
+        await q.edit_message_text("منوی تنظیمات:", reply_markup=pm_kb(user.id))
+        return
+
+    # admin
+    if data.startswith("a:") and not is_admin(user.id):
+        await q.answer("دسترسی نداری", show_alert=True)
+        return
+
+    if data == "a:settings":
+        await q.edit_message_text(
+            f"daily_tokens={sget('daily_tokens')}\n"
+            f"token_cost={sget('token_cost')}\n"
+            f"max_chars={sget('max_chars')}\n"
+            f"spam_sec={sget('spam_sec')}\n"
+            f"points_per_voice={sget('points_per_voice')}\n"
+            f"token_price_points={sget('token_price_points')}\n"
+            f"ref_tokens={sget('ref_tokens')}\n"
+            f"gender_lock={sget('gender_lock')} locked={sget('locked_gender')}\n\n"
+            "بفرست مثلا:\n<code>spam_sec 8</code>\n<code>daily_tokens 30</code>\n"
+            "<code>gender_lock 1</code>\n<code>locked_gender m1</code>",
+            parse_mode="HTML",
+            reply_markup=admin_kb(),
+        )
+        set_st(c, "a_set")
+        return
+
+    if data == "a:caption":
+        set_st(c, "a_cap")
+        await q.edit_message_text(
+            f"قالب فعلی:\n{sget('caption')}\n\n"
+            "متغیرها: {{mention}} {{name}} {{username}} {{id}} {{gender}} {{speed}} {{date}} {{time}} {{chat}} {{tokens_left}}",
+            reply_markup=admin_kb(),
+        )
+        return
+
+    if data == "a:mod":
+        cur = sget("mod_enabled", "1")
+        sset("mod_enabled", "0" if cur == "1" else "1")
+        await q.edit_message_text(
+            f"مدیریت گپ (سیک/بن/سکوت): {'خاموش' if cur=='1' else 'روشن'}",
+            reply_markup=admin_kb(),
+        )
+        return
+
+    if data == "a:groups":
+        set_st(c, "a_grp")
+        with tx() as conn:
+            rows = conn.execute("SELECT * FROM groups").fetchall()
+        lines = ["گپ‌های مجاز (خالی=همه):\n"] + [
+            f"{'✅' if r['active'] else '❌'} {r['title']} | {r['chat_id']}" for r in rows
+        ]
+        await q.edit_message_text(
+            "\n".join(lines) + "\n\nآیدی گپ را بفرست برای افزودن/حذف\nدر گپ: /addgroup",
+            reply_markup=admin_kb(),
+        )
+        return
+
+    if data == "a:gift":
+        set_st(c, "a_gift")
+        await q.edit_message_text(
+            "فرمت:\n<code>کد مبلغ تعداد روز [chat_id]</code>\n"
+            "مثال: <code>MEOW 10 50 7</code>\n"
+            "با گپ خاص: <code>MEOW 10 50 7 -100123</code>",
+            parse_mode="HTML",
+            reply_markup=admin_kb(),
+        )
+        return
+
+    if data == "a:block":
+        set_st(c, "a_block")
+        await q.edit_message_text("آیدی برای بلاک/آنبلاک:", reply_markup=admin_kb())
+        return
+
+    if data == "a:addtok":
+        set_st(c, "a_addtok")
+        await q.edit_message_text("آیدی تعداد_توکن\n<code>123456 20</code>", parse_mode="HTML", reply_markup=admin_kb())
+        return
+
+    if data == "a:adm":
+        set_st(c, "a_adm")
+        await q.edit_message_text("ادمین + آیدی / ادمین - آیدی", reply_markup=admin_kb())
+        return
+
+    if data == "a:stats":
+        with tx() as conn:
+            uc = conn.execute("SELECT COUNT(*) c FROM users").fetchone()["c"]
+            vt = conn.execute("SELECT SUM(voices_total) s FROM users").fetchone()["s"] or 0
+        await q.edit_message_text(f"کاربران: {uc}\nویس کل: {vt}", reply_markup=admin_kb())
+        return
+
+
+async def do_voice(update: Update, context: ContextTypes.DEFAULT_TYPE, body: str):
+    msg = update.effective_message
+    user = update.effective_user
+    chat = update.effective_chat
+    ensure_user(user)
+    uu = get_user(user.id)
+
+    if int(uu["blocked"] or 0):
+        return
+    if chat.type != ChatType.PRIVATE and not group_allowed(chat.id):
+        return
+
+    cost = sint("token_cost", 1)
+    if int(uu["tokens"]) < cost:
+        try:
+            await msg.reply_text("توکن کافی نداری. پیوی ربات: دریافت روزانه / خرید / کد هدیه")
+        except Exception:
+            pass
+        return
+
+    spam = sint("spam_sec", 5)
+    if spam > 0 and float(uu["last_voice"] or 0) + spam > time.time():
+        left = int(float(uu["last_voice"]) + spam - time.time())
+        try:
+            await msg.reply_text(f"کمی صبر کن ({left} ثانیه)")
+        except Exception:
+            pass
+        return
+
+    max_c = sint("max_chars", 400)
+    if len(body) > max_c:
+        body = body[:max_c]
+
+    # gender lock
+    gender = uu["gender"] or "f1"
+    if sget("gender_lock", "0") == "1":
+        gender = sget("locked_gender", "f1")
+    speed = uu["speed"] or "normal"
+
+    reply_to = msg.reply_to_message.message_id if msg.reply_to_message else msg.message_id
+
+    tmp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
+    path = tmp.name
+    tmp.close()
+    try:
+        await tts_save(body, gender, speed, path)
+        with tx() as conn:
+            conn.execute(
+                "UPDATE users SET tokens=tokens-?, points=points+?, voices_total=voices_total+1, last_voice=?, level=? WHERE id=?",
+                (
+                    cost,
+                    sint("points_per_voice", 2),
+                    time.time(),
+                    calc_level(int(uu["voices_total"]) + 1),
+                    user.id,
+                ),
+            )
+        uu2 = get_user(user.id)
+        gl = VOICES.get(gender, VOICES["f1"])[1]
+        sl = {"slow": "آرام", "fast": "سریع"}.get(speed, "عادی")
+        cap = render_caption(
+            sget("caption", "🎙 این ویس از طرف {mention}"),
+            user, gl, sl, int(uu2["tokens"]),
+            getattr(chat, "title", "") or "",
+        )
+        with open(path, "rb") as f:
+            sent = await context.bot.send_voice(
+                chat_id=chat.id,
+                voice=f,
+                caption=cap,
+                parse_mode="HTML",
+                reply_to_message_id=reply_to,
+            )
+        try:
+            await context.bot.set_message_reaction(chat.id, sent.message_id, reaction="🎙")
+        except Exception:
+            pass
+        # delete original if possible
+        if chat.type != ChatType.PRIVATE and await bot_can_delete(context.bot, chat.id):
+            try:
+                await msg.delete()
+            except Exception:
+                pass
+    except Exception as e:
+        log.exception("voice")
+        try:
+            await msg.reply_text("⚠️ خطا: " + str(e)[:100])
+        except Exception:
+            pass
+    finally:
+        try:
+            os.unlink(path)
+        except Exception:
+            pass
+
+
+async def handle_mod(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """True اگر پیام مدیریتی بود و مصرف شد."""
+    if sget("mod_enabled", "1") != "1":
+        return False
+    msg = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+    if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return False
+    text = (msg.text or "").strip()
+    if not text:
+        return False
+
+    # فقط یک کلمه یا خیلی کوتاه
+    low = text.lower()
+    cmd = None
+    if low in ("سیک", "بن", "ban"):
+        cmd = "ban"
+    elif low in ("سکوت", "mute"):
+        cmd = "mute"
+    else:
+        return False
+
+    # فقط ادمین گپ
+    if not await is_group_admin(context.bot, chat.id, user.id):
+        return True  # نادیده — جواب نده
+
+    if not await bot_can_restrict(context.bot, chat.id):
+        # بات ادمین نیست → هیچ جوابی نده
+        return True
+
+    if not msg.reply_to_message or not msg.reply_to_message.from_user:
+        return True  # بدون ریپلای نادیده
+
+    target = msg.reply_to_message.from_user
+    if target.is_bot:
+        return True
+    if await is_group_admin(context.bot, chat.id, target.id):
+        try:
+            await msg.reply_text("این فرد ادمین است.")
+        except Exception:
+            pass
+        return True
+
+    try:
+        if cmd == "ban":
+            await context.bot.ban_chat_member(chat.id, target.id)
+            await msg.reply_text("کاربر بن شد.")
         else:
-            path = f"/tmp/export_{lid}.txt"
-            open(path, "w", encoding="utf-8").write(text)
-            await q.message.reply_document(document=open(path, "rb"), filename=f"export_{lid}.txt")
+            # mute 1 hour
+            until = int(time.time()) + 3600
+            await context.bot.restrict_chat_member(
+                chat.id,
+                target.id,
+                permissions=ChatPermissions(can_send_messages=False),
+                until_date=until,
+            )
+            await msg.reply_text("یک ساعت سکوت اعمال شد.")
+    except Exception as e:
+        try:
+            await msg.reply_text("خطا: " + str(e)[:100])
+        except Exception:
+            pass
+    return True
+
+
+async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    if not u.message or not u.message.text:
+        return
+    user = u.effective_user
+    chat = u.effective_chat
+    text = u.message.text.strip()
+    ensure_user(user)
+
+    # mod commands in groups
+    if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+        if await handle_mod(u, c):
+            return
+        # voice
+        if text.startswith("-"):
+            body = text[1:].strip()
+            if body:
+                await do_voice(u, c, body)
+            return
         return
 
-    if data.startswith("l:clicks:"):
-        lid = int(data.split(":")[2])
-        # reuse message as trigger
-        class Fake:
-            message = q.message
-        await show_clicks(Fake(), c, link_id=lid, page=0)
+    # private
+    if chat.type != ChatType.PRIVATE:
         return
 
-    if data.startswith("c:page:"):
-        parts = data.split(":")
-        lid = int(parts[2])
-        page = int(parts[3])
-        class Fake:
-            message = q.message
-        await show_clicks(Fake(), c, link_id=lid if lid else None, page=page)
+    low = re.sub(r"^/", "", text).strip().lower()
+    st = get_st(c)
+
+    if low in ("پنل", "admin") and is_admin(user.id):
+        clear_st(c)
+        await u.message.reply_text("🎛 پنل ادمین", reply_markup=admin_kb())
         return
+
+    if low in ("منو", "start"):
+        await u.message.reply_text("منو:", reply_markup=pm_kb(user.id))
+        return
+
+    if st and st["kind"] == "gift":
+        code = text.strip().upper()
+        with tx() as conn:
+            g = conn.execute(
+                "SELECT * FROM gift_codes WHERE code=? AND active=1", (code,)
+            ).fetchone()
+            if not g or int(g["uses_left"]) < 1:
+                await u.message.reply_text("کد نامعتبر")
+                clear_st(c)
+                return
+            if g["expires"] and float(g["expires"]) < time.time():
+                await u.message.reply_text("کد منقضی شده")
+                clear_st(c)
+                return
+            if g["only_chat_id"]:
+                await u.message.reply_text(
+                    "این کد فقط داخل گپ خاص قابل استفاده است. کد را در همان گپ بفرست."
+                )
+                clear_st(c)
+                return
+            if conn.execute(
+                "SELECT 1 FROM gift_uses WHERE code=? AND user_id=?", (code, user.id)
+            ).fetchone():
+                await u.message.reply_text("قبلاً استفاده کردی")
+                clear_st(c)
+                return
+            conn.execute("UPDATE gift_codes SET uses_left=uses_left-1 WHERE code=?", (code,))
+            conn.execute("INSERT INTO gift_uses(code,user_id) VALUES (?,?)", (code, user.id))
+            conn.execute("UPDATE users SET tokens=tokens+? WHERE id=?", (int(g["amount"]), user.id))
+        clear_st(c)
+        await u.message.reply_text(f"✅ +{g['amount']} توکن")
+        return
+
+    # gift in group with only_chat_id — handled below in group? skip for brevity in group as text starting without -
+
+    if st and is_admin(user.id):
+        kind = st["kind"]
+        if kind == "a_set":
+            m = re.match(r"(\w+)\s+(.+)", text)
+            if m and m.group(1) in (
+                "daily_tokens", "token_cost", "max_chars", "spam_sec",
+                "points_per_voice", "token_price_points", "ref_tokens",
+                "gender_lock", "locked_gender",
+            ):
+                sset(m.group(1), m.group(2).strip())
+                clear_st(c)
+                await u.message.reply_text("OK", reply_markup=admin_kb())
+            return
+        if kind == "a_cap":
+            sset("caption", text)
+            clear_st(c)
+            await u.message.reply_text("قالب ذخیره شد", reply_markup=admin_kb())
+            return
+        if kind == "a_grp":
+            try:
+                cid = int(text.strip())
+            except ValueError:
+                await u.message.reply_text("آیدی عددی")
+                return
+            with tx() as conn:
+                r = conn.execute("SELECT 1 FROM groups WHERE chat_id=?", (cid,)).fetchone()
+                if r:
+                    conn.execute("DELETE FROM groups WHERE chat_id=?", (cid,))
+                    await u.message.reply_text("حذف شد", reply_markup=admin_kb())
+                else:
+                    conn.execute(
+                        "INSERT INTO groups(chat_id,title,active) VALUES (?,?,1)",
+                        (cid, str(cid)),
+                    )
+                    await u.message.reply_text("افزودن شد", reply_markup=admin_kb())
+            clear_st(c)
+            return
+        if kind == "a_gift":
+            parts = text.split()
+            if len(parts) >= 4:
+                code, amount, uses, days = parts[0].upper(), parts[1], parts[2], parts[3]
+                only = int(parts[4]) if len(parts) >= 5 else None
+                try:
+                    amount, uses, days = int(amount), int(uses), int(days)
+                except ValueError:
+                    await u.message.reply_text("اعداد نامعتبر")
+                    return
+                exp = time.time() + days * 86400
+                with tx() as conn:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO gift_codes(code,amount,uses_left,expires,only_chat_id,active) VALUES (?,?,?,?,?,1)",
+                        (code, amount, uses, exp, only),
+                    )
+                clear_st(c)
+                await u.message.reply_text(f"کد {code} ثبت شد", reply_markup=admin_kb())
+            return
+        if kind == "a_block":
+            try:
+                tid = int(re.sub(r"\D", "", text))
+            except Exception:
+                await u.message.reply_text("آیدی؟")
+                return
+            ensure_user(type("U", (), {"id": tid, "username": "", "full_name": str(tid), "is_bot": False})())
+            with tx() as conn:
+                cur = conn.execute("SELECT blocked FROM users WHERE id=?", (tid,)).fetchone()
+                nb = 0 if cur and cur["blocked"] else 1
+                conn.execute("UPDATE users SET blocked=? WHERE id=?", (nb, tid))
+            clear_st(c)
+            await u.message.reply_text("بلاک تغییر کرد", reply_markup=admin_kb())
+            return
+        if kind == "a_addtok":
+            parts = text.split()
+            if len(parts) >= 2:
+                try:
+                    tid, amt = int(parts[0]), int(parts[1])
+                except ValueError:
+                    await u.message.reply_text("نامعتبر")
+                    return
+                ensure_user(type("U", (), {"id": tid, "username": "", "full_name": str(tid), "is_bot": False})())
+                with tx() as conn:
+                    conn.execute("UPDATE users SET tokens=tokens+? WHERE id=?", (amt, tid))
+                clear_st(c)
+                await u.message.reply_text("OK", reply_markup=admin_kb())
+            return
+        if kind == "a_adm":
+            m = re.match(r"ادمین\s*([+-])\s*(\d+)", text)
+            if m:
+                with tx() as conn:
+                    if m.group(1) == "+":
+                        conn.execute("INSERT OR IGNORE INTO admins(user_id) VALUES (?)", (int(m.group(2)),))
+                    elif int(user.id) == ADMIN_ID:
+                        conn.execute("DELETE FROM admins WHERE user_id=?", (int(m.group(2)),))
+                clear_st(c)
+                await u.message.reply_text("OK", reply_markup=admin_kb())
+            return
+
+    # private voice test with -
+    if text.startswith("-"):
+        body = text[1:].strip()
+        if body:
+            await do_voice(u, c, body)
+        return
+
+
+async def cmd_addgroup(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(u.effective_user.id):
+        return
+    chat = u.effective_chat
+    if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await u.message.reply_text("فقط در گپ")
+        return
+    with tx() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO groups(chat_id,title,active) VALUES (?,?,1)",
+            (chat.id, chat.title or str(chat.id)),
+        )
+    await u.message.reply_text("گپ به لیست مجاز اضافه شد.")
 
 
 def main():
     init_db()
-    req = HTTPXRequest(connect_timeout=60.0, read_timeout=60.0, write_timeout=60.0, pool_timeout=60.0)
-    get_req = HTTPXRequest(connect_timeout=60.0, read_timeout=60.0, write_timeout=60.0, pool_timeout=60.0)
+    req = HTTPXRequest(connect_timeout=60.0, read_timeout=90.0, write_timeout=90.0, pool_timeout=60.0)
+    get_req = HTTPXRequest(connect_timeout=60.0, read_timeout=90.0, write_timeout=90.0, pool_timeout=60.0)
     app = (
         Application.builder()
         .token(BOT_TOKEN)
@@ -618,7 +911,7 @@ def main():
         except Exception as e:
             log.exception("text")
             try:
-                await update.effective_message.reply_text("⚠️ " + str(e)[:150])
+                await update.effective_message.reply_text("⚠️ " + str(e)[:120])
             except Exception:
                 pass
 
@@ -633,11 +926,20 @@ def main():
                 pass
 
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("addgroup", cmd_addgroup))
+    app.add_handler(CommandHandler("admin", lambda u, c: open_admin_cmd(u, c)))
     app.add_handler(CallbackQueryHandler(safe_cb))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, safe_text))
-    app.add_handler(MessageHandler(filters.COMMAND, safe_text))
-    log.info("click tracker up")
-    app.run_polling(allowed_updates=Update.ALL_TYPES, bootstrap_retries=10, drop_pending_updates=True)
+    log.info("voice bot up")
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True, bootstrap_retries=10)
+
+
+async def open_admin_cmd(u, c):
+    if not is_admin(u.effective_user.id):
+        return
+    if u.effective_chat.type != ChatType.PRIVATE:
+        return
+    await u.message.reply_text("🎛 پنل ادمین", reply_markup=admin_kb())
 
 
 if __name__ == "__main__":
