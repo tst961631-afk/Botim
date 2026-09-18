@@ -547,15 +547,10 @@ async def do_voice(update, context, body):
             pass
         return
     body = body[: sint("max_chars", 400)]
-    user_lang = (uu["lang"] if "lang" in uu.keys() else None) or "fa"
-    # ترجمه متن به زبان انتخابی کاربر
-    body = translate_text(body, user_lang)
+    # بدون ترجمه — همان متن کاربر با صدای انتخابی خوانده می‌شود
     gender = uu["gender"] or "fa_f"
     if sget("gender_lock", "0") == "1":
         gender = sget("locked_gender", "fa_f")
-    else:
-        # صدای مطابق زبان منو
-        gender = voice_for_lang(user_lang, gender)
     speed = uu["speed"] or "normal"
     target = getattr(msg, "reply_to_message", None)
     path = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False).name
