@@ -261,11 +261,28 @@ def group_allowed(chat_id):
         return bool(r)
 
 async def tts_save(text, voice_id, speed, path):
-    import edge_tts
+    """اول edge-tts؛ اگر نبود gTTS."""
     voice = VOICES.get(voice_id, VOICES["f1"])[0]
     rate = rate_for_speed(speed)
-    communicate = edge_tts.Communicate(text, voice, rate=rate)
-    await communicate.save(path)
+    try:
+        import edge_tts
+        communicate = edge_tts.Communicate(text, voice, rate=rate)
+        await communicate.save(path)
+        return
+    except ImportError:
+        log.warning("edge_tts not installed, fallback gTTS")
+    except Exception as e:
+        log.warning("edge_tts failed: %s — fallback gTTS", e)
+
+    # fallback
+    try:
+        from gtts import gTTS
+        tts = gTTS(text=text, lang="fa")
+        tts.save(path)
+    except ImportError:
+        raise RuntimeError(
+            "هیچ موتور ویسی نصب نیست. اجرا کن: pip install edge-tts"
+        )
 
 # ─── UI ───
 def pm_kb(uid):
