@@ -37,8 +37,8 @@ from telegram.ext import (
 # CONFIG - ONLY CHANGE THESE TWO VALUES
 # ============================================================
 
-BOT_TOKEN = "PASTE_YOUR_BOT_TOKEN_HERE"
-OWNER_ID = 123456789
+BOT_TOKEN = "8948581158:AAF7KaVHQf4wu_CIJi9XxVD5cNF3LNycXU0"
+OWNER_ID = 7530457395
 
 # ============================================================
 
