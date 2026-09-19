@@ -11,7 +11,7 @@ from telegram.ext import (
 )
 from telegram.constants import ChatType, MessageEntityType
 
-BOT_TOKEN = "8727762178:AAGrdb5XFjhkcdoOEIFy1s8U71idRpN0DX8"
+BOT_TOKEN = "8932340319:AAEEKFbUFWBo_3Bc3NSYy_r8QhrVvXBy1Uk"
 ADMIN_ID = 7530457395
 DATA = "diamond_game.json"
 TAX = 0.01
