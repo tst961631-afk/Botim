@@ -1,1448 +1,1571 @@
 # -*- coding: utf-8 -*-
-"""
-Telegram Game Bot - Pydroid 3
-Library: python-telegram-bot 22.x
-Database: SQLite (automatic)
+"""ربات بازی الماس — نسخه کامل + دوئل + شرط تماشاچی + همگانی تأخیری"""
+from __future__ import annotations
+import json, os, re, time, logging, random, asyncio, asyncio
+from datetime import datetime, timezone, timedelta
 
-IMPORTANT:
-1) Put your BotFather token in BOT_TOKEN below.
-2) Put your Telegram numeric user ID in OWNER_ID.
-3) Install: pip install -U python-telegram-bot
-4) Run: python bot.py
-
-This bot is a game/economy bot only.
-No group moderation, anti-spam, locks, bans, or welcome system.
-The chance games are non-wagering: users do not lose points and there is no cash gambling.
-"""
-
-import logging
-import random
-import sqlite3
-import time
-from datetime import datetime
-from functools import wraps
-
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.constants import ParseMode
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application,
-    CallbackQueryHandler,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
+    Application, CommandHandler, CallbackQueryHandler, MessageHandler,
+    ContextTypes, filters,
 )
-
-# ============================================================
-# CONFIG - ONLY CHANGE THESE TWO VALUES
-# ============================================================
-
-BOT_TOKEN = "8948581158:AAF7KaVHQf4wu_CIJi9XxVD5cNF3LNycXU0"
-OWNER_ID = 7530457395
-
-# ============================================================
-
-DB_FILE = "game_bot.db"
-
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
-
-
-# ------------------------- DATABASE --------------------------
-
-def db():
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def init_db():
-    conn = db()
-    cur = conn.cursor()
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT DEFAULT '',
-            first_name TEXT DEFAULT '',
-            points INTEGER DEFAULT 0,
-            tokens INTEGER DEFAULT 0,
-            xp INTEGER DEFAULT 0,
-            level INTEGER DEFAULT 1,
-            games INTEGER DEFAULT 0,
-            lucky_plays INTEGER DEFAULT 0,
-            wins INTEGER DEFAULT 0,
-            created_at INTEGER
-        )
-    """)
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS admins (
-            user_id INTEGER PRIMARY KEY,
-            role TEXT NOT NULL,
-            added_at INTEGER
-        )
-    """)
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS transactions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            amount INTEGER NOT NULL,
-            kind TEXT NOT NULL,
-            actor_id INTEGER,
-            target_id INTEGER,
-            note TEXT DEFAULT '',
-            created_at INTEGER
-        )
-    """)
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS gift_codes (
-            code TEXT PRIMARY KEY,
-            amount INTEGER NOT NULL,
-            max_uses INTEGER NOT NULL,
-            uses INTEGER DEFAULT 0,
-            created_by INTEGER,
-            expires_at INTEGER DEFAULT 0
-        )
-    """)
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS gift_claims (
-            code TEXT,
-            user_id INTEGER,
-            claimed_at INTEGER,
-            PRIMARY KEY(code, user_id)
-        )
-    """)
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS shop (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            price INTEGER NOT NULL,
-            stock INTEGER DEFAULT -1,
-            description TEXT DEFAULT '',
-            active INTEGER DEFAULT 1
-        )
-    """)
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS purchases (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            item_id INTEGER,
-            price INTEGER,
-            created_at INTEGER
-        )
-    """)
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS lucky_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            game TEXT,
-            result TEXT,
-            reward INTEGER,
-            created_at INTEGER
-        )
-    """)
-
-    # Owner is always an owner.
-    cur.execute(
-        "INSERT OR REPLACE INTO admins(user_id, role, added_at) VALUES(?,?,?)",
-        (OWNER_ID, "owner", int(time.time()))
-    )
-
-    conn.commit()
-    conn.close()
-
-
-def register_user(tg_user):
-    conn = db()
-    now = int(time.time())
-    conn.execute("""
-        INSERT INTO users(user_id, username, first_name, created_at)
-        VALUES(?,?,?,?,?)
-        ON CONFLICT(user_id) DO UPDATE SET
-            username=excluded.username,
-            first_name=excluded.first_name
-    """, (
-        tg_user.id,
-        tg_user.username or "",
-        tg_user.first_name or "",
-        now
-    ))
-    conn.commit()
-    conn.close()
-
-
-def get_user(user_id):
-    conn = db()
-    row = conn.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
-    conn.close()
-    return row
-
-
-def change_points(user_id, amount, kind, actor_id=None, target_id=None, note=""):
-    conn = db()
-    row = conn.execute("SELECT points FROM users WHERE user_id=?", (user_id,)).fetchone()
-    if not row:
-        conn.close()
-        return False, 0
-
-    new_balance = row["points"] + amount
-    if new_balance < 0:
-        conn.close()
-        return False, row["points"]
-
-    conn.execute(
-        "UPDATE users SET points=? WHERE user_id=?",
-        (new_balance, user_id)
-    )
-    conn.execute("""
-        INSERT INTO transactions
-        (user_id, amount, kind, actor_id, target_id, note, created_at)
-        VALUES(?,?,?,?,?,?,?)
-    """, (user_id, amount, kind, actor_id, target_id, note, int(time.time())))
-    conn.commit()
-    conn.close()
-    return True, new_balance
-
-
-# -------------------------- ROLES ---------------------------
-
-ROLE_NAMES = {
-    "owner": "👑 مالک",
-    "senior": "🛡 مدیر ارشد",
-    "settings": "⚙️ مدیر تنظیمات",
-    "economy": "💰 مدیر اقتصاد",
-    "rewards": "🎁 مدیر جوایز",
-    "shop": "🏪 مدیر فروشگاه",
-    "game": "🎮 مدیر بازی",
-    "stats": "📊 مدیر آمار",
-}
-
-
-def get_role(user_id):
-    if user_id == OWNER_ID:
-        return "owner"
-    conn = db()
-    row = conn.execute("SELECT role FROM admins WHERE user_id=?", (user_id,)).fetchone()
-    conn.close()
-    return row["role"] if row else None
-
-
-def can_manage(user_id, allowed):
-    role = get_role(user_id)
-    if role == "owner":
-        return True
-    return role in allowed
-
-
-def role_label(role):
-    return ROLE_NAMES.get(role, role)
-
-
-# ------------------------- KEYBOARDS -------------------------
-
-def main_keyboard(user_id):
-    buttons = [
-        [
-            InlineKeyboardButton("🎮 بازی", callback_data="menu_games"),
-            InlineKeyboardButton("🏦 بانک", callback_data="menu_bank"),
-        ],
-        [
-            InlineKeyboardButton("🛒 فروشگاه", callback_data="menu_shop"),
-            InlineKeyboardButton("🎁 کد هدیه", callback_data="menu_gift"),
-        ],
-        [
-            InlineKeyboardButton("🏆 رتبه‌بندی", callback_data="menu_rank"),
-            InlineKeyboardButton("📊 آمار", callback_data="menu_stats"),
-        ],
-        [
-            InlineKeyboardButton("👤 پروفایل", callback_data="menu_profile"),
-            InlineKeyboardButton("📖 راهنما", callback_data="menu_help"),
-        ],
-    ]
-
-    if get_role(user_id):
-        buttons.append([
-            InlineKeyboardButton("👑 پنل مدیریت", callback_data="admin_panel")
-        ])
-
-    buttons.append([InlineKeyboardButton("❌ بستن", callback_data="close")])
-    return InlineKeyboardMarkup(buttons)
-
-
-def back_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔙 بازگشت", callback_data="main")]
-    ])
-
-
-def admin_keyboard():
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("👑 مدیران", callback_data="admin_roles"),
-            InlineKeyboardButton("💰 اقتصاد", callback_data="admin_economy"),
-        ],
-        [
-            InlineKeyboardButton("🎁 جوایز", callback_data="admin_rewards"),
-            InlineKeyboardButton("🛒 فروشگاه", callback_data="admin_shop"),
-        ],
-        [
-            InlineKeyboardButton("🎮 بازی", callback_data="admin_game"),
-            InlineKeyboardButton("📊 آمار", callback_data="admin_stats"),
-        ],
-        [InlineKeyboardButton("🔙 بازگشت", callback_data="main")],
-    ])
-
-
-# -------------------------- HELPERS --------------------------
-
-def fmt(n):
-    return f"{int(n):,}"
-
-
-def now_text():
-    return datetime.now().strftime("%Y-%m-%d %H:%M")
-
-
-def level_for_xp(xp):
-    # Simple progression: every 500 XP = one level.
-    return max(1, xp // 500 + 1)
-
-
-def add_xp(user_id, amount):
-    conn = db()
-    row = conn.execute("SELECT xp FROM users WHERE user_id=?", (user_id,)).fetchone()
-    if not row:
-        conn.close()
-        return
-    xp = row["xp"] + amount
-    level = level_for_xp(xp)
-    conn.execute("UPDATE users SET xp=?, level=? WHERE user_id=?", (xp, level, user_id))
-    conn.commit()
-    conn.close()
-
-
-def mention_user(row):
-    name = row["first_name"] or row["username"] or str(row["user_id"])
-    return name.replace("<", "").replace(">", "")
-
-
-def reply_required(func):
-    @wraps(func)
-    async def wrapper(update, context):
-        if not update.message.reply_to_message:
-            await update.message.reply_text(
-                "❗ این دستور باید با ریپلای روی پیام کاربر استفاده شود."
-            )
-            return
-        return await func(update, context)
-    return wrapper
-
-
-# --------------------------- START --------------------------
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    register_user(update.effective_user)
-    text = (
-        "🎮 <b>به بازی خوش آمدی!</b>\n\n"
-        "💰 پوینت جمع کن، بازی کن، خرید کن و رتبه‌ات را بالا ببر.\n\n"
-        "از دکمه‌های زیر استفاده کن یا در گپ دستورات متنی را بفرست."
-    )
-    await update.message.reply_text(
-        text,
-        parse_mode=ParseMode.HTML,
-        reply_markup=main_keyboard(update.effective_user.id)
-    )
-
-
-# ----------------------- PROFILE / BANK ---------------------
-
-async def show_profile(update, user_id):
-    u = get_user(user_id)
-    if not u:
-        return "❌ کاربر ثبت نشده است."
-
-    username = f"@{u['username']}" if u["username"] else "بدون یوزرنیم"
-    return (
-        f"👤 <b>پروفایل</b>\n\n"
-        f"نام: {mention_user(u)}\n"
-        f"یوزرنیم: {username}\n"
-        f"🆔 ID: <code>{u['user_id']}</code>\n\n"
-        f"💰 پوینت: <b>{fmt(u['points'])}</b>\n"
-        f"💎 توکن: <b>{fmt(u['tokens'])}</b>\n"
-        f"⭐ XP: <b>{fmt(u['xp'])}</b>\n"
-        f"🏅 Level: <b>{u['level']}</b>\n"
-        f"🎮 بازی‌ها: {fmt(u['games'])}\n"
-        f"🏆 بردها: {fmt(u['wins'])}"
-    )
-
-
-async def bank_text(user_id):
-    u = get_user(user_id)
-    return (
-        "🏦 <b>بانک</b>\n\n"
-        f"💰 موجودی: <b>{fmt(u['points'])}</b> پوینت\n"
-        f"💎 توکن: <b>{fmt(u['tokens'])}</b>\n\n"
-        "برای انتقال به کاربر، روی پیام او ریپلای کن و بنویس:\n"
-        "<code>انتقال 1000</code>"
-    )
-
-
-# --------------------------- GAMES --------------------------
-
-async def games_menu(update, context):
-    text = (
-        "🎮 <b>بازی‌ها</b>\n\n"
-        "🎲 تاس روزانه — دریافت جایزه تصادفی بدون شرط‌بندی\n"
-        "🎡 چرخ شانس — جایزه تصادفی بدون کم‌شدن موجودی\n"
-        "🎁 جعبه شانس — یک جایزه رایگان\n\n"
-        "هیچ‌کدام نیاز به پرداخت یا شرط‌بندی ندارند."
-    )
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎲 تاس روزانه", callback_data="game_dice")],
-        [InlineKeyboardButton("🎡 چرخ شانس", callback_data="game_wheel")],
-        [InlineKeyboardButton("🎁 جعبه شانس", callback_data="game_box")],
-        [InlineKeyboardButton("🔙 بازگشت", callback_data="main")],
-    ])
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
-
-
-async def play_lucky(update, context, game):
-    uid = update.effective_user.id
-    register_user(update.effective_user)
-
-    # Simple daily cooldown per game.
-    conn = db()
-    last = conn.execute("""
-        SELECT created_at FROM lucky_log
-        WHERE user_id=? AND game=?
-        ORDER BY id DESC LIMIT 1
-    """, (uid, game)).fetchone()
-
-    if last and int(time.time()) - last["created_at"] < 24 * 3600:
-        remaining = 24 * 3600 - (int(time.time()) - last["created_at"])
-        h = remaining // 3600
-        m = (remaining % 3600) // 60
-        conn.close()
-        return f"⏳ این بازی را امروز انجام داده‌ای.\nزمان باقی‌مانده: {h} ساعت و {m} دقیقه"
-
-    rewards = [100, 250, 500, 1000, 2500, 5000]
-    weights = [30, 25, 20, 12, 8, 5]
-    reward = random.choices(rewards, weights=weights, k=1)[0]
-
-    labels = {
-        "dice": "🎲 تاس روزانه",
-        "wheel": "🎡 چرخ شانس",
-        "box": "🎁 جعبه شانس",
+from telegram.constants import ChatType, MessageEntityType
+
+BOT_TOKEN = "8727762178:AAGrdb5XFjhkcdoOEIFy1s8U71idRpN0DX8"
+ADMIN_ID = 7530457395
+DATA = "diamond_game.json"
+TAX = 0.01
+GAME_TTL = 600
+TEHRAN = timezone(timedelta(hours=3, minutes=30))
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("dgame")
+
+
+def D():
+    return {
+        "admins": [ADMIN_ID],
+        "balances": {},
+        "users": {},
+        "wins": {},
+        "losses": {},
+        "emoji": "💎",
+        "premium_emoji_id": None,
+        "premium_pool": [],
+        "games": {},
+        "self_caption": "اکانت شما",
+        "hourly_use": 1,
+        "min_bet": 1,
+        "max_bet": 0,
+        "lottery": None,
+        "known_chats": [],
+        # همگانی تأخیری برای کاربران جدید
+        "grant": None,
+        "bot_bank": 0,
+        "donations": {},
+        "top1_reward": None,
+        "chat_users": {},
+        "templates": {
+            "balance": "موجودی الماس\n\n{mention}\n{emoji} {balance}",
+            "game_open": "بازی باز است\n\nشرط: {emoji} {amount}\nمیزبان: {creator}\nحالت: {mode}\n\nشرکت با دکمه سبز\nلغو فقط برای میزبان\nمهلت: ۱۰ دقیقه",
+            "game_result": "نتیجه بازی\n\nبرنده: {winner}\nبرد: {emoji} {win_amount}\n\nبازنده: {loser}\n\nشرط میز: {emoji} {amount}",
+            "transfer_ok": "انتقال انجام شد\n\nاز: {from}\nبه: {to}\n\n{emoji} {sent}",
+        },
     }
 
-    conn.execute("""
-        INSERT INTO lucky_log(user_id, game, result, reward, created_at)
-        VALUES(?,?,?,?,?)
-    """, (uid, game, str(reward), reward, int(time.time())))
-    conn.execute("""
-        UPDATE users
-        SET points=points+?, games=games+1, lucky_plays=lucky_plays+1, wins=wins+1
-        WHERE user_id=?
-    """, (reward, uid))
-    conn.commit()
-    conn.close()
 
-    add_xp(uid, 50)
+def load():
+    if os.path.exists(DATA):
+        try:
+            with open(DATA, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            b = D()
+            for k, v in b.items():
+                if k == "templates" and isinstance(d.get("templates"), dict):
+                    for tk, tv in b["templates"].items():
+                        d.setdefault("templates", {}).setdefault(tk, tv)
+                else:
+                    d.setdefault(k, v)
+            if ADMIN_ID not in [int(x) for x in d.get("admins", [])]:
+                d.setdefault("admins", []).insert(0, ADMIN_ID)
+            return d
+        except Exception as e:
+            log.error(e)
+    return D()
 
-    return (
-        f"{labels.get(game, '🎮 بازی')}\n\n"
-        f"🎉 جایزه تو: <b>{fmt(reward)}</b> پوینت\n"
-        f"💰 موجودی جدید: <b>{fmt(get_user(uid)['points'])}</b>\n"
-        f"⭐ +50 XP"
-    )
 
+def save(d):
+    with open(DATA, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=2)
 
-# ------------------------- SHOP -----------------------------
 
-async def shop_text():
-    conn = db()
-    rows = conn.execute("SELECT * FROM shop WHERE active=1 ORDER BY id").fetchall()
-    conn.close()
+def is_admin(uid):
+    return int(uid) in {int(x) for x in load().get("admins", [ADMIN_ID])}
 
-    if not rows:
-        return "🛒 <b>فروشگاه</b>\n\nفعلاً آیتمی برای فروش وجود ندارد."
 
-    lines = ["🛒 <b>فروشگاه</b>\n"]
-    for r in rows:
-        stock = "∞" if r["stock"] < 0 else fmt(r["stock"])
-        lines.append(
-            f"#{r['id']} — <b>{r['name']}</b>\n"
-            f"💰 قیمت: {fmt(r['price'])}\n"
-            f"📦 موجودی: {stock}\n"
-            f"📝 {r['description']}\n"
-            f"برای خرید: <code>خرید {r['id']}</code>\n"
-        )
-    return "\n".join(lines)
+def is_main(uid):
+    return int(uid) == ADMIN_ID
 
 
-async def buy_item(update, context, item_id):
-    uid = update.effective_user.id
-    register_user(update.effective_user)
-
-    conn = db()
-    item = conn.execute(
-        "SELECT * FROM shop WHERE id=? AND active=1", (item_id,)
-    ).fetchone()
-
-    if not item:
-        conn.close()
-        await update.message.reply_text("❌ آیتم پیدا نشد.")
-        return
-
-    if item["stock"] == 0:
-        conn.close()
-        await update.message.reply_text("❌ این آیتم تمام شده است.")
-        return
-
-    user = conn.execute("SELECT points FROM users WHERE user_id=?", (uid,)).fetchone()
-    if user["points"] < item["price"]:
-        conn.close()
-        await update.message.reply_text("❌ موجودی پوینت کافی نیست.")
-        return
-
-    conn.execute(
-        "UPDATE users SET points=points-? WHERE user_id=?",
-        (item["price"], uid)
-    )
-    if item["stock"] > 0:
-        conn.execute(
-            "UPDATE shop SET stock=stock-1 WHERE id=?", (item_id,)
-        )
-
-    conn.execute("""
-        INSERT INTO purchases(user_id,item_id,price,created_at)
-        VALUES(?,?,?,?)
-    """, (uid, item_id, item["price"], int(time.time())))
-
-    conn.execute("""
-        INSERT INTO transactions
-        (user_id, amount, kind, actor_id, target_id, note, created_at)
-        VALUES(?,?,?,?,?,?,?)
-    """, (
-        uid, -item["price"], "purchase", uid, None,
-        item["name"], int(time.time())
-    ))
-    conn.commit()
-    conn.close()
-
-    await update.message.reply_text(
-        f"✅ خرید انجام شد!\n\n"
-        f"🛒 {item['name']}\n"
-        f"💰 هزینه: {fmt(item['price'])}\n"
-        f"💳 موجودی: {fmt(get_user(uid)['points'])}"
-    )
-
-
-# ---------------------- BANK COMMANDS -----------------------
-
-@reply_required
-async def admin_deposit(update, context):
-    uid = update.effective_user.id
-    if not can_manage(uid, {"senior", "economy"}):
-        await update.message.reply_text("⛔ دسترسی نداری.")
-        return
-
-    args = context.args
-    if len(args) != 1 or not args[0].isdigit():
-        await update.message.reply_text("فرمت: واریز 50000\n(حتماً با ریپلای)")
-        return
-
-    amount = int(args[0])
-    target = update.message.reply_to_message.from_user
-    register_user(target)
-
-    ok, balance = change_points(
-        target.id, amount, "admin_deposit",
-        actor_id=uid, target_id=target.id, note="واریز توسط مدیر"
-    )
-    if not ok:
-        await update.message.reply_text("❌ تراکنش انجام نشد.")
-        return
-
-    await update.message.reply_text(
-        f"✅ واریز انجام شد.\n\n"
-        f"👤 {target.first_name}\n"
-        f"➕ {fmt(amount)} پوینت\n"
-        f"💰 موجودی جدید: {fmt(balance)}"
-    )
-
-
-@reply_required
-async def admin_withdraw(update, context):
-    uid = update.effective_user.id
-    if not can_manage(uid, {"senior", "economy"}):
-        await update.message.reply_text("⛔ دسترسی نداری.")
-        return
-
-    args = context.args
-    if len(args) != 1 or not args[0].isdigit():
-        await update.message.reply_text("فرمت: برداشت 20000\n(حتماً با ریپلای)")
-        return
-
-    amount = int(args[0])
-    target = update.message.reply_to_message.from_user
-    register_user(target)
-
-    ok, balance = change_points(
-        target.id, -amount, "admin_withdraw",
-        actor_id=uid, target_id=target.id, note="برداشت توسط مدیر"
-    )
-    if not ok:
-        await update.message.reply_text("❌ موجودی کاربر کافی نیست.")
-        return
-
-    await update.message.reply_text(
-        f"✅ برداشت انجام شد.\n\n"
-        f"👤 {target.first_name}\n"
-        f"➖ {fmt(amount)} پوینت\n"
-        f"💰 موجودی جدید: {fmt(balance)}"
-    )
-
-
-@reply_required
-async def transfer_reply(update, context):
-    sender = update.effective_user
-    register_user(sender)
-
-    args = context.args
-    if len(args) != 1 or not args[0].isdigit():
-        await update.message.reply_text(
-            "فرمت صحیح:\nانتقال 1000\n\nو باید روی پیام گیرنده ریپلای کنی."
-        )
-        return
-
-    amount = int(args[0])
-    if amount <= 0:
-        await update.message.reply_text("❌ مبلغ باید بیشتر از صفر باشد.")
-        return
-
-    target = update.message.reply_to_message.from_user
-    register_user(target)
-
-    if target.id == sender.id:
-        await update.message.reply_text("❌ نمی‌توانی به خودت انتقال بدهی.")
-        return
-
-    conn = db()
-    sender_row = conn.execute(
-        "SELECT points FROM users WHERE user_id=?", (sender.id,)
-    ).fetchone()
-
-    if sender_row["points"] < amount:
-        conn.close()
-        await update.message.reply_text("❌ موجودی کافی نیست.")
-        return
-
-    conn.execute(
-        "UPDATE users SET points=points-? WHERE user_id=?",
-        (amount, sender.id)
-    )
-    conn.execute(
-        "UPDATE users SET points=points+? WHERE user_id=?",
-        (amount, target.id)
-    )
-
-    ts = int(time.time())
-    conn.execute("""
-        INSERT INTO transactions
-        (user_id, amount, kind, actor_id, target_id, note, created_at)
-        VALUES(?,?,?,?,?,?,?)
-    """, (sender.id, -amount, "transfer_out", sender.id, target.id, "انتقال بانکی", ts))
-
-    conn.execute("""
-        INSERT INTO transactions
-        (user_id, amount, kind, actor_id, target_id, note, created_at)
-        VALUES(?,?,?,?,?,?,?)
-    """, (target.id, amount, "transfer_in", sender.id, target.id, "دریافت بانکی", ts))
-
-    conn.commit()
-    conn.close()
-
-    await update.message.reply_text(
-        f"💸 <b>انتقال بانکی</b>\n\n"
-        f"👤 فرستنده: {sender.first_name}\n"
-        f"👤 گیرنده: {target.first_name}\n"
-        f"💰 مبلغ: <b>{fmt(amount)}</b>\n\n"
-        f"✅ انتقال انجام شد.",
-        parse_mode=ParseMode.HTML
-    )
-
-
-# ------------------------- GIFTS ----------------------------
-
-async def claim_gift(update, context, code):
-    uid = update.effective_user.id
-    register_user(update.effective_user)
-
-    conn = db()
-    gift = conn.execute("SELECT * FROM gift_codes WHERE code=?", (code,)).fetchone()
-
-    if not gift:
-        conn.close()
-        await update.message.reply_text("❌ کد هدیه معتبر نیست.")
-        return
-
-    if gift["expires_at"] and gift["expires_at"] < int(time.time()):
-        conn.close()
-        await update.message.reply_text("⏰ این کد منقضی شده است.")
-        return
-
-    if gift["uses"] >= gift["max_uses"]:
-        conn.close()
-        await update.message.reply_text("❌ ظرفیت این کد تمام شده است.")
-        return
-
-    already = conn.execute(
-        "SELECT 1 FROM gift_claims WHERE code=? AND user_id=?",
-        (code, uid)
-    ).fetchone()
-
-    if already:
-        conn.close()
-        await update.message.reply_text("❌ قبلاً از این کد استفاده کرده‌ای.")
-        return
-
-    conn.execute(
-        "UPDATE users SET points=points+? WHERE user_id=?",
-        (gift["amount"], uid)
-    )
-    conn.execute(
-        "UPDATE gift_codes SET uses=uses+1 WHERE code=?", (code,)
-    )
-    conn.execute(
-        "INSERT INTO gift_claims(code,user_id,claimed_at) VALUES(?,?,?)",
-        (code, uid, int(time.time()))
-    )
-    conn.execute("""
-        INSERT INTO transactions
-        (user_id, amount, kind, actor_id, target_id, note, created_at)
-        VALUES(?,?,?,?,?,?,?)
-    """, (uid, gift["amount"], "gift", None, uid, code, int(time.time())))
-
-    conn.commit()
-    conn.close()
-
-    await update.message.reply_text(
-        f"🎁 کد قبول شد!\n\n"
-        f"➕ {fmt(gift['amount'])} پوینت\n"
-        f"💰 موجودی: {fmt(get_user(uid)['points'])}"
-    )
-
-
-# ---------------------- ADMIN COMMANDS ----------------------
-
-async def admin_panel(update, context):
-    if not get_role(update.effective_user.id):
-        await update.message.reply_text("⛔ دسترسی نداری.")
-        return
-
-    await update.message.reply_text(
-        "👑 <b>پنل مدیریت</b>\n\n"
-        "هر نقش فقط بخش مربوط به خودش را کنترل می‌کند.",
-        parse_mode=ParseMode.HTML,
-        reply_markup=admin_keyboard()
-    )
-
-
-async def add_admin(update, context):
-    uid = update.effective_user.id
-    if uid != OWNER_ID:
-        await update.message.reply_text("⛔ فقط مالک می‌تواند مدیر اضافه کند.")
-        return
-
-    if not update.message.reply_to_message:
-        await update.message.reply_text(
-            "روی پیام شخص ریپلای کن و بنویس:\n"
-            "مدیر اقتصاد"
-        )
-        return
-
-    text = normalize(update.message.text)
-    role = None
-    for key, title in [
-        ("senior", "مدیر ارشد"),
-        ("settings", "مدیر تنظیمات"),
-        ("economy", "مدیر اقتصاد"),
-        ("rewards", "مدیر جوایز"),
-        ("shop", "مدیر فروشگاه"),
-        ("game", "مدیر بازی"),
-        ("stats", "مدیر آمار"),
-    ]:
-        if title in text:
-            role = key
-            break
-
-    if not role:
-        await update.message.reply_text(
-            "نقش را مشخص کن:\n"
-            "مدیر ارشد\nمدیر تنظیمات\nمدیر اقتصاد\nمدیر جوایز\n"
-            "مدیر فروشگاه\nمدیر بازی\nمدیر آمار"
-        )
-        return
-
-    target = update.message.reply_to_message.from_user
-    register_user(target)
-
-    conn = db()
-    conn.execute(
-        "INSERT OR REPLACE INTO admins(user_id,role,added_at) VALUES(?,?,?)",
-        (target.id, role, int(time.time()))
-    )
-    conn.commit()
-    conn.close()
-
-    await update.message.reply_text(
-        f"✅ مدیر اضافه شد.\n\n"
-        f"👤 {target.first_name}\n"
-        f"👑 نقش: {role_label(role)}"
-    )
-
-
-@reply_required
-async def remove_admin(update, context):
-    if update.effective_user.id != OWNER_ID:
-        await update.message.reply_text("⛔ فقط مالک می‌تواند مدیر حذف کند.")
-        return
-
-    target = update.message.reply_to_message.from_user
-    if target.id == OWNER_ID:
-        await update.message.reply_text("❌ مالک قابل حذف نیست.")
-        return
-
-    conn = db()
-    conn.execute("DELETE FROM admins WHERE user_id=?", (target.id,))
-    conn.commit()
-    conn.close()
-
-    await update.message.reply_text(
-        f"✅ دسترسی مدیریتی {target.first_name} حذف شد."
-    )
-
-
-async def create_gift(update, context):
-    uid = update.effective_user.id
-    if not can_manage(uid, {"owner", "rewards"}):
-        await update.message.reply_text("⛔ دسترسی نداری.")
-        return
-
-    args = context.args
-    if len(args) < 3:
-        await update.message.reply_text(
-            "فرمت:\n"
-            "کدسازی CODE AMOUNT MAX_USES\n\n"
-            "مثال:\n"
-            "کدسازی KI4N2026 50000 100"
-        )
-        return
-
-    code = args[0].upper()
-    if not args[1].isdigit() or not args[2].isdigit():
-        await update.message.reply_text("❌ مبلغ و ظرفیت باید عدد باشند.")
-        return
-
-    amount = int(args[1])
-    max_uses = int(args[2])
-
-    conn = db()
+def num(n):
     try:
-        conn.execute("""
-            INSERT INTO gift_codes(code,amount,max_uses,created_by)
-            VALUES(?,?,?,?)
-        """, (code, amount, max_uses, uid))
-        conn.commit()
-    except sqlite3.IntegrityError:
-        conn.close()
-        await update.message.reply_text("❌ این کد از قبل وجود دارد.")
-        return
-    conn.close()
-
-    await update.message.reply_text(
-        f"🎁 کد ساخته شد:\n\n"
-        f"<code>{code}</code>\n"
-        f"💰 مبلغ: {fmt(amount)}\n"
-        f"👥 ظرفیت: {max_uses}",
-        parse_mode=ParseMode.HTML
-    )
+        return f"{int(n):,}"
+    except Exception:
+        return str(n)
 
 
-async def add_shop_item(update, context):
-    uid = update.effective_user.id
-    if not can_manage(uid, {"owner", "shop"}):
-        await update.message.reply_text("⛔ دسترسی نداری.")
-        return
-
-    # Format: آیتم NAME | PRICE | STOCK | DESCRIPTION
-    raw = update.message.text
-    parts = raw.split("|")
-    if len(parts) < 4:
-        await update.message.reply_text(
-            "فرمت:\n"
-            "آیتم نام | قیمت | موجودی | توضیحات\n\n"
-            "مثال:\n"
-            "آیتم VIP | 50000 | 100 | دسترسی ویژه"
-        )
-        return
-
+def short_num(n):
     try:
-        name = parts[0].replace("آیتم", "", 1).strip()
-        price = int(parts[1].strip())
-        stock = int(parts[2].strip())
-        desc = parts[3].strip()
-    except ValueError:
-        await update.message.reply_text("❌ قیمت و موجودی باید عدد باشند.")
-        return
+        n = float(n)
+    except Exception:
+        return str(n)
+    absn = abs(n)
+    for thr, suf in ((1e12, "t"), (1e9, "b"), (1e6, "m"), (1e3, "k")):
+        if absn >= thr:
+            v = n / thr
+            s = ("%g" % round(v, 1)) if v % 1 else str(int(v))
+            return s + suf
+    return str(int(n))
 
-    conn = db()
-    conn.execute(
-        "INSERT INTO shop(name,price,stock,description) VALUES(?,?,?,?)",
-        (name, price, stock, desc)
+
+def parse_amount(text):
+    t = (text or "").strip().replace(",", "").replace(" ", "").replace("،", "")
+    t = t.replace("کا", "k").replace("ک", "k").replace("م", "m").replace("ب", "b").replace("ت", "t")
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)([kmbtKMBT])?", t, re.I)
+    if not m:
+        return None
+    val = float(m.group(1))
+    suf = (m.group(2) or "").lower()
+    mul = {"": 1, "k": 1_000, "m": 1_000_000, "b": 1_000_000_000, "t": 1_000_000_000_000}.get(suf)
+    if mul is None:
+        return None
+    return int(val * mul)
+
+
+def touch_user(d, user):
+    if not user or getattr(user, "is_bot", False):
+        return
+    prev = d.get("users", {}).get(str(user.id), {})
+    d.setdefault("users", {})[str(user.id)] = {
+        "name": user.full_name or prev.get("name") or str(user.id),
+        "username": user.username or prev.get("username") or "",
+        "seen": time.time(),
+    }
+    d.setdefault("balances", {}).setdefault(str(user.id), bal(d, user.id))
+    d.setdefault("wins", {}).setdefault(str(user.id), int(d.get("wins", {}).get(str(user.id), 0)))
+    d.setdefault("losses", {}).setdefault(str(user.id), int(d.get("losses", {}).get(str(user.id), 0)))
+
+
+def track_chat(d, chat_id, user=None):
+    if not chat_id:
+        return
+    ks = d.setdefault("known_chats", [])
+    if int(chat_id) not in [int(x) for x in ks]:
+        ks.append(int(chat_id))
+    if user and not getattr(user, "is_bot", False):
+        cu = d.setdefault("chat_users", {}).setdefault(str(chat_id), [])
+        if int(user.id) not in [int(x) for x in cu]:
+            cu.append(int(user.id))
+
+
+def bal(d, uid):
+    return int(d.get("balances", {}).get(str(uid), 0))
+
+
+def set_bal(d, uid, val):
+    d.setdefault("balances", {})[str(uid)] = max(0, int(val))
+
+
+def add_bal(d, uid, delta):
+    set_bal(d, uid, bal(d, uid) + int(delta))
+    return bal(d, uid)
+
+
+def add_win(d, uid):
+    d.setdefault("wins", {})[str(uid)] = int(d.get("wins", {}).get(str(uid), 0)) + 1
+
+
+def add_loss(d, uid):
+    d.setdefault("losses", {})[str(uid)] = int(d.get("losses", {}).get(str(uid), 0)) + 1
+
+
+def all_user_ids(d):
+    ids = set(str(k) for k in d.get("balances", {}))
+    ids |= set(str(k) for k in d.get("users", {}))
+    return ids
+
+
+def top1_uid(d):
+    items = [(int(u), int(v)) for u, v in (d.get("balances") or {}).items()]
+    if not items:
+        return None
+    items.sort(key=lambda x: -x[1])
+    return items[0][0] if items[0][1] > 0 else None
+
+
+def btn(text, data, style=None):
+    kw = {"text": str(text)[:64], "callback_data": data}
+    if style in ("danger", "success", "primary"):
+        kw["style"] = style
+    try:
+        return InlineKeyboardButton(**kw)
+    except TypeError:
+        kw.pop("style", None)
+        return InlineKeyboardButton(**kw)
+
+
+def set_st(c, kind, extra=None):
+    c.user_data["st"] = {"kind": kind, "extra": extra or {}, "ts": time.time()}
+
+
+def get_st(c):
+    st = c.user_data.get("st")
+    if not st:
+        return None
+    if time.time() - st.get("ts", 0) > 900:
+        c.user_data.pop("st", None)
+        return None
+    return st
+
+
+def clear_st(c):
+    c.user_data.pop("st", None)
+
+
+def em(d):
+    pid = d.get("premium_emoji_id")
+    fb = d.get("emoji") or "💎"
+    if pid:
+        return '<tg-emoji emoji-id="%s">%s</tg-emoji>' % (pid, fb)
+    return fb
+
+
+def em_plain(d):
+    return d.get("emoji") or "💎"
+
+
+def mention_user(user):
+    return '<a href="tg://user?id=%s">%s</a>' % (user.id, user.full_name or user.id)
+
+
+def mention_id(uid, name=None):
+    if not name:
+        name = (load().get("users") or {}).get(str(uid), {}).get("name") or str(uid)
+    return '<a href="tg://user?id=%s">%s</a>' % (uid, name)
+
+
+def tpl(d, key, **kw):
+    t = (d.get("templates") or {}).get(key) or D()["templates"].get(key, "")
+    kw.setdefault("emoji", em(d))
+    for k, v in list(kw.items()):
+        t = t.replace("{%s}" % k, str(v))
+    return t
+
+
+def expiry_parts(d, uid):
+    h = max(1, int(d.get("hourly_use") or 1))
+    hours = bal(d, uid) // h
+    return hours // 24, hours % 24
+
+
+def user_info(d, uid):
+    u = (d.get("users") or {}).get(str(uid), {})
+    return {
+        "name": u.get("name") or str(uid),
+        "username": u.get("username") or "—",
+        "balance": bal(d, uid),
+    }
+
+
+def rank_in(mapping, uid):
+    items = sorted(((int(k), int(v)) for k, v in (mapping or {}).items()), key=lambda x: -x[1])
+    for i, (k, _) in enumerate(items, 1):
+        if k == int(uid):
+            return i
+    return None
+
+
+def apply_grant(d, uid):
+    """همگانی تأخیری برای کاربر جدید"""
+    g = d.get("grant")
+    if not g:
+        return 0
+    if time.time() > float(g.get("until_ts") or 0):
+        return 0
+    claimed = [int(x) for x in (g.get("claimed") or [])]
+    if int(uid) in claimed:
+        return 0
+    # فقط اگر قبلاً موجودی/ثبت جدی نداشته (اولین تعامل بعد از همگانی)
+    amt = int(g.get("amount") or 0)
+    if amt < 1:
+        return 0
+    add_bal(d, uid, amt)
+    claimed.append(int(uid))
+    g["claimed"] = claimed
+    d["grant"] = g
+    return amt
+
+
+async def announce_record(bot, d, uid, chat_id=None):
+    """اگر کاربر نفر اول شد اعلام کن"""
+    t1 = top1_uid(d)
+    if t1 is None or int(t1) != int(uid):
+        return
+    prev = d.get("last_top1")
+    if prev is not None and int(prev) == int(uid):
+        return
+    d["last_top1"] = int(uid)
+    save(d)
+    name = user_info(d, uid)["name"]
+    msg = "👑 رکورد جدید!\n%s الان نفر اول لیدربرده\n%s %s" % (
+        mention_id(uid, name), em(d), num(bal(d, uid)),
     )
-    conn.commit()
-    conn.close()
+    targets = set(int(x) for x in (d.get("known_chats") or []))
+    if chat_id:
+        targets.add(int(chat_id))
+    for cid in targets:
+        try:
+            await bot.send_message(cid, msg, parse_mode="HTML")
+        except Exception:
+            pass
 
-    await update.message.reply_text("✅ آیتم فروشگاه اضافه شد.")
+
+# ---------- keyboards ----------
+def start_kb():
+    return InlineKeyboardMarkup([
+        [btn("👤 پنل سلف", "self_panel", "primary")],
+        [btn("💰 موجودی", "my_bal", "primary")],
+        [btn("🏆 لیدربرد", "lb", "primary")],
+    ])
 
 
-# -------------------------- STATS ---------------------------
+def admin_kb():
+    return InlineKeyboardMarkup([
+        [btn("➕ واریز (آیدی)", "a_add", "success"), btn("➖ کم (آیدی)", "a_sub", "danger")],
+        [btn("📢 واریز همگانی", "a_add_all", "success")],
+        [btn("📨 پیام همگانی", "a_bcast", "primary")],
+        [btn("🔍 اسکن افراد گپ", "a_scan", "primary")],
+        [btn("🏦 بانک بات", "a_bank", "success")],
+        [btn("👑 جایزه تاپ‌۱", "a_top1", "primary")],
+        [btn("🗑 صفر کردن همه", "a_zero", "danger")],
+        [btn("🔒 قفل شرط", "a_betlock", "primary")],
+        [btn("😀 ایموجی الماس", "a_emoji", "primary")],
+        [btn("📝 کپشن پنل سلف", "a_self_cap", "primary")],
+        [btn("⏱ مصرف ساعتی", "a_hourly", "primary")],
+        [btn("🎰 قرعه‌کشی", "a_lot", "success"), btn("🚫 لغو قرعه", "a_lot_cancel", "danger")],
+        [btn("📄 قالب پیام", "a_tpl", "primary")],
+        [btn("👤 ادمین‌ها", "a_admins", "primary")],
+        [btn("❌ بستن", "close", "danger")],
+    ])
 
-async def stats_text():
-    conn = db()
-    users = conn.execute("SELECT COUNT(*) c FROM users").fetchone()["c"]
-    total_points = conn.execute("SELECT COALESCE(SUM(points),0) s FROM users").fetchone()["s"]
-    games = conn.execute("SELECT COALESCE(SUM(games),0) s FROM users").fetchone()["s"]
-    purchases = conn.execute("SELECT COUNT(*) c FROM purchases").fetchone()["c"]
-    conn.close()
 
-    return (
-        "📊 <b>آمار بازی</b>\n\n"
-        f"👥 کاربران: <b>{fmt(users)}</b>\n"
-        f"💰 مجموع پوینت کاربران: <b>{fmt(total_points)}</b>\n"
-        f"🎮 تعداد بازی‌ها: <b>{fmt(games)}</b>\n"
-        f"🛒 خریدها: <b>{fmt(purchases)}</b>"
+def tpl_kb():
+    return InlineKeyboardMarkup([
+        [btn("balance", "tpl:balance", "primary")],
+        [btn("game_open", "tpl:game_open", "primary")],
+        [btn("game_result", "tpl:game_result", "primary")],
+        [btn("transfer_ok", "tpl:transfer_ok", "primary")],
+        [btn("🔙", "a_home", "danger")],
+    ])
+
+
+def self_panel_kb(d, uid):
+    info = user_info(d, uid)
+    days, rem_h = expiry_parts(d, uid)
+    un = info["username"]
+    if un and un != "—" and not str(un).startswith("@"):
+        un = "@" + un
+    o = "sp:%s" % uid
+    wins = int(d.get("wins", {}).get(str(uid), 0))
+    losses = int(d.get("losses", {}).get(str(uid), 0))
+    rk = rank_in(d.get("balances") or {}, uid) or "—"
+    return InlineKeyboardMarkup([
+        [btn(info["name"][:28], o, "success"), btn("اسم", o, "primary")],
+        [btn(str(uid), o, "success"), btn("آیدی", o, "primary")],
+        [btn(un[:28], o, "success"), btn("یوزرنیم", o, "primary")],
+        [btn(num(info["balance"]), o, "success"), btn("موجودی", o, "primary")],
+        [btn("#%s" % rk, o, "success"), btn("رتبه", o, "primary")],
+        [btn("%s برد" % num(wins), o, "success"), btn("%s باخت" % num(losses), o, "danger")],
+        [btn("%s روز و %s ساعت" % (num(days), num(rem_h)), o, "success"), btn("انقضا", o, "primary")],
+        [btn("بازگشت", "sp_back:%s" % uid, "danger")],
+    ])
+
+
+def game_kb(d, game, gid):
+    rows = [
+        [btn("✅ شرکت", "join:%s" % gid, "success")],
+        [btn("🚫 لغو", "cancel:%s" % gid, "danger")],
+    ]
+    # شرط تماشاچی روی بازیکنان فعلی
+    for pid in game.get("players") or []:
+        name = game.get("names", {}).get(str(pid), str(pid))[:12]
+        rows.append([btn("👁 شرط روی %s" % name, "sidebet:%s:%s" % (gid, pid), "primary")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def send_self_panel(bot, chat_id, uid, d, message=None):
+    kb = self_panel_kb(d, uid)
+    info = user_info(d, uid)
+    rk = rank_in(d.get("balances") or {}, uid) or "—"
+    wins = int(d.get("wins", {}).get(str(uid), 0))
+    losses = int(d.get("losses", {}).get(str(uid), 0))
+    cap = d.get("self_caption") or "اکانت شما"
+    text = "%s\n\n%s\nرتبه #%s | برد %s | باخت %s" % (cap, info["name"], rk, num(wins), num(losses))
+    photo_id = None
+    try:
+        photos = await bot.get_user_profile_photos(int(uid), limit=1)
+        if photos.total_count > 0:
+            photo_id = photos.photos[0][-1].file_id
+    except Exception:
+        pass
+    if message:
+        try:
+            if not message.photo:
+                await message.edit_text(text, reply_markup=kb)
+                return
+        except Exception:
+            pass
+    if photo_id:
+        try:
+            await bot.send_photo(chat_id, photo=photo_id, caption=text, reply_markup=kb)
+            return
+        except Exception:
+            pass
+    await bot.send_message(chat_id, text, reply_markup=kb)
+
+
+async def notify_deposit(bot, uid, amount, d, broadcast=False):
+    new_b = bal(d, uid)
+    if broadcast:
+        text = "%s\nالماس از طرف ادمین برای کاربرا شارژ شد" % num(amount)
+    else:
+        text = "%s\nالماس از طرف مدیریت انتقال یافت" % num(amount)
+    kb = InlineKeyboardMarkup([[btn("%s %s" % (em_plain(d), num(new_b)), "noop", "primary")]])
+    try:
+        await bot.send_message(int(uid), text, reply_markup=kb)
+    except Exception:
+        pass
+
+
+async def expire_games(d):
+    now = time.time()
+    ch = False
+    for g in (d.get("games") or {}).values():
+        if g.get("status") == "open" and now - g.get("ts", now) >= GAME_TTL:
+            amount = int(g["amount"])
+            for pid in g.get("players") or []:
+                add_bal(d, pid, amount)
+            # برگشت شرط تماشاچی
+            for b in g.get("side_bets") or []:
+                add_bal(d, b["uid"], int(b["amount"]))
+            g["status"] = "expired"
+            ch = True
+    if ch:
+        save(d)
+
+
+async def maybe_top1_reward(bot, d):
+    cfg = d.get("top1_reward")
+    if not cfg:
+        return
+    hours = float(cfg.get("hours") or 0)
+    amount = int(cfg.get("amount") or 0)
+    if hours <= 0 or amount <= 0:
+        return
+    t1 = top1_uid(d)
+    if t1 is None:
+        return
+    last_pay = float(cfg.get("last_pay") or 0)
+    last_uid = cfg.get("last_uid")
+    now = time.time()
+    if last_uid is not None and int(last_uid) == int(t1) and now - last_pay >= hours * 3600:
+        add_bal(d, t1, amount)
+        cfg["last_pay"] = now
+        d["top1_reward"] = cfg
+        save(d)
+        try:
+            await bot.send_message(int(t1), "👑 جایزه ماندن در رتبه ۱\n+%s" % num(amount))
+        except Exception:
+            pass
+    elif last_uid is None or int(last_uid) != int(t1):
+        cfg["last_uid"] = int(t1)
+        cfg["last_pay"] = now
+        d["top1_reward"] = cfg
+        save(d)
+
+
+async def maybe_finish_lottery(bot, d):
+    lot = d.get("lottery")
+    if not lot or lot.get("status") != "open":
+        return
+    end_ts = lot.get("end_ts")
+    if not end_ts or time.time() < end_ts:
+        return
+    joined = list(lot.get("joined") or [])
+    nw = min(int(lot.get("winners", 1)), len(joined))
+    prize = int(lot.get("prize", 0))
+    names = []
+    if nw >= 1 and joined:
+        for w in random.sample(joined, nw):
+            add_bal(d, w, prize)
+            names.append(mention_id(w))
+    lot["status"] = "done"
+    save(d)
+    msg = "🎰 قرعه‌کشی تمام شد\n\n🏆 برنده‌ها:\n" + ("\n".join(names) if names else "—") + "\n\nهر کدام: %s %s" % (em(d), num(prize))
+    for cid in d.get("known_chats") or []:
+        try:
+            await bot.send_message(int(cid), msg, parse_mode="HTML")
+        except Exception:
+            pass
+
+
+async def finish_game(q, c, d, gid, game):
+    """انیمیشن + نتیجه + شرط تماشاچی + رکورد"""
+    players = list(game["players"])
+    amount = int(game["amount"])
+    try:
+        await q.edit_message_text("✨")
+    except Exception:
+        pass
+    await asyncio.sleep(1.6)
+    winner = random.choice(players)
+    losers = [p for p in players if p != winner]
+    pot = amount * len(players)
+    win_amount = int(pot * (1 - TAX))
+    add_bal(d, winner, win_amount)
+    add_win(d, winner)
+    for L in losers:
+        add_loss(d, L)
+    # side bets: برد روی برنده = x2 منهای کمیسیون ساده
+    side_lines = []
+    for b in game.get("side_bets") or []:
+        bu, onp, bam = int(b["uid"]), int(b["on"]), int(b["amount"])
+        if onp == winner:
+            pay = int(bam * 1.9)
+            add_bal(d, bu, pay)
+            side_lines.append("%s برد شرط %s" % (mention_id(bu), num(pay)))
+        # باخت: پولش قبلاً کسر شده
+    game["status"] = "done"
+    game["winner"] = winner
+    save(d)
+    wname = game["names"].get(str(winner), str(winner))
+    lnames = ", ".join(mention_id(L, game["names"].get(str(L))) for L in losers)
+    text = tpl(
+        d, "game_result",
+        amount=num(amount),
+        winner=mention_id(winner, wname),
+        loser=lnames,
+        win_amount=num(win_amount),
     )
+    if side_lines:
+        text += "\n\n👁 شرط تماشاچی:\n" + "\n".join(side_lines)
+    rows = [[btn("✅ %s | %s" % (wname[:14], num(bal(d, winner))), "noop", "success")]]
+    for L in losers:
+        ln = game["names"].get(str(L), str(L))
+        rows.append([btn("❌ %s | %s" % (ln[:14], num(bal(d, L))), "noop", "danger")])
+    await q.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+    pass  # no record spam
 
 
-async def rank_text():
-    conn = db()
-    rows = conn.execute("""
-        SELECT * FROM users
-        ORDER BY points DESC
-        LIMIT 10
-    """).fetchall()
-    conn.close()
-
-    if not rows:
-        return "🏆 هنوز کاربری ثبت نشده است."
-
-    lines = ["🏆 <b>۱۰ نفر برتر</b>\n"]
-    medals = ["🥇", "🥈", "🥉"]
-    for i, r in enumerate(rows, 1):
-        medal = medals[i-1] if i <= 3 else f"{i}."
-        lines.append(
-            f"{medal} {mention_user(r)} — 💰 {fmt(r['points'])}"
-        )
-    return "\n".join(lines)
+# ---------- handlers ----------
+async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    clear_st(c)
+    d = load()
+    touch_user(d, u.effective_user)
+    track_chat(d, u.effective_chat.id)
+    gamt = apply_grant(d, u.effective_user.id)
+    save(d)
+    extra = ""
+    if gamt:
+        extra = "\n🎁 همگانی: +%s" % num(gamt)
+    if u.effective_chat.type != ChatType.PRIVATE:
+        await u.message.reply_text("گپ: بازی | دعوت | موجودی | انتقال | لیدربرد | وینرها | لوزرها | سلف" + extra)
+        return
+    await u.message.reply_text("سلام 👋" + extra, reply_markup=start_kb())
 
 
-async def transaction_history(user_id):
-    conn = db()
-    rows = conn.execute("""
-        SELECT * FROM transactions
-        WHERE user_id=?
-        ORDER BY id DESC
-        LIMIT 15
-    """, (user_id,)).fetchall()
-    conn.close()
-
-    if not rows:
-        return "📜 هنوز تراکنشی ثبت نشده است."
-
-    lines = ["📜 <b>آخرین تراکنش‌ها</b>\n"]
-    for r in rows:
-        sign = "+" if r["amount"] > 0 else ""
-        lines.append(
-            f"{sign}{fmt(r['amount'])} — {r['kind']}"
-            + (f" — {r['note']}" if r["note"] else "")
-        )
-    return "\n".join(lines)
+async def cmd_admin(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    if u.effective_chat.type != ChatType.PRIVATE or not is_admin(u.effective_user.id):
+        return
+    clear_st(c)
+    await u.message.reply_text("🎛 پنل ادمین", reply_markup=admin_kb())
 
 
-# ------------------------ TEXT PARSER -----------------------
+async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    q = u.callback_query
+    data = q.data or ""
+    d = load()
+    user = q.from_user
+    touch_user(d, user)
+    gamt = apply_grant(d, user.id)
+    save(d)
+    await expire_games(d)
+    await maybe_finish_lottery(c.bot, d)
+    await maybe_top1_reward(c.bot, d)
+    d = load()
 
-def normalize(text):
-    return (
-        text.replace("ي", "ی")
-        .replace("ى", "ی")
-        .replace("ك", "ک")
-        .strip()
-    )
-
-
-async def text_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
+    if data.startswith("sp:"):
+        if user.id != int(data.split(":")[1]):
+            await q.answer("تو دسترسی بهش نداری", show_alert=True)
+            return
+        await q.answer()
         return
 
-    register_user(update.effective_user)
-    text = normalize(update.message.text)
-    low = text.lower()
-
-    # Do not interfere with regular conversation.
-    if low in {"منو", "پنل", "شروع"}:
-        await start(update, context)
-        return
-
-    if low in {"راهنما", "help", "/help"}:
-        await help_command(update, context)
-        return
-
-    if low in {"پروفایل", "پروفایل من"}:
-        await update.message.reply_text(
-            await show_profile(update, update.effective_user.id),
-            parse_mode=ParseMode.HTML
-        )
-        return
-
-    if low in {"موجودی", "بانک"}:
-        await update.message.reply_text(
-            await bank_text(update.effective_user.id),
-            parse_mode=ParseMode.HTML
-        )
-        return
-
-    if low == "بازی":
-        await games_menu(update, context)
-        return
-
-    if low == "فروشگاه":
-        await update.message.reply_text(
-            await shop_text(),
-            parse_mode=ParseMode.HTML
-        )
-        return
-
-    if low == "رتبه":
-        await update.message.reply_text(
-            await rank_text(),
-            parse_mode=ParseMode.HTML
-        )
-        return
-
-    if low == "آمار":
-        await update.message.reply_text(
-            await stats_text(),
-            parse_mode=ParseMode.HTML
-        )
-        return
-
-    if low in {"تاریخچه", "تاریخچه بانک"}:
-        await update.message.reply_text(
-            await transaction_history(update.effective_user.id),
-            parse_mode=ParseMode.HTML
-        )
-        return
-
-    if low.startswith("انتقال "):
-        # Let dedicated command-style handler logic run here.
-        args = text.split()
-        if len(args) == 2:
-            context.args = args[1:]
-            await transfer_reply(update, context)
+    if data.startswith("sp_back:"):
+        if user.id != int(data.split(":")[1]):
+            await q.answer("تو دسترسی بهش نداری", show_alert=True)
+            return
+        await q.answer()
+        if u.effective_chat.type == ChatType.PRIVATE:
+            try:
+                await q.edit_message_text("منو:", reply_markup=start_kb())
+            except Exception:
+                pass
         else:
-            await update.message.reply_text("فرمت: انتقال 1000 (با ریپلای)")
+            try:
+                await q.message.delete()
+            except Exception:
+                pass
         return
 
-    if low.startswith("واریز "):
-        args = text.split()
-        if len(args) == 2:
-            context.args = args[1:]
-            await admin_deposit(update, context)
-        return
-
-    if low.startswith("برداشت "):
-        args = text.split()
-        if len(args) == 2:
-            context.args = args[1:]
-            await admin_withdraw(update, context)
-        return
-
-    if low.startswith("خرید "):
-        args = text.split()
-        if len(args) == 2 and args[1].isdigit():
-            await buy_item(update, context, int(args[1]))
-        return
-
-    if low.startswith("کد "):
-        args = text.split()
-        if len(args) == 2:
-            await claim_gift(update, context, args[1].upper())
-        return
-
-    if low.startswith("مدیر ") or low.startswith("مدیر ارشد"):
-        await add_admin(update, context)
-        return
-
-    if low == "حذف مدیر":
-        await remove_admin(update, context)
-        return
-
-    if low.startswith("کدسازی "):
-        context.args = text.split()[1:]
-        await create_gift(update, context)
-        return
-
-    if low.startswith("آیتم "):
-        await add_shop_item(update, context)
-        return
-
-
-# --------------------------- HELP ---------------------------
-
-async def help_command(update, context):
-    text = (
-        "📖 <b>راهنمای کامل</b>\n\n"
-        "👤 <b>کاربری</b>\n"
-        "• پروفایل\n"
-        "• موجودی\n"
-        "• بانک\n"
-        "• بازی\n"
-        "• فروشگاه\n"
-        "• رتبه\n"
-        "• آمار\n"
-        "• تاریخچه\n\n"
-        "💸 <b>انتقال بانکی</b>\n"
-        "روی پیام گیرنده ریپلای کن:\n"
-        "<code>انتقال 1000</code>\n\n"
-        "🛒 <b>خرید</b>\n"
-        "<code>خرید 1</code>\n\n"
-        "🎁 <b>کد هدیه</b>\n"
-        "<code>کد KI4N2026</code>\n\n"
-        "👑 <b>مدیریت</b>\n"
-        "واریز و برداشت فقط با ریپلای روی کاربر انجام می‌شود.\n"
-        "مثال:\n"
-        "<code>واریز 50000</code>\n"
-        "<code>برداشت 20000</code>\n\n"
-        "🎮 بازی‌های شانس رایگان هستند و در آن‌ها شرط‌بندی یا از دست دادن پوینت وجود ندارد."
-    )
-    await update.message.reply_text(
-        text, parse_mode=ParseMode.HTML, reply_markup=back_keyboard()
-    )
-
-
-# ---------------------- CALLBACK HANDLER --------------------
-
-async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
     await q.answer()
-
-    uid = q.from_user.id
-    register_user(q.from_user)
-    data = q.data
-
-    if data == "main":
-        await q.edit_message_text(
-            "🎮 <b>منوی اصلی</b>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=main_keyboard(uid)
-        )
-        return
+    if gamt:
+        try:
+            await c.bot.send_message(user.id, "🎁 همگانی تأخیری: +%s %s" % (num(gamt), em_plain(d)))
+        except Exception:
+            pass
 
     if data == "close":
-        await q.edit_message_text("❌ منو بسته شد.")
+        await q.edit_message_text("بسته شد.")
+        return
+    if data == "noop":
         return
 
-    if data == "menu_profile":
+    if data == "my_bal":
         await q.edit_message_text(
-            await show_profile(update, uid),
-            parse_mode=ParseMode.HTML,
-            reply_markup=back_keyboard()
+            tpl(d, "balance", mention=mention_user(user), balance=num(bal(d, user.id))),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[btn("%s %s" % (em_plain(d), num(bal(d, user.id))), "noop", "primary")]]),
         )
         return
 
-    if data == "menu_bank":
+    if data == "lb":
+        await q.edit_message_text(leaderboard_text(d, user.id), parse_mode="HTML", reply_markup=start_kb())
+        return
+
+    if data == "self_panel":
+        await send_self_panel(c.bot, q.message.chat_id, user.id, d, message=q.message)
+        return
+
+    # mode:2:amount:creator
+    if data.startswith("mode:"):
+        parts = data.split(":")
+        if len(parts) < 4:
+            await q.answer("منقضی", show_alert=True)
+            return
+        need, amount, creator_id = int(parts[1]), int(parts[2]), int(parts[3])
+        if user.id != creator_id:
+            await q.answer("تو دسترسی بهش نداری", show_alert=True)
+            return
+        min_b, max_b = int(d.get("min_bet") or 1), int(d.get("max_bet") or 0)
+        if amount < min_b or (max_b and amount > max_b):
+            await q.answer("خارج از قفل شرط", show_alert=True)
+            return
+        if bal(d, user.id) < amount:
+            await q.answer("موجودی کم", show_alert=True)
+            return
+        add_bal(d, user.id, -amount)
+        gid = "g%d%d" % (int(time.time()), random.randint(10, 99))
+        game = {
+            "creator": user.id,
+            "amount": amount,
+            "need": need,
+            "players": [user.id],
+            "names": {str(user.id): user.full_name},
+            "status": "open",
+            "chat_id": q.message.chat_id,
+            "ts": time.time(),
+            "invite": None,
+            "side_bets": [],
+        }
+        d.setdefault("games", {})[gid] = game
+        track_chat(d, q.message.chat_id)
+        save(d)
+        mode = "۲ نفره" if need == 2 else "۳ نفره"
+        await q.edit_message_text(
+            tpl(d, "game_open", amount=num(amount), creator=mention_user(user), mode=mode),
+            parse_mode="HTML",
+            reply_markup=game_kb(d, game, gid),
+        )
+        return
+
+    if data.startswith("join:"):
+        await expire_games(d)
+        d = load()
+        gid = data.split(":")[1]
+        game = d.get("games", {}).get(gid)
+        if not game or game.get("status") != "open":
+            await q.answer("بسته است", show_alert=True)
+            return
+        if game.get("invite") and user.id != int(game["invite"]) and user.id != int(game["creator"]):
+            await q.answer("این دوئل خصوصی است", show_alert=True)
+            return
+        if user.id == game["creator"]:
+            await q.answer("سازنده‌ای", show_alert=True)
+            return
+        if user.id in game.get("players", []):
+            await q.answer("قبلاً پیوستی", show_alert=True)
+            return
+        amount = int(game["amount"])
+        need = int(game.get("need") or 2)
+        if bal(d, user.id) < amount:
+            await q.answer("موجودی کم", show_alert=True)
+            return
+        add_bal(d, user.id, -amount)
+        game["players"].append(user.id)
+        game["names"][str(user.id)] = user.full_name
+        if len(game["players"]) >= need:
+            await finish_game(q, c, d, gid, game)
+            return
+        save(d)
+        left = need - len(game["players"])
+        mode = "۲ نفره" if need == 2 else "۳ نفره"
+        inv = "\n🔒 دوئل خصوصی" if game.get("invite") else ""
+        await q.edit_message_text(
+            tpl(d, "game_open", amount=num(amount), creator=mention_id(game["creator"], game["names"].get(str(game["creator"]))), mode=mode)
+            + "\n\nپیوسته: %s / %s%s" % (len(game["players"]), need, inv),
+            parse_mode="HTML",
+            reply_markup=game_kb(d, game, gid),
+        )
+        return
+
+    if data.startswith("cancel:"):
+        gid = data.split(":")[1]
+        game = d.get("games", {}).get(gid)
+        if not game or game.get("status") != "open":
+            await q.answer("قابل لغو نیست", show_alert=True)
+            return
+        if user.id != game["creator"]:
+            await q.answer("تو دسترسی بهش نداری", show_alert=True)
+            return
+        amount = int(game["amount"])
+        for pid in game.get("players", []):
+            add_bal(d, pid, amount)
+        for b in game.get("side_bets") or []:
+            add_bal(d, b["uid"], int(b["amount"]))
+        game["status"] = "cancelled"
+        save(d)
+        await q.edit_message_text("🚫 لغو شد — الماس‌ها برگشت.")
+        return
+
+    # شرط تماشاچی: sidebet:gid:player → بعد مبلغ از state
+    if data.startswith("sidebet:"):
+        parts = data.split(":")
+        if len(parts) < 3:
+            return
+        gid, onp = parts[1], int(parts[2])
+        game = d.get("games", {}).get(gid)
+        if not game or game.get("status") != "open":
+            await q.answer("بازی بسته است", show_alert=True)
+            return
+        if user.id in game.get("players", []):
+            await q.answer("بازیکن نمی‌تواند شرط ببندد", show_alert=True)
+            return
+        set_st(c, "sidebet_amt", {"gid": gid, "on": onp})
+        try:
+            me = await c.bot.get_me()
+            link = "https://t.me/%s?start=sb_%s_%s" % (me.username, gid, onp)
+            await c.bot.send_message(user.id, "مبلغ شرط را بفرست (مثال 1k):\n%s" % link)
+            await q.answer("پیوی ربات را چک کن", show_alert=True)
+        except Exception:
+            await q.answer("اول ربات را استارت کن", show_alert=True)
+        return
+
+    if data.startswith("tr_ok:"):
+        parts = data.split(":")
+        frm, to, amount = int(parts[1]), int(parts[2]), int(parts[3])
+        if user.id != frm:
+            await q.answer("تو دسترسی بهش نداری", show_alert=True)
+            return
+        if bal(d, frm) < amount:
+            await q.edit_message_text("موجودی کافی نیست.")
+            return
+        send_amt = amount - int(amount * TAX)
+        if send_amt < 1:
+            await q.edit_message_text("مقدار کم است.")
+            return
+        add_bal(d, frm, -amount)
+        add_bal(d, to, send_amt)
+        save(d)
+        await q.edit_message_text(
+            tpl(d, "transfer_ok", **{"from": mention_id(frm), "to": mention_id(to), "sent": num(send_amt)}),
+            parse_mode="HTML",
+        )
+        try:
+            await c.bot.send_message(to, "دریافت: %s %s" % (em(d), num(send_amt)), parse_mode="HTML")
+        except Exception:
+            pass
+        pass
+        return
+
+    if data.startswith("tr_no:"):
+        try:
+            if user.id != int(data.split(":")[1]):
+                await q.answer("تو دسترسی بهش نداری", show_alert=True)
+                return
+        except Exception:
+            pass
+        await q.edit_message_text("لغو شد.")
+        return
+
+
+    if data == "a_bank" and is_admin(user.id):
+        bank = int(d.get("bot_bank") or 0)
+        items = sorted(((int(u), int(v)) for u, v in (d.get("donations") or {}).items() if int(v) > 0), key=lambda x: -x[1])[:3]
+        lines = ["🏦 <b>بانک بات</b>", "", "موجودی: %s" % num(bank), "", "⭐ دونیت‌کننده‌ها:"]
+        if not items:
+            lines.append("—")
+        for i, (uid, v) in enumerate(items, 1):
+            name = (d.get("users") or {}).get(str(uid), {}).get("name") or str(uid)
+            lines.append("%s. %s — %s" % (i, mention_id(uid, name), num(v)))
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📜 تاریخچه", callback_data="bank_history")],
-            [InlineKeyboardButton("🔙 بازگشت", callback_data="main")],
+            [btn("📢 پخش همگانی بانک", "bank_spread", "success")],
+            [btn("📥 به حساب ادمین", "bank_to_admin", "primary")],
+            [btn("🗑 صفر بانک", "bank_zero", "danger")],
+            [btn("🔙", "a_home", "primary")],
         ])
-        await q.edit_message_text(
-            await bank_text(uid),
-            parse_mode=ParseMode.HTML,
-            reply_markup=kb
-        )
+        await q.edit_message_text("\n".join(lines), parse_mode="HTML", reply_markup=kb)
         return
-
-    if data == "bank_history":
-        await q.edit_message_text(
-            await transaction_history(uid),
-            parse_mode=ParseMode.HTML,
-            reply_markup=back_keyboard()
-        )
-        return
-
-    if data == "menu_games":
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🎲 تاس روزانه", callback_data="game_dice")],
-            [InlineKeyboardButton("🎡 چرخ شانس", callback_data="game_wheel")],
-            [InlineKeyboardButton("🎁 جعبه شانس", callback_data="game_box")],
-            [InlineKeyboardButton("🔙 بازگشت", callback_data="main")],
-        ])
-        await q.edit_message_text(
-            "🎮 <b>بازی‌ها</b>\n\n"
-            "هر بازی روزی یک‌بار قابل استفاده است و جایزه رایگان می‌دهد.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=kb
-        )
-        return
-
-    if data.startswith("game_"):
-        game = data.replace("game_", "", 1)
-        result = await play_lucky(update, context, game)
-        await q.edit_message_text(
-            result,
-            parse_mode=ParseMode.HTML,
-            reply_markup=back_keyboard()
-        )
-        return
-
-    if data == "menu_shop":
-        await q.edit_message_text(
-            await shop_text(),
-            parse_mode=ParseMode.HTML,
-            reply_markup=back_keyboard()
-        )
-        return
-
-    if data == "menu_gift":
-        await q.edit_message_text(
-            "🎁 <b>کد هدیه</b>\n\n"
-            "در گپ بنویس:\n"
-            "<code>کد CODE</code>\n\n"
-            "مثال: <code>کد KI4N2026</code>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=back_keyboard()
-        )
-        return
-
-    if data == "menu_rank":
-        await q.edit_message_text(
-            await rank_text(),
-            parse_mode=ParseMode.HTML,
-            reply_markup=back_keyboard()
-        )
-        return
-
-    if data == "menu_stats":
-        await q.edit_message_text(
-            await stats_text(),
-            parse_mode=ParseMode.HTML,
-            reply_markup=back_keyboard()
-        )
-        return
-
-    if data == "menu_help":
-        # Inline equivalent of help.
-        text = (
-            "📖 <b>راهنما</b>\n\n"
-            "💰 موجودی — نمایش موجودی\n"
-            "👤 پروفایل — نمایش مشخصات\n"
-            "🎮 بازی — بازی‌های روزانه\n"
-            "🛒 فروشگاه — نمایش آیتم‌ها\n"
-            "🏆 رتبه — نمایش برترین‌ها\n"
-            "📜 تاریخچه — تراکنش‌ها\n\n"
-            "💸 انتقال فقط با ریپلای:\n"
-            "<code>انتقال 1000</code>\n\n"
-            "👑 واریز/برداشت مدیران هم فقط با ریپلای انجام می‌شود."
-        )
-        await q.edit_message_text(
-            text, parse_mode=ParseMode.HTML, reply_markup=back_keyboard()
-        )
-        return
-
-    if data == "admin_panel":
-        if not get_role(uid):
-            await q.edit_message_text("⛔ دسترسی نداری.", reply_markup=back_keyboard())
+    if data == "bank_spread" and is_admin(user.id):
+        bank = int(d.get("bot_bank") or 0)
+        ids = list(all_user_ids(d))
+        if bank < 1 or not ids:
+            await q.answer("خالی است", show_alert=True)
             return
-        await q.edit_message_text(
-            "👑 <b>پنل مدیریت</b>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=admin_keyboard()
-        )
-        return
-
-    if data == "admin_roles":
-        if uid != OWNER_ID:
-            await q.answer("فقط مالک به مدیریت نقش‌ها دسترسی دارد.", show_alert=True)
+        each = bank // len(ids)
+        if each < 1:
+            await q.answer("کمتر از تعداد کاربران", show_alert=True)
             return
-        conn = db()
-        rows = conn.execute("SELECT * FROM admins ORDER BY role").fetchall()
-        conn.close()
-        lines = ["👑 <b>مدیران</b>\n"]
-        for r in rows:
-            lines.append(f"• <code>{r['user_id']}</code> — {role_label(r['role'])}")
-        lines.append("\nبرای افزودن مدیر، روی پیام او ریپلای کن و بنویس «مدیر اقتصاد».")
-        await q.edit_message_text(
-            "\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=back_keyboard()
-        )
+        for uid in ids:
+            add_bal(d, uid, each)
+            await notify_deposit(c.bot, uid, each, d, True)
+        d["bot_bank"] = bank - each * len(ids)
+        save(d)
+        await q.edit_message_text("پخش شد — هر نفر %s" % num(each), reply_markup=admin_kb())
         return
-
-    if data == "admin_economy":
-        if not can_manage(uid, {"senior", "economy"}):
-            await q.answer("دسترسی نداری.", show_alert=True)
+    if data == "bank_to_admin" and is_admin(user.id):
+        bank = int(d.get("bot_bank") or 0)
+        add_bal(d, user.id, bank)
+        d["bot_bank"] = 0
+        save(d)
+        await q.edit_message_text("به ادمین منتقل شد: %s" % num(bank), reply_markup=admin_kb())
+        return
+    if data == "bank_zero" and is_admin(user.id):
+        d["bot_bank"] = 0
+        save(d)
+        await q.edit_message_text("بانک صفر شد.", reply_markup=admin_kb())
+        return
+    if data.startswith("scan:") and is_admin(user.id):
+        cid = int(data.split(":")[1])
+        added = 0
+        try:
+            for a in await c.bot.get_chat_administrators(cid):
+                touch_user(d, a.user)
+                track_chat(d, cid, a.user if hasattr(a, "user") else None)
+                added += 1
+        except Exception as e:
+            await q.edit_message_text("اسکن ناموفق (بات باید ادمین گپ باشد):\n%s" % e)
             return
-        await q.edit_message_text(
-            "💰 <b>مدیریت اقتصاد</b>\n\n"
-            "واریز/برداشت فقط با ریپلای:\n"
-            "<code>واریز 50000</code>\n"
-            "<code>برداشت 20000</code>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=back_keyboard()
-        )
+        for uid in d.get("chat_users", {}).get(str(cid), []):
+            d.setdefault("balances", {}).setdefault(str(uid), bal(d, uid))
+            added += 1
+        save(d)
+        await q.edit_message_text("ثبت شد (~%s)" % added, reply_markup=admin_kb())
         return
 
-    if data == "admin_rewards":
-        if not can_manage(uid, {"senior", "rewards"}):
-            await q.answer("دسترسی نداری.", show_alert=True)
+    if not is_admin(user.id):
+        return
+
+    if data == "a_home":
+        clear_st(c)
+        await q.edit_message_text("🎛 پنل", reply_markup=admin_kb())
+        return
+    if data == "a_scan":
+        chats = d.get("known_chats") or []
+        if not chats:
+            await q.edit_message_text("گپی ثبت نشده.", reply_markup=admin_kb())
             return
-        await q.edit_message_text(
-            "🎁 <b>مدیریت جوایز</b>\n\n"
-            "ساخت کد:\n"
-            "<code>کدسازی CODE AMOUNT MAX_USES</code>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=back_keyboard()
-        )
+        rows = []
+        for cid in chats[:30]:
+            title = str(cid)
+            try:
+                ch = await c.bot.get_chat(int(cid))
+                title = (ch.title or ch.username or str(cid))[:40]
+            except Exception:
+                pass
+            rows.append([btn(title, "scan:%s" % cid, "primary")])
+        rows.append([btn("🔙", "a_home", "danger")])
+        await q.edit_message_text("گپ را برای اسکن انتخاب کن:", reply_markup=InlineKeyboardMarkup(rows))
         return
-
-    if data == "admin_shop":
-        if not can_manage(uid, {"senior", "shop"}):
-            await q.answer("دسترسی نداری.", show_alert=True)
+    if data == "a_top1":
+        set_st(c, "a_top1_amt")
+        await q.edit_message_text("مبلغ جایزه برای ماندن در رتبه ۱:")
+        return
+    if data == "a_add":
+        set_st(c, "a_add_id")
+        await q.edit_message_text("آیدی عددی:")
+        return
+    if data == "a_sub":
+        set_st(c, "a_sub_id")
+        await q.edit_message_text("آیدی برای کم کردن:")
+        return
+    if data == "a_add_all":
+        set_st(c, "a_add_all")
+        await q.edit_message_text("مقدار همگانی (مثال 5k):\n%s کاربر فعلی" % num(len(all_user_ids(d))))
+        return
+    if data == "a_bcast":
+        set_st(c, "a_bcast_where")
+        await q.edit_message_text("پیوی یا گپ؟")
+        return
+    if data == "a_zero":
+        set_st(c, "a_zero_confirm")
+        await q.edit_message_text("بنویس: تأیید صفر")
+        return
+    if data == "a_betlock":
+        set_st(c, "a_bet_min")
+        await q.edit_message_text("حداقل شرط:")
+        return
+    if data == "a_emoji":
+        set_st(c, "a_emoji")
+        await q.edit_message_text("ایموجی پرمیوم یا متنی:")
+        return
+    if data == "a_self_cap":
+        set_st(c, "a_self_cap")
+        await q.edit_message_text("کپشن پنل:")
+        return
+    if data == "a_hourly":
+        set_st(c, "a_hourly")
+        await q.edit_message_text("مصرف ساعتی:")
+        return
+    if data == "a_lot":
+        set_st(c, "a_lot_prize")
+        await q.edit_message_text("جایزه هر برنده:")
+        return
+    if data == "a_lot_cancel":
+        lot = d.get("lottery")
+        if not lot or lot.get("status") != "open":
+            await q.answer("قرعه فعالی نیست", show_alert=True)
             return
+        lot["status"] = "cancelled"
+        save(d)
+        await q.edit_message_text("🚫 لغو شد.", reply_markup=admin_kb())
+        return
+    if data == "a_tpl":
         await q.edit_message_text(
-            "🛒 <b>مدیریت فروشگاه</b>\n\n"
-            "افزودن آیتم:\n"
-            "<code>آیتم نام | قیمت | موجودی | توضیحات</code>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=back_keyboard()
+            "قالب را انتخاب کن:\n\n"
+            "<code>{mention}</code> تگ کاربر\n"
+            "<code>{emoji}</code> ایموجی\n"
+            "<code>{balance}</code> موجودی\n"
+            "<code>{amount}</code> شرط\n"
+            "<code>{creator}</code> میزبان\n"
+            "<code>{mode}</code> حالت\n"
+            "<code>{winner}</code> برنده\n"
+            "<code>{loser}</code> بازنده\n"
+            "<code>{win_amount}</code> مبلغ برد\n"
+            "<code>{from}</code> فرستنده\n"
+            "<code>{to}</code> گیرنده\n"
+            "<code>{sent}</code> رسیده",
+            parse_mode="HTML",
+            reply_markup=tpl_kb(),
         )
         return
-
-    if data == "admin_game":
-        if not can_manage(uid, {"senior", "game"}):
-            await q.answer("دسترسی نداری.", show_alert=True)
-            return
-        await q.edit_message_text(
-            "🎮 <b>مدیریت بازی</b>\n\n"
-            "بازی‌های شانس فعلی رایگان و بدون شرط‌بندی هستند.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=back_keyboard()
-        )
+    if data.startswith("tpl:"):
+        key = data.split(":")[1]
+        set_st(c, "a_tpl_set", {"key": key})
+        await q.edit_message_text("متن جدید <code>%s</code>:\n%s" % (key, d.get("templates", {}).get(key, "")), parse_mode="HTML")
+        return
+    if data == "a_admins":
+        lines = ["👤 ادمین‌ها\n"]
+        rows = []
+        for a in d.get("admins", []):
+            lines.append("• <code>%s</code>" % a)
+            if int(a) != ADMIN_ID and is_main(user.id):
+                rows.append([btn("🗑 %s" % a, "a_adel:%s" % a, "danger")])
+        if is_main(user.id):
+            rows.insert(0, [btn("➕ آیدی", "a_aadd", "success")])
+        rows.append([btn("🔙", "a_home", "primary")])
+        await q.edit_message_text("\n".join(lines), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+        return
+    if data == "a_aadd":
+        set_st(c, "a_aadd")
+        await q.edit_message_text("آیدی ادمین:")
+        return
+    if data.startswith("a_adel:") and is_main(user.id):
+        aid = int(data.split(":")[1])
+        d["admins"] = [x for x in d.get("admins", []) if int(x) != aid]
+        save(d)
+        await q.edit_message_text("حذف شد.", reply_markup=admin_kb())
         return
 
-    if data == "admin_stats":
-        if not can_manage(uid, {"senior", "stats"}):
-            await q.answer("دسترسی نداری.", show_alert=True)
-            return
-        await q.edit_message_text(
-            await stats_text(),
-            parse_mode=ParseMode.HTML,
-            reply_markup=back_keyboard()
-        )
-        return
+
+def leaderboard_text(d, viewer_id=None):
+    items = sorted(((int(u), int(v)) for u, v in (d.get("balances") or {}).items() if int(v) > 0), key=lambda x: -x[1])
+    top = items[:5]
+    if not top:
+        return "لیدربرد خالی است."
+    out = ["🏆 <b>۵ نفر برتر</b>", ""]
+    for i, (uid, v) in enumerate(top, 1):
+        name = (d.get("users") or {}).get(str(uid), {}).get("name") or str(uid)
+        out.append("%s: %s  ➡️  %s" % (i, mention_id(uid, name), short_num(v)))
+        if i < len(top):
+            out.append("")
+            out.append("────────────")
+            out.append("")
+    if viewer_id is not None:
+        r = rank_in(d.get("balances") or {}, viewer_id)
+        out.append("")
+        out.append("رتبه شما")
+        out.append(str(r if r else "—"))
+    return "\n".join(out)
 
 
-# -------------------------- COMMANDS ------------------------
+def wins_text(d, viewer_id=None):
+    items = sorted(((int(u), int(v)) for u, v in (d.get("wins") or {}).items() if int(v) > 0), key=lambda x: -x[1])[:5]
+    if not items:
+        return "هنوز بردی ثبت نشده."
+    out = ["🏆 <b>وینرها</b>", ""]
+    for i, (uid, v) in enumerate(items, 1):
+        name = (d.get("users") or {}).get(str(uid), {}).get("name") or str(uid)
+        out.append("%s: %s  ➡️  %s برد" % (i, mention_id(uid, name), num(v)))
+        if i < len(items):
+            out.append("")
+            out.append("────────────")
+            out.append("")
+    if viewer_id is not None:
+        r = rank_in(d.get("wins") or {}, viewer_id)
+        out.append("")
+        out.append("رتبه شما")
+        out.append(str(r if r else "—"))
+    return "\n".join(out)
 
-async def cmd_start(update, context):
-    await start(update, context)
+
+def losses_text(d, viewer_id=None):
+    items = sorted(((int(u), int(v)) for u, v in (d.get("losses") or {}).items() if int(v) > 0), key=lambda x: -x[1])[:5]
+    if not items:
+        return "هنوز باختی ثبت نشده."
+    out = ["💀 <b>لوزرها</b>", ""]
+    for i, (uid, v) in enumerate(items, 1):
+        name = (d.get("users") or {}).get(str(uid), {}).get("name") or str(uid)
+        out.append("%s: %s  ➡️  %s باخت" % (i, mention_id(uid, name), num(v)))
+        if i < len(items):
+            out.append("")
+            out.append("────────────")
+            out.append("")
+    if viewer_id is not None:
+        r = rank_in(d.get("losses") or {}, viewer_id)
+        out.append("")
+        out.append("رتبه شما")
+        out.append(str(r if r else "—"))
+    return "\n".join(out)
 
 
-async def cmd_help(update, context):
-    await help_command(update, context)
 
-
-async def cmd_panel(update, context):
-    await admin_panel(update, context)
-
-
-async def cmd_games(update, context):
-    await games_menu(update, context)
-
-
-async def cmd_profile(update, context):
-    register_user(update.effective_user)
-    await update.message.reply_text(
-        await show_profile(update, update.effective_user.id),
-        parse_mode=ParseMode.HTML
+def help_text():
+    return (
+        "📖 <b>راهنما</b>\n\n"
+        "• <b>بازی 1k</b> — ۲ یا ۳ نفره\n"
+        "• <b>دعوت 5k</b> + ریپلای — دوئل\n"
+        "• <b>موجودی / انتقال / لیدربرد</b>\n"
+        "• <b>وینرها / لوزرها / سلف</b>\n"
+        "• <b>دونیت بات 1k</b> — بانک بات\n"
+        "• <b>بانک بات</b>\n"
     )
 
+async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    if not u.message:
+        return
+    user = u.effective_user
+    d = load()
+    touch_user(d, user)
+    track_chat(d, u.effective_chat.id)
+    gamt = apply_grant(d, user.id)
+    save(d)
+    await expire_games(d)
+    await maybe_finish_lottery(c.bot, d)
+    await maybe_top1_reward(c.bot, d)
+    d = load()
+    text = (u.message.text or "").strip()
+    chat = u.effective_chat
+    st = get_st(c)
 
-async def cmd_balance(update, context):
-    register_user(update.effective_user)
-    await update.message.reply_text(
-        await bank_text(update.effective_user.id),
-        parse_mode=ParseMode.HTML
-    )
+    if u.message.reply_to_message and u.message.reply_to_message.from_user and u.message.reply_to_message.from_user.is_bot:
+        if re.fullmatch(r"/?(موجودی|bal)", text, re.I):
+            await u.message.reply_text("من خودم الماسم 😎 میخوای چیو ببینی؟")
+            return
+
+    # ادمین: ریپلای + ایدی
+    if is_admin(user.id) and chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+        if text.strip() in ("ایدی", "آیدی", "id", "ID") and u.message.reply_to_message and u.message.reply_to_message.from_user:
+            tu = u.message.reply_to_message.from_user
+            touch_user(d, tu)
+            save(d)
+            un = ("@" + tu.username) if tu.username else "—"
+            msg = "اطلاعات کاربر\nاسم: %s\nیوزرنیم: %s\nآیدی: <code>%s</code>" % (tu.full_name, un, tu.id)
+            for aid in d.get("admins", [ADMIN_ID]):
+                try:
+                    await c.bot.send_message(int(aid), msg, parse_mode="HTML")
+                except Exception:
+                    pass
+            await u.message.reply_text("به پیوی ادمین ارسال شد.")
+            return
 
 
-async def cmd_transfer(update, context):
-    await transfer_reply(update, context)
+    if gamt and chat.type == ChatType.PRIVATE:
+        await u.message.reply_text("🎁 همگانی: +%s %s" % (num(gamt), em(d)), parse_mode="HTML")
+
+    # شرط تماشاچی مبلغ
+    if chat.type == ChatType.PRIVATE and st and st.get("kind") == "sidebet_amt":
+        amt = parse_amount(text)
+        if amt is None or amt < 1:
+            await u.message.reply_text("مبلغ نامعتبر")
+            return
+        if bal(d, user.id) < amt:
+            await u.message.reply_text("موجودی کم")
+            return
+        gid = st["extra"]["gid"]
+        onp = int(st["extra"]["on"])
+        game = d.get("games", {}).get(gid)
+        if not game or game.get("status") != "open":
+            clear_st(c)
+            await u.message.reply_text("بازی دیگر باز نیست")
+            return
+        add_bal(d, user.id, -amt)
+        game.setdefault("side_bets", []).append({"uid": user.id, "on": onp, "amount": amt})
+        save(d)
+        clear_st(c)
+        await u.message.reply_text("✅ شرط %s روی %s ثبت شد" % (num(amt), mention_id(onp)), parse_mode="HTML")
+        return
+
+    if is_main(user.id) and chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+        m = re.match(r"^کسر\s+(.+)$", text)
+        if m and u.message.reply_to_message and u.message.reply_to_message.from_user:
+            amt = parse_amount(m.group(1))
+            if amt and amt > 0:
+                tuser = u.message.reply_to_message.from_user
+                touch_user(d, tuser)
+                add_bal(d, tuser.id, -amt)
+                save(d)
+                await u.message.reply_text("کسر از %s: %s" % (mention_user(tuser), num(bal(d, tuser.id))), parse_mode="HTML")
+                return
+
+    if chat.type == ChatType.PRIVATE and st and is_admin(user.id):
+        kind = st.get("kind")
+        extra = st.get("extra") or {}
+        if kind == "a_add_id" and text.lstrip("-").isdigit():
+            set_st(c, "a_add_amt", {"uid": int(text)})
+            await u.message.reply_text("مقدار:")
+            return
+        if kind == "a_add_amt":
+            amt = parse_amount(text)
+            if amt is None:
+                await u.message.reply_text("نامعتبر")
+                return
+            uid = int(extra["uid"])
+            add_bal(d, uid, amt)
+            save(d)
+            clear_st(c)
+            await u.message.reply_text("✅ %s → %s" % (num(amt), uid), reply_markup=admin_kb())
+            await notify_deposit(c.bot, uid, amt, d, False)
+            return
+        if kind == "a_sub_id" and text.lstrip("-").isdigit():
+            set_st(c, "a_sub_amt", {"uid": int(text)})
+            await u.message.reply_text("مقدار:")
+            return
+        if kind == "a_sub_amt":
+            amt = parse_amount(text)
+            if amt is None:
+                await u.message.reply_text("نامعتبر")
+                return
+            uid = int(extra["uid"])
+            add_bal(d, uid, -amt)
+            save(d)
+            clear_st(c)
+            await u.message.reply_text("✅ %s" % num(bal(d, uid)), reply_markup=admin_kb())
+            return
+        if kind == "a_add_all":
+            amt = parse_amount(text)
+            if amt is None:
+                await u.message.reply_text("نامعتبر")
+                return
+            set_st(c, "a_grant_days", {"amount": amt})
+            await u.message.reply_text(
+                "همگانی %s برای کاربران فعلی واریز می‌شود.\n"
+                "چند روز کاربران جدید هم بگیرند؟ (مثال 7)\n0 = فقط فعلی‌ها" % num(amt)
+            )
+            return
+        if kind == "a_grant_days" and text.isdigit():
+            amt = int(extra["amount"])
+            days = int(text)
+            ids = all_user_ids(d)
+            for uid in ids:
+                add_bal(d, uid, amt)
+                await notify_deposit(c.bot, uid, amt, d, True)
+            if days > 0:
+                d["grant"] = {
+                    "amount": amt,
+                    "until_ts": time.time() + days * 86400,
+                    "claimed": [int(x) for x in ids],
+                }
+            else:
+                d["grant"] = None
+            save(d)
+            clear_st(c)
+            msg = "✅ %s به %s نفر" % (num(amt), num(len(ids)))
+            if days > 0:
+                msg += "\nکاربران جدید تا %s روز هم می‌گیرند." % days
+            await u.message.reply_text(msg, reply_markup=admin_kb())
+            return
+        if kind == "a_bcast_where":
+            if text.strip() not in ("پیوی", "گپ"):
+                await u.message.reply_text("پیوی یا گپ")
+                return
+            set_st(c, "a_bcast_msg", {"where": text.strip()})
+            await u.message.reply_text("متن:")
+            return
+        if kind == "a_bcast_msg":
+            ok = fail = 0
+            if extra.get("where") == "پیوی":
+                for uid in all_user_ids(d):
+                    try:
+                        await c.bot.send_message(int(uid), text)
+                        ok += 1
+                    except Exception:
+                        fail += 1
+            else:
+                for cid in d.get("known_chats") or []:
+                    try:
+                        await c.bot.send_message(int(cid), text)
+                        ok += 1
+                    except Exception:
+                        fail += 1
+            clear_st(c)
+            await u.message.reply_text("✅%s ❌%s" % (ok, fail), reply_markup=admin_kb())
+            return
+        if kind == "a_zero_confirm":
+            if text.strip() != "تأیید صفر":
+                await u.message.reply_text("تأیید صفر")
+                return
+            for uid in list(d.get("balances", {}).keys()):
+                d["balances"][uid] = 0
+            save(d)
+            clear_st(c)
+            await u.message.reply_text("صفر شد.", reply_markup=admin_kb())
+            return
+        if kind == "a_bet_min":
+            amt = parse_amount(text)
+            if not amt:
+                await u.message.reply_text("نامعتبر")
+                return
+            set_st(c, "a_bet_max", {"min": amt})
+            await u.message.reply_text("حداکثر (0=آزاد):")
+            return
+        if kind == "a_bet_max":
+            amt = parse_amount(text)
+            if amt is None:
+                await u.message.reply_text("نامعتبر")
+                return
+            d["min_bet"], d["max_bet"] = int(extra["min"]), int(amt)
+            save(d)
+            clear_st(c)
+            await u.message.reply_text("قفل شد.", reply_markup=admin_kb())
+            return
+        if kind == "a_emoji":
+            eid = None
+            if u.message.entities:
+                for ent in u.message.entities:
+                    if ent.type == MessageEntityType.CUSTOM_EMOJI and ent.custom_emoji_id:
+                        eid = str(ent.custom_emoji_id)
+                        break
+            if eid:
+                d["premium_emoji_id"] = eid
+                d["emoji"] = "💎"
+            else:
+                d["emoji"] = text[:8] if text else "💎"
+                d["premium_emoji_id"] = None
+            save(d)
+            clear_st(c)
+            await u.message.reply_text("ذخیره شد.", reply_markup=admin_kb())
+            return
+            pool = d.get("premium_pool") or []
+            if eid not in pool:
+                pool.append(eid)
+            d["premium_pool"] = pool[-10:]
+            d["premium_emoji_id"] = eid
+            save(d)
+            clear_st(c)
+            await u.message.reply_text("OK %s/10" % len(d["premium_pool"]), reply_markup=admin_kb())
+            return
+        if kind == "a_self_cap":
+            d["self_caption"] = text
+            save(d)
+            clear_st(c)
+            await u.message.reply_text("ذخیره.", reply_markup=admin_kb())
+            return
+        if kind == "a_hourly" and text.isdigit():
+            d["hourly_use"] = max(1, int(text))
+            save(d)
+            clear_st(c)
+            await u.message.reply_text("OK", reply_markup=admin_kb())
+            return
+        if kind == "a_top1_amt":
+            amt = parse_amount(text)
+            if not amt:
+                await u.message.reply_text("نامعتبر")
+                return
+            set_st(c, "a_top1_hours", {"amount": amt})
+            await u.message.reply_text("هر چند ساعت یک‌بار؟ (مثال 10)")
+            return
+        if kind == "a_top1_hours" and text.replace(".", "", 1).isdigit():
+            d["top1_reward"] = {
+                "amount": int(extra["amount"]),
+                "hours": float(text),
+                "last_pay": time.time(),
+                "last_uid": top1_uid(d),
+            }
+            save(d)
+            clear_st(c)
+            await u.message.reply_text("جایزه تاپ‌۱ فعال شد.", reply_markup=admin_kb())
+            return
+        if kind == "a_lot_prize":
+            amt = parse_amount(text)
+            if not amt:
+                await u.message.reply_text("نامعتبر")
+                return
+            set_st(c, "a_lot_win", {"prize": amt})
+            await u.message.reply_text("تعداد برنده:")
+            return
+        if kind == "a_lot_win" and text.isdigit():
+            set_st(c, "a_lot_end", {"prize": extra["prize"], "winners": int(text)})
+            await u.message.reply_text("زمان پایان (دقیقه):")
+            return
+        if kind == "a_lot_end" and text.isdigit():
+            mins = int(text)
+            end_ts = time.time() + mins * 60
+            ids = [int(x) for x in all_user_ids(d)]
+            d["lottery"] = {
+                "prize": int(extra["prize"]),
+                "winners": int(extra["winners"]),
+                "joined": ids,
+                "status": "open",
+                "end_ts": end_ts,
+            }
+            save(d)
+            clear_st(c)
+            end_local = datetime.fromtimestamp(end_ts, TEHRAN).strftime("%Y-%m-%d %H:%M")
+            msg = "🎰 قرعه‌کشی\nجایزه: %s\nبرنده: %s\nشرکت‌کننده: %s\nپایان: %s" % (
+                num(extra["prize"]), num(extra["winners"]), num(len(ids)), end_local)
+            for cid in d.get("known_chats") or []:
+                try:
+                    await c.bot.send_message(int(cid), msg)
+                except Exception:
+                    pass
+            await u.message.reply_text(msg, reply_markup=admin_kb())
+            return
+        if kind == "a_tpl_set":
+            d.setdefault("templates", {})[extra["key"]] = text
+            save(d)
+            clear_st(c)
+            await u.message.reply_text("ذخیره.", reply_markup=admin_kb())
+            return
+        if kind == "a_aadd" and text.lstrip("-").isdigit():
+            aid = int(text)
+            if aid not in [int(x) for x in d.get("admins", [])]:
+                d.setdefault("admins", []).append(aid)
+                save(d)
+            clear_st(c)
+            await u.message.reply_text("✅", reply_markup=admin_kb())
+            return
+
+    low2 = re.sub(r"^@\w+\s+", "", text)
+    low2 = re.sub(r"^/(\w+)@\w+", r"/\1", low2)
+
+    if re.fullmatch(r"/?(راهنما|help)", low2, re.I):
+        await u.message.reply_text(help_text(), parse_mode="HTML")
+        return
+
+    if re.fullmatch(r"/?(موجودی|bal)", low2, re.I):
+        if u.message.reply_to_message and u.message.reply_to_message.from_user:
+            tuser = u.message.reply_to_message.from_user
+            touch_user(d, tuser)
+            save(d)
+            target, tid = tuser, tuser.id
+        else:
+            target, tid = user, user.id
+        await u.message.reply_text(
+            tpl(d, "balance", mention=mention_user(target), balance=num(bal(d, tid))),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[btn("%s %s" % (em_plain(d), num(bal(d, tid))), "noop", "primary")]]),
+        )
+        return
+
+    if re.fullmatch(r"/?(لیدربرد|لیدربورد|top)", low2, re.I):
+        await u.message.reply_text(leaderboard_text(d, user.id), parse_mode="HTML")
+        return
+    if re.fullmatch(r"/?(وینرها|winners|wins)", low2, re.I):
+        await u.message.reply_text(wins_text(d, user.id), parse_mode="HTML")
+        return
+    if re.fullmatch(r"/?(لوزرها|losers|losses)", low2, re.I):
+        await u.message.reply_text(losses_text(d, user.id), parse_mode="HTML")
+        return
+    if re.fullmatch(r"/?(سلف|self)", low2, re.I):
+        await send_self_panel(c.bot, chat.id, user.id, d)
+        return
+
+    if re.fullmatch(r"/?(بازیکنان|players)", low2, re.I):
+        if chat.type != ChatType.PRIVATE or not is_admin(user.id):
+            return
+        ids = sorted(all_user_ids(d), key=lambda x: -bal(d, x))
+        lines = ["👥 %s نفر\n" % num(len(ids))]
+        for uid in ids[:60]:
+            info = user_info(d, uid)
+            lines.append("• %s\n  <code>%s</code> | %s" % (info["name"], uid, num(bal(d, uid))))
+        await u.message.reply_text("\n".join(lines), parse_mode="HTML")
+        return
 
 
-async def cmd_deposit(update, context):
-    await admin_deposit(update, context)
+    if re.fullmatch(r"/?(بانک بات|bank)", low2, re.I):
+        bank = int(d.get("bot_bank") or 0)
+        items = sorted(((int(u), int(v)) for u, v in (d.get("donations") or {}).items() if int(v) > 0), key=lambda x: -x[1])[:3]
+        lines = ["🏦 <b>بانک بات</b>", "", "موجودی بانک: %s" % num(bank), "", "⭐ برترین دونیت‌کننده‌ها:"]
+        if not items:
+            lines.append("—")
+        for i, (uid, v) in enumerate(items, 1):
+            name = (d.get("users") or {}).get(str(uid), {}).get("name") or str(uid)
+            lines.append("%s. %s — %s" % (i, mention_id(uid, name), num(v)))
+        await u.message.reply_text("\n".join(lines), parse_mode="HTML")
+        return
+
+    m = re.match(r"^(?:/)?(?:دونیت بات|donate)\s+(.+)$", low2, re.I)
+    if m:
+        amt = parse_amount(m.group(1))
+        if not amt or amt < 1:
+            await u.message.reply_text("مثال: دونیت بات 1k")
+            return
+        if bal(d, user.id) < amt:
+            await u.message.reply_text("موجودی کم")
+            return
+        add_bal(d, user.id, -amt)
+        d["bot_bank"] = int(d.get("bot_bank") or 0) + amt
+        d.setdefault("donations", {})[str(user.id)] = int(d.get("donations", {}).get(str(user.id), 0)) + amt
+        save(d)
+        await u.message.reply_text("✅ %s به بانک بات اضافه شد\nبانک: %s" % (num(amt), num(d["bot_bank"])))
+        return
+
+    # دوئل خصوصی: دعوت 5k + reply
+    m = re.match(r"^(?:/)?(?:دعوت|duel)\s+(.+)$", low2, re.I)
+    if m:
+        amount = parse_amount(m.group(1))
+        if not amount or amount < 1:
+            await u.message.reply_text("مثال: دعوت 5k (ریپلای روی فرد)")
+            return
+        if not u.message.reply_to_message or not u.message.reply_to_message.from_user:
+            await u.message.reply_text("روی پیام حریف ریپلای کن: دعوت 5k")
+            return
+        foe = u.message.reply_to_message.from_user
+        if foe.id == user.id or foe.is_bot:
+            await u.message.reply_text("نامعتبر")
+            return
+        min_b, max_b = int(d.get("min_bet") or 1), int(d.get("max_bet") or 0)
+        if amount < min_b or (max_b and amount > max_b):
+            await u.message.reply_text("خارج از قفل شرط")
+            return
+        if bal(d, user.id) < amount:
+            await u.message.reply_text("موجودی کم")
+            return
+        add_bal(d, user.id, -amount)
+        gid = "d%d%d" % (int(time.time()), random.randint(10, 99))
+        game = {
+            "creator": user.id,
+            "amount": amount,
+            "need": 2,
+            "players": [user.id],
+            "names": {str(user.id): user.full_name},
+            "status": "open",
+            "chat_id": chat.id,
+            "ts": time.time(),
+            "invite": foe.id,
+            "side_bets": [],
+        }
+        d.setdefault("games", {})[gid] = game
+        track_chat(d, chat.id)
+        save(d)
+        kb = InlineKeyboardMarkup([
+            [btn("✅ قبول دوئل", "join:%s" % gid, "success")],
+            [btn("🚫 لغو", "cancel:%s" % gid, "danger")],
+        ])
+        await u.message.reply_text(
+            "🔒 دوئل خصوصی\n%s vs %s\nشرط: %s %s\nفقط طرف مقابل می‌تواند بپیوندد."
+            % (mention_user(user), mention_user(foe), em(d), num(amount)),
+            parse_mode="HTML",
+            reply_markup=kb,
+        )
+        return
+
+    m = re.match(r"^(?:/)?(?:بازی|game)\s+(.+)$", low2, re.I)
+    if m:
+        amount = parse_amount(m.group(1))
+        if not amount or amount < 1:
+            await u.message.reply_text("مثال: بازی 1k")
+            return
+        min_b, max_b = int(d.get("min_bet") or 1), int(d.get("max_bet") or 0)
+        if amount < min_b:
+            await u.message.reply_text("حداقل: %s" % num(min_b))
+            return
+        if max_b and amount > max_b:
+            await u.message.reply_text("حداکثر: %s" % num(max_b))
+            return
+        if bal(d, user.id) < amount:
+            await u.message.reply_text("موجودی: %s" % num(bal(d, user.id)))
+            return
+        kb = InlineKeyboardMarkup([
+            [btn("۲ نفره", "mode:2:%s:%s" % (amount, user.id), "primary")],
+            [btn("۳ نفره", "mode:3:%s:%s" % (amount, user.id), "success")],
+        ])
+        await u.message.reply_text(
+            "بازی %s %s\nحالت را انتخاب کن (فقط خودت):" % (em(d), num(amount)),
+            parse_mode="HTML",
+            reply_markup=kb,
+        )
+        return
+
+    m = re.match(r"^(?:/)?(?:انتقال|transfer)\s+(.+)$", low2, re.I)
+    if m:
+        amount = parse_amount(m.group(1))
+        if not amount or amount < 1:
+            await u.message.reply_text("نامعتبر")
+            return
+        if not u.message.reply_to_message or not u.message.reply_to_message.from_user:
+            await u.message.reply_text("ریپلای + انتقال 1k")
+            return
+        to = u.message.reply_to_message.from_user
+        if to.id == user.id or to.is_bot:
+            return
+        if bal(d, user.id) < amount:
+            await u.message.reply_text("موجودی کم")
+            return
+        send_amt = amount - int(amount * TAX)
+        kb = InlineKeyboardMarkup([
+            [btn("✅ تأیید", "tr_ok:%s:%s:%s" % (user.id, to.id, amount), "success")],
+            [btn("❌ لغو", "tr_no:%s" % user.id, "danger")],
+        ])
+        await u.message.reply_text(
+            "تأیید؟\n%s → %s\nکسر: %s\nدریافتی: %s" % (mention_user(user), mention_user(to), num(amount), num(send_amt)),
+            parse_mode="HTML",
+            reply_markup=kb,
+        )
+        return
 
 
-async def cmd_withdraw(update, context):
-    await admin_withdraw(update, context)
+async def on_startup(app):
+    d = load()
+    try:
+        await app.bot.send_message(
+            ADMIN_ID,
+            "🤖 روشن شد\nکاربران: %s\nگپ‌ها: %s\nدستور: بازیکنان" % (num(len(all_user_ids(d))), num(len(d.get("known_chats") or []))),
+        )
+    except Exception:
+        pass
 
-
-# ---------------------------- MAIN --------------------------
 
 def main():
-    if BOT_TOKEN == "PASTE_YOUR_BOT_TOKEN_HERE":
-        print("\n[ERROR] BOT_TOKEN را داخل bot.py وارد کن.\n")
-        return
-
-    init_db()
-
-    app = Application.builder().token(BOT_TOKEN).build()
-
-    # Slash commands
+    app = Application.builder().token(BOT_TOKEN).post_init(on_startup).build()
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("panel", cmd_panel))
-    app.add_handler(CommandHandler("games", cmd_games))
-    app.add_handler(CommandHandler("profile", cmd_profile))
-    app.add_handler(CommandHandler("balance", cmd_balance))
-    app.add_handler(CommandHandler("transfer", cmd_transfer))
-    app.add_handler(CommandHandler("deposit", cmd_deposit))
-    app.add_handler(CommandHandler("withdraw", cmd_withdraw))
-
-    # Inline buttons
-    app.add_handler(CallbackQueryHandler(callbacks))
-
-    # Persian text commands
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_commands))
-
-    print("====================================")
-    print("🎮 Game Bot is running...")
-    print("📁 Database:", DB_FILE)
-    print("====================================")
-
-    app.run_polling(drop_pending_updates=True)
+    app.add_handler(CommandHandler("admin", cmd_admin))
+    app.add_handler(CommandHandler("panel", cmd_admin))
+    app.add_handler(CallbackQueryHandler(on_cb))
+    app.add_handler(MessageHandler(filters.TEXT, on_text))
+    log.info("up")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
