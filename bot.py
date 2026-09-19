@@ -1,1665 +1,1448 @@
 # -*- coding: utf-8 -*-
-"""بات ویس کامل: چندزبان، فروشگاه، قمار، استیکر، خوش‌آمد/خداحافظی"""
-from __future__ import annotations
-import os, re, time, logging, sqlite3, threading, tempfile, random, io, json
-from contextlib import contextmanager
-from datetime import datetime, timezone, timedelta
+"""
+Telegram Game Bot - Pydroid 3
+Library: python-telegram-bot 22.x
+Database: SQLite (automatic)
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+IMPORTANT:
+1) Put your BotFather token in BOT_TOKEN below.
+2) Put your Telegram numeric user ID in OWNER_ID.
+3) Install: pip install -U python-telegram-bot
+4) Run: python bot.py
+
+This bot is a game/economy bot only.
+No group moderation, anti-spam, locks, bans, or welcome system.
+The chance games are non-wagering: users do not lose points and there is no cash gambling.
+"""
+
+import logging
+import random
+import sqlite3
+import time
+from datetime import datetime
+from functools import wraps
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ParseMode
 from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler, MessageHandler,
-    ContextTypes, filters,
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
 )
-from telegram.constants import ChatType, ParseMode
-from telegram.request import HTTPXRequest
 
-BOT_TOKEN = "8932340319:AAEEKFbUFWBo_3Bc3NSYy_r8QhrVvXBy1Uk"
-ADMIN_ID = 7530457395
-DB_PATH = "voice_bot.db"
-TZ = timezone(timedelta(hours=3, minutes=30))
+# ============================================================
+# CONFIG - ONLY CHANGE THESE TWO VALUES
+# ============================================================
 
-# voice_id -> (engine, default_label, lang)
-ENGINE = {
-    "fa_f": ("fa-IR-DilaraNeural", "فارسی زن", "fa"),
-    "fa_m": ("fa-IR-FaridNeural", "فارسی مرد", "fa"),
-    "en_f": ("en-US-JennyNeural", "English Female", "en"),
-    "en_m": ("en-US-GuyNeural", "English Male", "en"),
-    "tr_f": ("tr-TR-EmelNeural", "Türkçe Kadın", "tr"),
-    "tr_m": ("tr-TR-AhmetNeural", "Türkçe Erkek", "tr"),
-    "ru_f": ("ru-RU-SvetlanaNeural", "Русский Жен", "ru"),
-    "ru_m": ("ru-RU-DmitryNeural", "Русский Муж", "ru"),
-    "ja_f": ("ja-JP-NanamiNeural", "日本語 女性", "ja"),
-    "ja_m": ("ja-JP-KeitaNeural", "日本語 男性", "ja"),
-}
+BOT_TOKEN = "PASTE_YOUR_BOT_TOKEN_HERE"
+OWNER_ID = 123456789
 
-LANGS = {
-    "fa": "🇮🇷 فارسی",
-    "en": "🇬🇧 English",
-    "tr": "🇹🇷 Türkçe",
-    "ru": "🇷🇺 Русский",
-    "ja": "🇯🇵 日本語",
-}
+# ============================================================
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("voicebot")
-_lock = threading.RLock()
-_sticker_job_started = False
+DB_FILE = "game_bot.db"
+
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
 
 
-def connect():
-    c = sqlite3.connect(DB_PATH, timeout=60, check_same_thread=False)
-    c.row_factory = sqlite3.Row
-    c.execute("PRAGMA journal_mode=WAL")
-    return c
+# ------------------------- DATABASE --------------------------
 
-
-@contextmanager
-def tx():
-    with _lock:
-        c = connect()
-        try:
-            yield c
-            c.commit()
-        except Exception:
-            c.rollback()
-            raise
-        finally:
-            c.close()
+def db():
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
 def init_db():
-    with tx() as c:
-        c.executescript("""
-        CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
-        CREATE TABLE IF NOT EXISTS admins (user_id INTEGER PRIMARY KEY);
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY,
+            user_id INTEGER PRIMARY KEY,
             username TEXT DEFAULT '',
-            name TEXT DEFAULT '',
-            gender TEXT DEFAULT 'fa_f',
-            speed TEXT DEFAULT 'normal',
-            lang TEXT DEFAULT 'fa',
-            tokens INTEGER DEFAULT 0,
-            tokens_day TEXT DEFAULT '',
+            first_name TEXT DEFAULT '',
             points INTEGER DEFAULT 0,
-            voices_total INTEGER DEFAULT 0,
+            tokens INTEGER DEFAULT 0,
+            xp INTEGER DEFAULT 0,
             level INTEGER DEFAULT 1,
-            last_voice REAL DEFAULT 0,
-            referred_by INTEGER,
-            blocked INTEGER DEFAULT 0,
-            joined_at REAL
-        );
-        CREATE TABLE IF NOT EXISTS groups (
-            chat_id INTEGER PRIMARY KEY,
-            title TEXT,
-            active INTEGER DEFAULT 1
-        );
+            games INTEGER DEFAULT 0,
+            lucky_plays INTEGER DEFAULT 0,
+            wins INTEGER DEFAULT 0,
+            created_at INTEGER
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS admins (
+            user_id INTEGER PRIMARY KEY,
+            role TEXT NOT NULL,
+            added_at INTEGER
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            amount INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            actor_id INTEGER,
+            target_id INTEGER,
+            note TEXT DEFAULT '',
+            created_at INTEGER
+        )
+    """)
+
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS gift_codes (
             code TEXT PRIMARY KEY,
-            amount INTEGER,
-            uses_left INTEGER,
-            expires REAL,
-            only_chat_id INTEGER,
-            active INTEGER DEFAULT 1
-        );
-        CREATE TABLE IF NOT EXISTS gift_uses (
-            code TEXT, user_id INTEGER, PRIMARY KEY(code, user_id)
-        );
+            amount INTEGER NOT NULL,
+            max_uses INTEGER NOT NULL,
+            uses INTEGER DEFAULT 0,
+            created_by INTEGER,
+            expires_at INTEGER DEFAULT 0
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS gift_claims (
+            code TEXT,
+            user_id INTEGER,
+            claimed_at INTEGER,
+            PRIMARY KEY(code, user_id)
+        )
+    """)
+
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS shop (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT,
-            token_amount INTEGER,
-            price_points INTEGER,
+            name TEXT NOT NULL,
+            price INTEGER NOT NULL,
+            stock INTEGER DEFAULT -1,
+            description TEXT DEFAULT '',
             active INTEGER DEFAULT 1
-        );
-        CREATE TABLE IF NOT EXISTS gamble_opts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT,
-            multiplier REAL,
-            win_chance REAL,
-            active INTEGER DEFAULT 1
-        );
-        CREATE TABLE IF NOT EXISTS stickers (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            file_id TEXT,
-            chat_id INTEGER,
-            active INTEGER DEFAULT 1
-        );
-        CREATE TABLE IF NOT EXISTS human_lines (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            keyword TEXT,
-            answer TEXT
-        );
-        """)
-        c.execute("INSERT OR IGNORE INTO admins(user_id) VALUES (?)", (ADMIN_ID,))
-        defaults = {
-            "daily_tokens": "20",
-            "token_cost": "1",
-            "max_chars": "400",
-            "spam_sec": "5",
-            "points_per_voice": "2",
-            "token_price_points": "10",
-            "ref_tokens": "5",
-            "gender_lock": "0",
-            "locked_gender": "fa_f",
-            "welcome_enabled": "1",
-            "leave_enabled": "1",
-            "caption": "🎙 این ویس از طرف {mention}",
-            "caption_style": "none",
-            "default_welcome": "سلام! از منو زبان و صدا را تنظیم کن.",
-            "help_text": "",
-            "member_welcome": "سلام {mention} خوش آمدی 👋",
-            "member_leave": "خداحافظ {name} 👋",
-            "welcome_media_type": "",
-            "welcome_media_id": "",
-            "leave_media_type": "",
-            "leave_media_id": "",
-            "token_emoji": "💎",
-            "token_msg": "{emoji} موجودی توکن شما",
-            "lang_fa": "1", "lang_en": "1", "lang_tr": "1", "lang_ru": "1", "lang_ja": "1",
-            "sticker_interval": "0",
-            "sticker_chat_id": "0",
-            "human_enabled": "1",
-        }
-        for k, v in defaults.items():
-            c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)", (k, v))
-        for vid, (_, label, _) in ENGINE.items():
-            c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)", ("voice_" + vid, label))
-
-
-def sget(k, d=None):
-    with tx() as c:
-        r = c.execute("SELECT value FROM settings WHERE key=?", (k,)).fetchone()
-        return r["value"] if r else d
-
-
-def sset(k, v):
-    with tx() as c:
-        c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES (?,?)", (k, str(v)))
-
-
-def sint(k, d=0):
-    try:
-        return int(float(sget(k, d)))
-    except Exception:
-        return int(d)
-
-
-def is_admin(uid):
-    uid = int(uid)
-    if uid == ADMIN_ID:
-        return True
-    with tx() as c:
-        return bool(c.execute("SELECT 1 FROM admins WHERE user_id=?", (uid,)).fetchone())
-
-
-def today_str():
-    return datetime.now(TZ).strftime("%Y-%m-%d")
-
-
-def voice_label(vid):
-    return sget("voice_" + vid, ENGINE.get(vid, ("", vid, ""))[1])
-
-
-def ensure_user(user):
-    if not user or getattr(user, "is_bot", False):
-        return
-    now = time.time()
-    day = today_str()
-    daily = sint("daily_tokens", 20)
-    with tx() as c:
-        r = c.execute("SELECT * FROM users WHERE id=?", (user.id,)).fetchone()
-        if not r:
-            c.execute(
-                "INSERT INTO users(id,username,name,tokens,tokens_day,joined_at) VALUES (?,?,?,?,?,?)",
-                (user.id, user.username or "", user.full_name or str(user.id), daily, day, now),
-            )
-        else:
-            c.execute(
-                "UPDATE users SET username=?, name=? WHERE id=?",
-                (user.username or "", user.full_name or str(user.id), user.id),
-            )
-            if (r["tokens_day"] or "") != day:
-                bonus = max(0, (int(r["level"] or 1) - 1) * 2)
-                c.execute(
-                    "UPDATE users SET tokens=?, tokens_day=? WHERE id=?",
-                    (daily + bonus, day, user.id),
-                )
-
-
-def get_user(uid):
-    with tx() as c:
-        return c.execute("SELECT * FROM users WHERE id=?", (int(uid),)).fetchone()
-
-
-def btn(text, data, style=None):
-    kw = {"text": str(text)[:64], "callback_data": str(data)[:64]}
-    if style in ("success", "danger", "primary"):
-        kw["style"] = style
-    try:
-        return InlineKeyboardButton(**kw)
-    except TypeError:
-        kw.pop("style", None)
-        return InlineKeyboardButton(**kw)
-
-
-def set_st(ctx, kind, extra=None):
-    ctx.user_data["st"] = {"kind": kind, "extra": extra or {}, "ts": time.time()}
-
-
-def get_st(ctx):
-    st = ctx.user_data.get("st")
-    if not st:
-        return None
-    if time.time() - st.get("ts", 0) > 900:
-        ctx.user_data.pop("st", None)
-        return None
-    return st
-
-
-def clear_st(ctx):
-    ctx.user_data.pop("st", None)
-
-
-def calc_level(v):
-    return max(1, int(v) // 50 + 1)
-
-
-def mention_html(user):
-    return '<a href="tg://user?id=%s">%s</a>' % (user.id, user.full_name or user.id)
-
-
-def mono(s):
-    return "<code>%s</code>" % str(s).replace("<", "").replace(">", "")
-
-
-VARS_HELP = (
-    "متغیرها:\n"
-    + mono("{mention}") + " تگ قابل‌کلیک\n"
-    + mono("{name}") + " اسم\n"
-    + mono("{username}") + " یوزرنیم\n"
-    + mono("{id}") + " آیدی عددی\n"
-    + mono("{gender}") + " نام صدا\n"
-    + mono("{speed}") + " سرعت\n"
-    + mono("{date}") + " تاریخ\n"
-    + mono("{time}") + " ساعت\n"
-    + mono("{chat}") + " اسم گپ\n"
-    + mono("{tokens}") + " توکن\n"
-    + mono("{emoji}") + " ایموجی توکن\n"
-    + mono("{level}") + " سطح\n"
-    + mono("{points}") + " امتیاز"
-)
-
-SETTINGS_HELP = (
-    "تنظیمات — این‌طور بفرست:\n"
-    + mono("daily_tokens 20") + " توکن روزانه\n"
-    + mono("token_cost 1") + " هزینه هر ویس\n"
-    + mono("max_chars 400") + " سقف طول متن\n"
-    + mono("spam_sec 5") + " فاصله دو ویس (ثانیه)\n"
-    + mono("points_per_voice 2") + " امتیاز هر ویس\n"
-    + mono("ref_tokens 5") + " پاداش دعوت\n"
-    + mono("gender_lock 0") + " 0 آزاد / 1 قفل صدا\n"
-    + mono("locked_gender fa_f") + " صدا وقتی قفل روشن است"
-)
-
-
-def apply_style(text, style):
-    style = (style or "none").lower()
-    if style == "bold":
-        return "<b>%s</b>" % text
-    if style == "italic":
-        return "<i>%s</i>" % text
-    if style == "mono":
-        return "<code>%s</code>" % text
-    if style == "spoiler":
-        return "<tg-spoiler>%s</tg-spoiler>" % text
-    if style == "quote":
-        return "<blockquote>%s</blockquote>" % text
-    if style == "underline":
-        return "<u>%s</u>" % text
-    if style == "strike":
-        return "<s>%s</s>" % text
-    # fake fonts via unicode
-    if style == "fancy":
-        return to_fancy(text)
-    if style == "boldu":
-        return to_bold_unicode(text)
-    if style == "italicu":
-        return to_italic_unicode(text)
-    return text
-
-
-def _map_chars(text, base_upper, base_lower):
-    out = []
-    for ch in text:
-        if "A" <= ch <= "Z":
-            out.append(chr(base_upper + ord(ch) - 65))
-        elif "a" <= ch <= "z":
-            out.append(chr(base_lower + ord(ch) - 97))
-        else:
-            out.append(ch)
-    return "".join(out)
-
-
-def to_bold_unicode(t):
-    return _map_chars(t, 0x1D400, 0x1D41A)
-
-
-def to_italic_unicode(t):
-    return _map_chars(t, 0x1D434, 0x1D44E)
-
-
-def to_fancy(t):
-    return _map_chars(t, 0x1D4D0, 0x1D4EA)
-
-
-def render_tpl(template, user, gender_label="", speed_label="", tokens_left="", chat_title=""):
-    t = template or ""
-    rep = {
-        "{mention}": mention_html(user),
-        "{name}": user.full_name or "",
-        "{username}": ("@" + user.username) if getattr(user, "username", None) else "",
-        "{id}": str(user.id),
-        "{gender}": gender_label,
-        "{speed}": speed_label,
-        "{date}": datetime.now(TZ).strftime("%Y/%m/%d"),
-        "{time}": datetime.now(TZ).strftime("%H:%M"),
-        "{chat}": chat_title or "",
-        "{tokens_left}": str(tokens_left),
-        "{tokens}": str(tokens_left),
-        "{emoji}": sget("token_emoji", "💎"),
-        "{level}": "",
-        "{points}": "",
-    }
-    for k, v in rep.items():
-        t = t.replace(k, str(v))
-    return apply_style(t, sget("caption_style", "none"))
-
-
-
-def translate_text(text, target_lang):
-    """ترجمه متن به زبان کاربر. fa نیاز به ترجمه ندارد."""
-    target_lang = (target_lang or "fa").lower()
-    if target_lang == "fa" or not text:
-        return text
-    try:
-        from deep_translator import GoogleTranslator
-        # deep-translator codes
-        code = {"en": "en", "tr": "tr", "ru": "ru", "ja": "ja", "fa": "fa"}.get(target_lang, "en")
-        out = GoogleTranslator(source="auto", target=code).translate(text)
-        return out or text
-    except Exception as e:
-        log.warning("translate fail: %s", e)
-        return text
-
-
-def voice_for_lang(lang, current_gender):
-    """صدای مناسب زبان؛ جنسیت را تا حد ممکن حفظ می‌کند."""
-    lang = (lang or "fa").lower()
-    male = str(current_gender or "").endswith("_m") or str(current_gender or "").startswith("m")
-    suffix = "_m" if male else "_f"
-    vid = lang + suffix
-    if vid in ENGINE:
-        return vid
-    # fallback any voice of that lang
-    for k in ENGINE:
-        if k.startswith(lang + "_"):
-            return k
-    return current_gender if current_gender in ENGINE else "fa_f"
-
-
-def rate_for_speed(speed):
-
-    if speed == "fast":
-        return "+25%"
-    if speed == "slow":
-        return "-20%"
-    return "+0%"
-
-
-def group_allowed(chat_id):
-    with tx() as c:
-        n = c.execute("SELECT COUNT(*) c FROM groups WHERE active=1").fetchone()["c"]
-        if n == 0:
-            return True
-        return bool(c.execute("SELECT 1 FROM groups WHERE chat_id=? AND active=1", (int(chat_id),)).fetchone())
-
-
-async def bot_can_delete(bot, chat_id):
-    try:
-        from telegram.constants import ChatMemberStatus
-        me = await bot.get_me()
-        m = await bot.get_chat_member(chat_id, me.id)
-        if m.status in (ChatMemberStatus.OWNER, "creator"):
-            return True
-        if m.status in (ChatMemberStatus.ADMINISTRATOR, "administrator"):
-            return bool(getattr(m, "can_delete_messages", False))
-    except Exception:
-        pass
-    return False
-
-
-async def tts_save(text, voice_id, speed, path):
-    eng = ENGINE.get(voice_id, ENGINE["fa_f"])[0]
-    rate = rate_for_speed(speed)
-    try:
-        import edge_tts
-        await edge_tts.Communicate(text, eng, rate=rate).save(path)
-        return
-    except Exception as e:
-        log.warning("edge_tts: %s", e)
-    try:
-        from gtts import gTTS
-        lang = ENGINE.get(voice_id, ENGINE["fa_f"])[2]
-        if lang == "ja":
-            lang = "ja"
-        elif lang not in ("en", "tr", "ru", "fa", "ja"):
-            lang = "en"
-        gTTS(text=text, lang=("fa" if lang == "fa" else lang)).save(path)
-    except Exception as e:
-        raise RuntimeError("TTS failed: %s" % e)
-
-
-def parse_voice_cmd(text: str):
-    if not text:
-        return None
-    m = re.match(r"^-\s*س\s+(.*)$", text)
-    if m:
-        return m.group(1).strip() or None
-    m = re.match(r"^-\s+(.*)$", text)
-    if m:
-        return m.group(1).strip() or None
-    m = re.match(r"^-(.*)$", text)
-    if m:
-        body = m.group(1).strip()
-        if body.startswith("س "):
-            body = body[2:].strip()
-        elif body == "س":
-            return None
-        return body or None
-    return None
-
-
-def enabled_langs():
-    return [k for k in LANGS if sget("lang_" + k, "1") == "1"]
-
-
-def pm_kb(uid):
-    return InlineKeyboardMarkup([
-        [btn("🎭 صدا", "pm:voice:%s" % uid, "primary"), btn("⚡ سرعت", "pm:speed:%s" % uid, "primary")],
-        [btn("💎 توکن‌های من", "pm:tok:%s" % uid, "success")],
-        [btn("🛒 فروشگاه", "pm:shop:%s" % uid, "success"), btn("🎰 قمار", "pm:gamble:%s" % uid, "danger")],
-        [btn("🔗 دعوت", "pm:ref:%s" % uid, "primary"), btn("🎁 کد هدیه", "pm:gift:%s" % uid, "success")],
-        [btn("📖 راهنما", "pm:help:%s" % uid, "primary")],
-    ])
-
-
-def admin_kb():
-    return InlineKeyboardMarkup([
-        [btn("⚙️ تنظیمات", "a:settings", "primary")],
-        [btn("🛒 فروشگاه", "a:shop", "success"), btn("🎰 قمار", "a:gamble", "danger")],
-        [btn("📢 گپ‌ها", "a:groups", "primary"), btn("🎁 کد هدیه", "a:gift", "success")],
-        [btn("📝 کپشن", "a:caption", "primary"), btn("🎨 استایل کپشن", "a:cstyle", "primary")],
-        [btn("🎭 اسم صدا", "a:vnames", "primary"), btn("💎 ایموجی توکن", "a:temoji", "success")],
-        [btn("💬 قالب توکن", "a:tmsg", "primary"), btn("📦 واریز همگانی", "a:mass", "success")],
-        [btn("👋 خوش‌آمد/لفت", "a:welmenu", "primary"), btn("🖼 مدیا خوش‌آمد", "a:welmedia", "primary")],
-        [btn("🎫 استیکر تایمر", "a:stick", "primary"), btn("🗣 حرف انسانی", "a:human", "primary")],
-        [btn("➕ واریز تکی", "a:addtok", "success"), btn("🚫 بلک‌لیست", "a:block", "danger")],
-        [btn("👤 ادمین", "a:adm", "primary"), btn("📊 آمار", "a:stats", "primary")],
-        [btn("❌ بستن", "a:close", "danger")],
-    ])
-
-
-# ── handlers ──
-async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    try:
-        user = u.effective_user
-        if not u.message or not user:
-            return
-        ensure_user(user)
-        text = u.message.text or ""
-        m = re.search(r"ref[_-]?(\d+)", text)
-        if m:
-            ref = int(m.group(1))
-            if ref != user.id:
-                with tx() as conn:
-                    uu = conn.execute("SELECT referred_by FROM users WHERE id=?", (user.id,)).fetchone()
-                    if uu and not uu["referred_by"]:
-                        conn.execute("UPDATE users SET referred_by=? WHERE id=?", (ref, user.id))
-                        conn.execute("UPDATE users SET tokens=tokens+? WHERE id=?", (sint("ref_tokens", 5), ref))
-                try:
-                    await c.bot.send_message(ref, "🎉 دعوت موفق! +%s توکن" % sint("ref_tokens", 5))
-                except Exception:
-                    pass
-        if u.effective_chat.type != ChatType.PRIVATE:
-            await u.message.reply_text("پیوی ربات را استارت کن.")
-            return
-        uu = get_user(user.id)
-        await u.message.reply_text(
-            sget("default_welcome", "سلام!")
-            + "\n\n💎 %s | ⭐ %s | 📶 %s" % (uu["tokens"], uu["points"], uu["level"]),
-            reply_markup=pm_kb(user.id),
         )
-    except Exception:
-        log.exception("start")
+    """)
 
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS purchases (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            item_id INTEGER,
+            price INTEGER,
+            created_at INTEGER
+        )
+    """)
 
-async def cmd_help(u, c):
-    ensure_user(u.effective_user)
-    h = (sget("help_text") or "").strip() or "در گپ: -متن\nپیوی: منو برای تنظیمات و فروشگاه و قمار"
-    await u.message.reply_text(h)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS lucky_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            game TEXT,
+            result TEXT,
+            reward INTEGER,
+            created_at INTEGER
+        )
+    """)
 
-
-
-async def start_gamble(u: Update, c: ContextTypes.DEFAULT_TYPE, amount: int):
-    """قمار مبلغ → انتخاب ضریب → انیمیشن → نتیجه"""
-    user = u.effective_user
-    ensure_user(user)
-    uu = get_user(user.id)
-    if not uu or int(uu["blocked"] or 0):
-        return
-    if amount < 1:
-        await u.effective_message.reply_text("مبلغ نامعتبر")
-        return
-    if int(uu["tokens"]) < amount:
-        await u.effective_message.reply_text("توکن کافی نیست. موجودی: %s" % uu["tokens"])
-        return
-    with tx() as conn:
-        opts = conn.execute("SELECT * FROM gamble_opts WHERE active=1 ORDER BY id").fetchall()
-    if not opts:
-        await u.effective_message.reply_text("قمار فعال نیست. ادمین ضریب تعریف کند.")
-        return
-    rows = []
-    for o in opts:
-        rows.append([btn(
-            "%s | برد x%s | باخت -1 | %s%%" % (o["title"], o["multiplier"], o["win_chance"]),
-            "g:run:%s:%s:%s" % (o["id"], amount, user.id),
-            "danger",
-        )])
-    rows.append([btn("لغو", "g:cancel:%s" % user.id, "primary")])
-    await u.effective_message.reply_text(
-        "🎰 شرط: <b>%s</b> توکن\nیک ضریب را انتخاب کن:\n• ضریب برد = سود در صورت برد\n• باخت = از دست دادن همان مبلغ" % amount,
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(rows),
+    # Owner is always an owner.
+    cur.execute(
+        "INSERT OR REPLACE INTO admins(user_id, role, added_at) VALUES(?,?,?)",
+        (OWNER_ID, "owner", int(time.time()))
     )
 
+    conn.commit()
+    conn.close()
 
-async def run_gamble_animation(q, context, opt_id, amount, user_id):
-    import asyncio
-    user = q.from_user
-    if int(user.id) != int(user_id):
-        await q.answer("این قمار برای تو نیست", show_alert=True)
-        return
-    with tx() as conn:
-        opt = conn.execute("SELECT * FROM gamble_opts WHERE id=? AND active=1", (opt_id,)).fetchone()
-        uu = conn.execute("SELECT tokens FROM users WHERE id=?", (user_id,)).fetchone()
-    if not opt:
-        await q.edit_message_text("این ضریب دیگر فعال نیست.")
-        return
-    if not uu or int(uu["tokens"]) < amount:
-        await q.edit_message_text("توکن کافی نیست.")
-        return
 
-    # انیمیشن ادیت
-    for dots in (".", "..", "...", "...."):
-        try:
-            await q.edit_message_text("🎰 در حال انجام شرط\n" + dots)
-        except Exception:
-            pass
-        await asyncio.sleep(0.45)
+def register_user(tg_user):
+    conn = db()
+    now = int(time.time())
+    conn.execute("""
+        INSERT INTO users(user_id, username, first_name, created_at)
+        VALUES(?,?,?,?,?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            username=excluded.username,
+            first_name=excluded.first_name
+    """, (
+        tg_user.id,
+        tg_user.username or "",
+        tg_user.first_name or "",
+        now
+    ))
+    conn.commit()
+    conn.close()
 
-    win = random.random() * 100 < float(opt["win_chance"])
-    mult = float(opt["multiplier"])
-    with tx() as conn:
-        # اول مبلغ را کم کن
-        conn.execute("UPDATE users SET tokens=tokens-? WHERE id=? AND tokens>=?", (amount, user_id, amount))
-        ch = conn.execute("SELECT changes() AS c").fetchone()["c"]
-        if not ch:
-            await q.edit_message_text("توکن کافی نیست.")
-            return
-        if win:
-            # برگشت مبلغ * ضریب
-            gain = int(amount * mult)
-            conn.execute("UPDATE users SET tokens=tokens+? WHERE id=?", (gain, user_id))
-            result_line = "✅ <b>برد</b>\nضریب برد: <code>x%s</code>\nبرداشت: <b>+%s</b>" % (mult, gain)
-        else:
-            result_line = "❌ <b>باخت</b>\nضریب باخت: <code>x-1</code>\nاز دست رفت: <b>-%s</b>" % amount
-        left = conn.execute("SELECT tokens FROM users WHERE id=?", (user_id,)).fetchone()["tokens"]
 
-    emoji = sget("token_emoji", "💎")
-    text = (
-        "🎰 نتیجه قمار\n"
-        + "بسته: <b>%s</b>\n" % (opt["title"],)
-        + "شرط: <code>%s</code>\n" % amount
-        + result_line
-        + "\n%s موجودی: <b>%s</b>" % (emoji, left)
+def get_user(user_id):
+    conn = db()
+    row = conn.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
+    conn.close()
+    return row
+
+
+def change_points(user_id, amount, kind, actor_id=None, target_id=None, note=""):
+    conn = db()
+    row = conn.execute("SELECT points FROM users WHERE user_id=?", (user_id,)).fetchone()
+    if not row:
+        conn.close()
+        return False, 0
+
+    new_balance = row["points"] + amount
+    if new_balance < 0:
+        conn.close()
+        return False, row["points"]
+
+    conn.execute(
+        "UPDATE users SET points=? WHERE user_id=?",
+        (new_balance, user_id)
     )
-    await q.edit_message_text(
-        text,
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([
-            [btn("%s %s" % (emoji, left), "noop", "success")],
-        ]),
-    )
+    conn.execute("""
+        INSERT INTO transactions
+        (user_id, amount, kind, actor_id, target_id, note, created_at)
+        VALUES(?,?,?,?,?,?,?)
+    """, (user_id, amount, kind, actor_id, target_id, note, int(time.time())))
+    conn.commit()
+    conn.close()
+    return True, new_balance
 
 
-async def do_voice(update, context, body):
-    msg = update.message or update.effective_message
-    user = update.effective_user
-    chat = update.effective_chat
-    if not msg or not user:
+# -------------------------- ROLES ---------------------------
+
+ROLE_NAMES = {
+    "owner": "👑 مالک",
+    "senior": "🛡 مدیر ارشد",
+    "settings": "⚙️ مدیر تنظیمات",
+    "economy": "💰 مدیر اقتصاد",
+    "rewards": "🎁 مدیر جوایز",
+    "shop": "🏪 مدیر فروشگاه",
+    "game": "🎮 مدیر بازی",
+    "stats": "📊 مدیر آمار",
+}
+
+
+def get_role(user_id):
+    if user_id == OWNER_ID:
+        return "owner"
+    conn = db()
+    row = conn.execute("SELECT role FROM admins WHERE user_id=?", (user_id,)).fetchone()
+    conn.close()
+    return row["role"] if row else None
+
+
+def can_manage(user_id, allowed):
+    role = get_role(user_id)
+    if role == "owner":
+        return True
+    return role in allowed
+
+
+def role_label(role):
+    return ROLE_NAMES.get(role, role)
+
+
+# ------------------------- KEYBOARDS -------------------------
+
+def main_keyboard(user_id):
+    buttons = [
+        [
+            InlineKeyboardButton("🎮 بازی", callback_data="menu_games"),
+            InlineKeyboardButton("🏦 بانک", callback_data="menu_bank"),
+        ],
+        [
+            InlineKeyboardButton("🛒 فروشگاه", callback_data="menu_shop"),
+            InlineKeyboardButton("🎁 کد هدیه", callback_data="menu_gift"),
+        ],
+        [
+            InlineKeyboardButton("🏆 رتبه‌بندی", callback_data="menu_rank"),
+            InlineKeyboardButton("📊 آمار", callback_data="menu_stats"),
+        ],
+        [
+            InlineKeyboardButton("👤 پروفایل", callback_data="menu_profile"),
+            InlineKeyboardButton("📖 راهنما", callback_data="menu_help"),
+        ],
+    ]
+
+    if get_role(user_id):
+        buttons.append([
+            InlineKeyboardButton("👑 پنل مدیریت", callback_data="admin_panel")
+        ])
+
+    buttons.append([InlineKeyboardButton("❌ بستن", callback_data="close")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def back_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔙 بازگشت", callback_data="main")]
+    ])
+
+
+def admin_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("👑 مدیران", callback_data="admin_roles"),
+            InlineKeyboardButton("💰 اقتصاد", callback_data="admin_economy"),
+        ],
+        [
+            InlineKeyboardButton("🎁 جوایز", callback_data="admin_rewards"),
+            InlineKeyboardButton("🛒 فروشگاه", callback_data="admin_shop"),
+        ],
+        [
+            InlineKeyboardButton("🎮 بازی", callback_data="admin_game"),
+            InlineKeyboardButton("📊 آمار", callback_data="admin_stats"),
+        ],
+        [InlineKeyboardButton("🔙 بازگشت", callback_data="main")],
+    ])
+
+
+# -------------------------- HELPERS --------------------------
+
+def fmt(n):
+    return f"{int(n):,}"
+
+
+def now_text():
+    return datetime.now().strftime("%Y-%m-%d %H:%M")
+
+
+def level_for_xp(xp):
+    # Simple progression: every 500 XP = one level.
+    return max(1, xp // 500 + 1)
+
+
+def add_xp(user_id, amount):
+    conn = db()
+    row = conn.execute("SELECT xp FROM users WHERE user_id=?", (user_id,)).fetchone()
+    if not row:
+        conn.close()
         return
-    ensure_user(user)
-    uu = get_user(user.id)
-    if not uu or int(uu["blocked"] or 0):
-        return
-    if chat.type != ChatType.PRIVATE and not group_allowed(chat.id):
-        return
-    cost = sint("token_cost", 1)
-    if int(uu["tokens"]) < cost:
-        try:
-            await msg.reply_text("توکن کافی نیست.")
-        except Exception:
-            pass
-        return
-    spam = sint("spam_sec", 5)
-    if spam > 0 and float(uu["last_voice"] or 0) + spam > time.time():
-        try:
-            await msg.reply_text("صبر کن %s ثانیه" % int(float(uu["last_voice"]) + spam - time.time()))
-        except Exception:
-            pass
-        return
-    body = body[: sint("max_chars", 400)]
-    # بدون ترجمه — همان متن کاربر با صدای انتخابی خوانده می‌شود
-    gender = uu["gender"] or "fa_f"
-    if sget("gender_lock", "0") == "1":
-        gender = sget("locked_gender", "fa_f")
-    speed = uu["speed"] or "normal"
-    target = getattr(msg, "reply_to_message", None)
-    path = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False).name
-    try:
-        await tts_save(body, gender, speed, path)
-        with tx() as conn:
-            conn.execute(
-                "UPDATE users SET tokens=tokens-?, points=points+?, voices_total=voices_total+1, last_voice=?, level=? WHERE id=?",
-                (cost, sint("points_per_voice", 2), time.time(), calc_level(int(uu["voices_total"]) + 1), user.id),
+    xp = row["xp"] + amount
+    level = level_for_xp(xp)
+    conn.execute("UPDATE users SET xp=?, level=? WHERE user_id=?", (xp, level, user_id))
+    conn.commit()
+    conn.close()
+
+
+def mention_user(row):
+    name = row["first_name"] or row["username"] or str(row["user_id"])
+    return name.replace("<", "").replace(">", "")
+
+
+def reply_required(func):
+    @wraps(func)
+    async def wrapper(update, context):
+        if not update.message.reply_to_message:
+            await update.message.reply_text(
+                "❗ این دستور باید با ریپلای روی پیام کاربر استفاده شود."
             )
-        uu2 = get_user(user.id)
-        sl = {"slow": "آرام", "fast": "سریع"}.get(speed, "عادی")
-        cap = render_tpl(sget("caption", "{mention}"), user, voice_label(gender), sl, uu2["tokens"], getattr(chat, "title", "") or "")
-        with open(path, "rb") as f:
-            if target is not None:
-                sent = await target.reply_voice(voice=f, caption=cap, parse_mode="HTML")
-            else:
-                sent = await msg.reply_voice(voice=f, caption=cap, parse_mode="HTML")
-        try:
-            await context.bot.set_message_reaction(chat.id, sent.message_id, reaction="🎙")
-        except Exception:
-            pass
-        if chat.type != ChatType.PRIVATE and await bot_can_delete(context.bot, chat.id):
-            try:
-                await context.bot.delete_message(chat.id, msg.message_id)
-            except Exception:
-                pass
-    except Exception as e:
-        log.exception("voice")
-        try:
-            await msg.reply_text("⚠️ " + str(e)[:140])
-        except Exception:
-            pass
-    finally:
-        try:
-            os.unlink(path)
-        except Exception:
-            pass
+            return
+        return await func(update, context)
+    return wrapper
 
 
-async def convert_to_photo(update, context, kind):
-    msg = update.effective_message
-    if not msg.reply_to_message:
-        await msg.reply_text("روی استیکر یا گیف ریپلای کن.")
+# --------------------------- START --------------------------
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    register_user(update.effective_user)
+    text = (
+        "🎮 <b>به بازی خوش آمدی!</b>\n\n"
+        "💰 پوینت جمع کن، بازی کن، خرید کن و رتبه‌ات را بالا ببر.\n\n"
+        "از دکمه‌های زیر استفاده کن یا در گپ دستورات متنی را بفرست."
+    )
+    await update.message.reply_text(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=main_keyboard(update.effective_user.id)
+    )
+
+
+# ----------------------- PROFILE / BANK ---------------------
+
+async def show_profile(update, user_id):
+    u = get_user(user_id)
+    if not u:
+        return "❌ کاربر ثبت نشده است."
+
+    username = f"@{u['username']}" if u["username"] else "بدون یوزرنیم"
+    return (
+        f"👤 <b>پروفایل</b>\n\n"
+        f"نام: {mention_user(u)}\n"
+        f"یوزرنیم: {username}\n"
+        f"🆔 ID: <code>{u['user_id']}</code>\n\n"
+        f"💰 پوینت: <b>{fmt(u['points'])}</b>\n"
+        f"💎 توکن: <b>{fmt(u['tokens'])}</b>\n"
+        f"⭐ XP: <b>{fmt(u['xp'])}</b>\n"
+        f"🏅 Level: <b>{u['level']}</b>\n"
+        f"🎮 بازی‌ها: {fmt(u['games'])}\n"
+        f"🏆 بردها: {fmt(u['wins'])}"
+    )
+
+
+async def bank_text(user_id):
+    u = get_user(user_id)
+    return (
+        "🏦 <b>بانک</b>\n\n"
+        f"💰 موجودی: <b>{fmt(u['points'])}</b> پوینت\n"
+        f"💎 توکن: <b>{fmt(u['tokens'])}</b>\n\n"
+        "برای انتقال به کاربر، روی پیام او ریپلای کن و بنویس:\n"
+        "<code>انتقال 1000</code>"
+    )
+
+
+# --------------------------- GAMES --------------------------
+
+async def games_menu(update, context):
+    text = (
+        "🎮 <b>بازی‌ها</b>\n\n"
+        "🎲 تاس روزانه — دریافت جایزه تصادفی بدون شرط‌بندی\n"
+        "🎡 چرخ شانس — جایزه تصادفی بدون کم‌شدن موجودی\n"
+        "🎁 جعبه شانس — یک جایزه رایگان\n\n"
+        "هیچ‌کدام نیاز به پرداخت یا شرط‌بندی ندارند."
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎲 تاس روزانه", callback_data="game_dice")],
+        [InlineKeyboardButton("🎡 چرخ شانس", callback_data="game_wheel")],
+        [InlineKeyboardButton("🎁 جعبه شانس", callback_data="game_box")],
+        [InlineKeyboardButton("🔙 بازگشت", callback_data="main")],
+    ])
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+async def play_lucky(update, context, game):
+    uid = update.effective_user.id
+    register_user(update.effective_user)
+
+    # Simple daily cooldown per game.
+    conn = db()
+    last = conn.execute("""
+        SELECT created_at FROM lucky_log
+        WHERE user_id=? AND game=?
+        ORDER BY id DESC LIMIT 1
+    """, (uid, game)).fetchone()
+
+    if last and int(time.time()) - last["created_at"] < 24 * 3600:
+        remaining = 24 * 3600 - (int(time.time()) - last["created_at"])
+        h = remaining // 3600
+        m = (remaining % 3600) // 60
+        conn.close()
+        return f"⏳ این بازی را امروز انجام داده‌ای.\nزمان باقی‌مانده: {h} ساعت و {m} دقیقه"
+
+    rewards = [100, 250, 500, 1000, 2500, 5000]
+    weights = [30, 25, 20, 12, 8, 5]
+    reward = random.choices(rewards, weights=weights, k=1)[0]
+
+    labels = {
+        "dice": "🎲 تاس روزانه",
+        "wheel": "🎡 چرخ شانس",
+        "box": "🎁 جعبه شانس",
+    }
+
+    conn.execute("""
+        INSERT INTO lucky_log(user_id, game, result, reward, created_at)
+        VALUES(?,?,?,?,?)
+    """, (uid, game, str(reward), reward, int(time.time())))
+    conn.execute("""
+        UPDATE users
+        SET points=points+?, games=games+1, lucky_plays=lucky_plays+1, wins=wins+1
+        WHERE user_id=?
+    """, (reward, uid))
+    conn.commit()
+    conn.close()
+
+    add_xp(uid, 50)
+
+    return (
+        f"{labels.get(game, '🎮 بازی')}\n\n"
+        f"🎉 جایزه تو: <b>{fmt(reward)}</b> پوینت\n"
+        f"💰 موجودی جدید: <b>{fmt(get_user(uid)['points'])}</b>\n"
+        f"⭐ +50 XP"
+    )
+
+
+# ------------------------- SHOP -----------------------------
+
+async def shop_text():
+    conn = db()
+    rows = conn.execute("SELECT * FROM shop WHERE active=1 ORDER BY id").fetchall()
+    conn.close()
+
+    if not rows:
+        return "🛒 <b>فروشگاه</b>\n\nفعلاً آیتمی برای فروش وجود ندارد."
+
+    lines = ["🛒 <b>فروشگاه</b>\n"]
+    for r in rows:
+        stock = "∞" if r["stock"] < 0 else fmt(r["stock"])
+        lines.append(
+            f"#{r['id']} — <b>{r['name']}</b>\n"
+            f"💰 قیمت: {fmt(r['price'])}\n"
+            f"📦 موجودی: {stock}\n"
+            f"📝 {r['description']}\n"
+            f"برای خرید: <code>خرید {r['id']}</code>\n"
+        )
+    return "\n".join(lines)
+
+
+async def buy_item(update, context, item_id):
+    uid = update.effective_user.id
+    register_user(update.effective_user)
+
+    conn = db()
+    item = conn.execute(
+        "SELECT * FROM shop WHERE id=? AND active=1", (item_id,)
+    ).fetchone()
+
+    if not item:
+        conn.close()
+        await update.message.reply_text("❌ آیتم پیدا نشد.")
         return
-    src = msg.reply_to_message
-    file_id = None
-    if kind == "sticker" and src.sticker:
-        if src.sticker.is_animated or src.sticker.is_video:
-            await msg.reply_text("استیکر متحرک پشتیبانی نمی‌شود.")
-            return
-        file_id = src.sticker.file_id
-    elif kind == "gif":
-        if src.animation:
-            file_id = src.animation.file_id
-        elif src.document and (src.document.mime_type or "").startswith("image/gif"):
-            file_id = src.document.file_id
-        else:
-            await msg.reply_text("روی گیف ریپلای کن.")
-            return
-    else:
-        await msg.reply_text("روی استیکر ریپلای کن.")
+
+    if item["stock"] == 0:
+        conn.close()
+        await update.message.reply_text("❌ این آیتم تمام شده است.")
         return
+
+    user = conn.execute("SELECT points FROM users WHERE user_id=?", (uid,)).fetchone()
+    if user["points"] < item["price"]:
+        conn.close()
+        await update.message.reply_text("❌ موجودی پوینت کافی نیست.")
+        return
+
+    conn.execute(
+        "UPDATE users SET points=points-? WHERE user_id=?",
+        (item["price"], uid)
+    )
+    if item["stock"] > 0:
+        conn.execute(
+            "UPDATE shop SET stock=stock-1 WHERE id=?", (item_id,)
+        )
+
+    conn.execute("""
+        INSERT INTO purchases(user_id,item_id,price,created_at)
+        VALUES(?,?,?,?)
+    """, (uid, item_id, item["price"], int(time.time())))
+
+    conn.execute("""
+        INSERT INTO transactions
+        (user_id, amount, kind, actor_id, target_id, note, created_at)
+        VALUES(?,?,?,?,?,?,?)
+    """, (
+        uid, -item["price"], "purchase", uid, None,
+        item["name"], int(time.time())
+    ))
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_text(
+        f"✅ خرید انجام شد!\n\n"
+        f"🛒 {item['name']}\n"
+        f"💰 هزینه: {fmt(item['price'])}\n"
+        f"💳 موجودی: {fmt(get_user(uid)['points'])}"
+    )
+
+
+# ---------------------- BANK COMMANDS -----------------------
+
+@reply_required
+async def admin_deposit(update, context):
+    uid = update.effective_user.id
+    if not can_manage(uid, {"senior", "economy"}):
+        await update.message.reply_text("⛔ دسترسی نداری.")
+        return
+
+    args = context.args
+    if len(args) != 1 or not args[0].isdigit():
+        await update.message.reply_text("فرمت: واریز 50000\n(حتماً با ریپلای)")
+        return
+
+    amount = int(args[0])
+    target = update.message.reply_to_message.from_user
+    register_user(target)
+
+    ok, balance = change_points(
+        target.id, amount, "admin_deposit",
+        actor_id=uid, target_id=target.id, note="واریز توسط مدیر"
+    )
+    if not ok:
+        await update.message.reply_text("❌ تراکنش انجام نشد.")
+        return
+
+    await update.message.reply_text(
+        f"✅ واریز انجام شد.\n\n"
+        f"👤 {target.first_name}\n"
+        f"➕ {fmt(amount)} پوینت\n"
+        f"💰 موجودی جدید: {fmt(balance)}"
+    )
+
+
+@reply_required
+async def admin_withdraw(update, context):
+    uid = update.effective_user.id
+    if not can_manage(uid, {"senior", "economy"}):
+        await update.message.reply_text("⛔ دسترسی نداری.")
+        return
+
+    args = context.args
+    if len(args) != 1 or not args[0].isdigit():
+        await update.message.reply_text("فرمت: برداشت 20000\n(حتماً با ریپلای)")
+        return
+
+    amount = int(args[0])
+    target = update.message.reply_to_message.from_user
+    register_user(target)
+
+    ok, balance = change_points(
+        target.id, -amount, "admin_withdraw",
+        actor_id=uid, target_id=target.id, note="برداشت توسط مدیر"
+    )
+    if not ok:
+        await update.message.reply_text("❌ موجودی کاربر کافی نیست.")
+        return
+
+    await update.message.reply_text(
+        f"✅ برداشت انجام شد.\n\n"
+        f"👤 {target.first_name}\n"
+        f"➖ {fmt(amount)} پوینت\n"
+        f"💰 موجودی جدید: {fmt(balance)}"
+    )
+
+
+@reply_required
+async def transfer_reply(update, context):
+    sender = update.effective_user
+    register_user(sender)
+
+    args = context.args
+    if len(args) != 1 or not args[0].isdigit():
+        await update.message.reply_text(
+            "فرمت صحیح:\nانتقال 1000\n\nو باید روی پیام گیرنده ریپلای کنی."
+        )
+        return
+
+    amount = int(args[0])
+    if amount <= 0:
+        await update.message.reply_text("❌ مبلغ باید بیشتر از صفر باشد.")
+        return
+
+    target = update.message.reply_to_message.from_user
+    register_user(target)
+
+    if target.id == sender.id:
+        await update.message.reply_text("❌ نمی‌توانی به خودت انتقال بدهی.")
+        return
+
+    conn = db()
+    sender_row = conn.execute(
+        "SELECT points FROM users WHERE user_id=?", (sender.id,)
+    ).fetchone()
+
+    if sender_row["points"] < amount:
+        conn.close()
+        await update.message.reply_text("❌ موجودی کافی نیست.")
+        return
+
+    conn.execute(
+        "UPDATE users SET points=points-? WHERE user_id=?",
+        (amount, sender.id)
+    )
+    conn.execute(
+        "UPDATE users SET points=points+? WHERE user_id=?",
+        (amount, target.id)
+    )
+
+    ts = int(time.time())
+    conn.execute("""
+        INSERT INTO transactions
+        (user_id, amount, kind, actor_id, target_id, note, created_at)
+        VALUES(?,?,?,?,?,?,?)
+    """, (sender.id, -amount, "transfer_out", sender.id, target.id, "انتقال بانکی", ts))
+
+    conn.execute("""
+        INSERT INTO transactions
+        (user_id, amount, kind, actor_id, target_id, note, created_at)
+        VALUES(?,?,?,?,?,?,?)
+    """, (target.id, amount, "transfer_in", sender.id, target.id, "دریافت بانکی", ts))
+
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_text(
+        f"💸 <b>انتقال بانکی</b>\n\n"
+        f"👤 فرستنده: {sender.first_name}\n"
+        f"👤 گیرنده: {target.first_name}\n"
+        f"💰 مبلغ: <b>{fmt(amount)}</b>\n\n"
+        f"✅ انتقال انجام شد.",
+        parse_mode=ParseMode.HTML
+    )
+
+
+# ------------------------- GIFTS ----------------------------
+
+async def claim_gift(update, context, code):
+    uid = update.effective_user.id
+    register_user(update.effective_user)
+
+    conn = db()
+    gift = conn.execute("SELECT * FROM gift_codes WHERE code=?", (code,)).fetchone()
+
+    if not gift:
+        conn.close()
+        await update.message.reply_text("❌ کد هدیه معتبر نیست.")
+        return
+
+    if gift["expires_at"] and gift["expires_at"] < int(time.time()):
+        conn.close()
+        await update.message.reply_text("⏰ این کد منقضی شده است.")
+        return
+
+    if gift["uses"] >= gift["max_uses"]:
+        conn.close()
+        await update.message.reply_text("❌ ظرفیت این کد تمام شده است.")
+        return
+
+    already = conn.execute(
+        "SELECT 1 FROM gift_claims WHERE code=? AND user_id=?",
+        (code, uid)
+    ).fetchone()
+
+    if already:
+        conn.close()
+        await update.message.reply_text("❌ قبلاً از این کد استفاده کرده‌ای.")
+        return
+
+    conn.execute(
+        "UPDATE users SET points=points+? WHERE user_id=?",
+        (gift["amount"], uid)
+    )
+    conn.execute(
+        "UPDATE gift_codes SET uses=uses+1 WHERE code=?", (code,)
+    )
+    conn.execute(
+        "INSERT INTO gift_claims(code,user_id,claimed_at) VALUES(?,?,?)",
+        (code, uid, int(time.time()))
+    )
+    conn.execute("""
+        INSERT INTO transactions
+        (user_id, amount, kind, actor_id, target_id, note, created_at)
+        VALUES(?,?,?,?,?,?,?)
+    """, (uid, gift["amount"], "gift", None, uid, code, int(time.time())))
+
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_text(
+        f"🎁 کد قبول شد!\n\n"
+        f"➕ {fmt(gift['amount'])} پوینت\n"
+        f"💰 موجودی: {fmt(get_user(uid)['points'])}"
+    )
+
+
+# ---------------------- ADMIN COMMANDS ----------------------
+
+async def admin_panel(update, context):
+    if not get_role(update.effective_user.id):
+        await update.message.reply_text("⛔ دسترسی نداری.")
+        return
+
+    await update.message.reply_text(
+        "👑 <b>پنل مدیریت</b>\n\n"
+        "هر نقش فقط بخش مربوط به خودش را کنترل می‌کند.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=admin_keyboard()
+    )
+
+
+async def add_admin(update, context):
+    uid = update.effective_user.id
+    if uid != OWNER_ID:
+        await update.message.reply_text("⛔ فقط مالک می‌تواند مدیر اضافه کند.")
+        return
+
+    if not update.message.reply_to_message:
+        await update.message.reply_text(
+            "روی پیام شخص ریپلای کن و بنویس:\n"
+            "مدیر اقتصاد"
+        )
+        return
+
+    text = normalize(update.message.text)
+    role = None
+    for key, title in [
+        ("senior", "مدیر ارشد"),
+        ("settings", "مدیر تنظیمات"),
+        ("economy", "مدیر اقتصاد"),
+        ("rewards", "مدیر جوایز"),
+        ("shop", "مدیر فروشگاه"),
+        ("game", "مدیر بازی"),
+        ("stats", "مدیر آمار"),
+    ]:
+        if title in text:
+            role = key
+            break
+
+    if not role:
+        await update.message.reply_text(
+            "نقش را مشخص کن:\n"
+            "مدیر ارشد\nمدیر تنظیمات\nمدیر اقتصاد\nمدیر جوایز\n"
+            "مدیر فروشگاه\nمدیر بازی\nمدیر آمار"
+        )
+        return
+
+    target = update.message.reply_to_message.from_user
+    register_user(target)
+
+    conn = db()
+    conn.execute(
+        "INSERT OR REPLACE INTO admins(user_id,role,added_at) VALUES(?,?,?)",
+        (target.id, role, int(time.time()))
+    )
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_text(
+        f"✅ مدیر اضافه شد.\n\n"
+        f"👤 {target.first_name}\n"
+        f"👑 نقش: {role_label(role)}"
+    )
+
+
+@reply_required
+async def remove_admin(update, context):
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("⛔ فقط مالک می‌تواند مدیر حذف کند.")
+        return
+
+    target = update.message.reply_to_message.from_user
+    if target.id == OWNER_ID:
+        await update.message.reply_text("❌ مالک قابل حذف نیست.")
+        return
+
+    conn = db()
+    conn.execute("DELETE FROM admins WHERE user_id=?", (target.id,))
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_text(
+        f"✅ دسترسی مدیریتی {target.first_name} حذف شد."
+    )
+
+
+async def create_gift(update, context):
+    uid = update.effective_user.id
+    if not can_manage(uid, {"owner", "rewards"}):
+        await update.message.reply_text("⛔ دسترسی نداری.")
+        return
+
+    args = context.args
+    if len(args) < 3:
+        await update.message.reply_text(
+            "فرمت:\n"
+            "کدسازی CODE AMOUNT MAX_USES\n\n"
+            "مثال:\n"
+            "کدسازی KI4N2026 50000 100"
+        )
+        return
+
+    code = args[0].upper()
+    if not args[1].isdigit() or not args[2].isdigit():
+        await update.message.reply_text("❌ مبلغ و ظرفیت باید عدد باشند.")
+        return
+
+    amount = int(args[1])
+    max_uses = int(args[2])
+
+    conn = db()
     try:
-        from PIL import Image
-        tg_file = await context.bot.get_file(file_id)
-        data = bytes(await tg_file.download_as_bytearray())
-        im = Image.open(io.BytesIO(data))
-        if getattr(im, "is_animated", False):
-            im.seek(0)
-        if im.mode in ("RGBA", "P"):
-            bg = Image.new("RGB", im.size, (255, 255, 255))
-            rgba = im.convert("RGBA")
-            bg.paste(rgba, mask=rgba.split()[-1])
-            im = bg
+        conn.execute("""
+            INSERT INTO gift_codes(code,amount,max_uses,created_by)
+            VALUES(?,?,?,?)
+        """, (code, amount, max_uses, uid))
+        conn.commit()
+    except sqlite3.IntegrityError:
+        conn.close()
+        await update.message.reply_text("❌ این کد از قبل وجود دارد.")
+        return
+    conn.close()
+
+    await update.message.reply_text(
+        f"🎁 کد ساخته شد:\n\n"
+        f"<code>{code}</code>\n"
+        f"💰 مبلغ: {fmt(amount)}\n"
+        f"👥 ظرفیت: {max_uses}",
+        parse_mode=ParseMode.HTML
+    )
+
+
+async def add_shop_item(update, context):
+    uid = update.effective_user.id
+    if not can_manage(uid, {"owner", "shop"}):
+        await update.message.reply_text("⛔ دسترسی نداری.")
+        return
+
+    # Format: آیتم NAME | PRICE | STOCK | DESCRIPTION
+    raw = update.message.text
+    parts = raw.split("|")
+    if len(parts) < 4:
+        await update.message.reply_text(
+            "فرمت:\n"
+            "آیتم نام | قیمت | موجودی | توضیحات\n\n"
+            "مثال:\n"
+            "آیتم VIP | 50000 | 100 | دسترسی ویژه"
+        )
+        return
+
+    try:
+        name = parts[0].replace("آیتم", "", 1).strip()
+        price = int(parts[1].strip())
+        stock = int(parts[2].strip())
+        desc = parts[3].strip()
+    except ValueError:
+        await update.message.reply_text("❌ قیمت و موجودی باید عدد باشند.")
+        return
+
+    conn = db()
+    conn.execute(
+        "INSERT INTO shop(name,price,stock,description) VALUES(?,?,?,?)",
+        (name, price, stock, desc)
+    )
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_text("✅ آیتم فروشگاه اضافه شد.")
+
+
+# -------------------------- STATS ---------------------------
+
+async def stats_text():
+    conn = db()
+    users = conn.execute("SELECT COUNT(*) c FROM users").fetchone()["c"]
+    total_points = conn.execute("SELECT COALESCE(SUM(points),0) s FROM users").fetchone()["s"]
+    games = conn.execute("SELECT COALESCE(SUM(games),0) s FROM users").fetchone()["s"]
+    purchases = conn.execute("SELECT COUNT(*) c FROM purchases").fetchone()["c"]
+    conn.close()
+
+    return (
+        "📊 <b>آمار بازی</b>\n\n"
+        f"👥 کاربران: <b>{fmt(users)}</b>\n"
+        f"💰 مجموع پوینت کاربران: <b>{fmt(total_points)}</b>\n"
+        f"🎮 تعداد بازی‌ها: <b>{fmt(games)}</b>\n"
+        f"🛒 خریدها: <b>{fmt(purchases)}</b>"
+    )
+
+
+async def rank_text():
+    conn = db()
+    rows = conn.execute("""
+        SELECT * FROM users
+        ORDER BY points DESC
+        LIMIT 10
+    """).fetchall()
+    conn.close()
+
+    if not rows:
+        return "🏆 هنوز کاربری ثبت نشده است."
+
+    lines = ["🏆 <b>۱۰ نفر برتر</b>\n"]
+    medals = ["🥇", "🥈", "🥉"]
+    for i, r in enumerate(rows, 1):
+        medal = medals[i-1] if i <= 3 else f"{i}."
+        lines.append(
+            f"{medal} {mention_user(r)} — 💰 {fmt(r['points'])}"
+        )
+    return "\n".join(lines)
+
+
+async def transaction_history(user_id):
+    conn = db()
+    rows = conn.execute("""
+        SELECT * FROM transactions
+        WHERE user_id=?
+        ORDER BY id DESC
+        LIMIT 15
+    """, (user_id,)).fetchall()
+    conn.close()
+
+    if not rows:
+        return "📜 هنوز تراکنشی ثبت نشده است."
+
+    lines = ["📜 <b>آخرین تراکنش‌ها</b>\n"]
+    for r in rows:
+        sign = "+" if r["amount"] > 0 else ""
+        lines.append(
+            f"{sign}{fmt(r['amount'])} — {r['kind']}"
+            + (f" — {r['note']}" if r["note"] else "")
+        )
+    return "\n".join(lines)
+
+
+# ------------------------ TEXT PARSER -----------------------
+
+def normalize(text):
+    return (
+        text.replace("ي", "ی")
+        .replace("ى", "ی")
+        .replace("ك", "ک")
+        .strip()
+    )
+
+
+async def text_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return
+
+    register_user(update.effective_user)
+    text = normalize(update.message.text)
+    low = text.lower()
+
+    # Do not interfere with regular conversation.
+    if low in {"منو", "پنل", "شروع"}:
+        await start(update, context)
+        return
+
+    if low in {"راهنما", "help", "/help"}:
+        await help_command(update, context)
+        return
+
+    if low in {"پروفایل", "پروفایل من"}:
+        await update.message.reply_text(
+            await show_profile(update, update.effective_user.id),
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    if low in {"موجودی", "بانک"}:
+        await update.message.reply_text(
+            await bank_text(update.effective_user.id),
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    if low == "بازی":
+        await games_menu(update, context)
+        return
+
+    if low == "فروشگاه":
+        await update.message.reply_text(
+            await shop_text(),
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    if low == "رتبه":
+        await update.message.reply_text(
+            await rank_text(),
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    if low == "آمار":
+        await update.message.reply_text(
+            await stats_text(),
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    if low in {"تاریخچه", "تاریخچه بانک"}:
+        await update.message.reply_text(
+            await transaction_history(update.effective_user.id),
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    if low.startswith("انتقال "):
+        # Let dedicated command-style handler logic run here.
+        args = text.split()
+        if len(args) == 2:
+            context.args = args[1:]
+            await transfer_reply(update, context)
         else:
-            im = im.convert("RGB")
-        buf = io.BytesIO()
-        im.save(buf, format="PNG")
-        buf.seek(0)
-        await msg.reply_photo(photo=InputFile(buf, filename="out.png"))
-    except Exception as e:
-        await msg.reply_text("خطا: " + str(e)[:120])
-
-
-async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    q = u.callback_query
-    data = q.data or ""
-    user = u.effective_user
-    ensure_user(user)
-
-    if data == "a:close":
-        clear_st(c)
-        await q.answer()
-        try:
-            await q.message.delete()
-        except Exception:
-            pass
-        return
-    if data == "a:home":
-        clear_st(c)
-        await q.answer()
-        await q.edit_message_text("🎛 پنل ادمین", reply_markup=admin_kb())
+            await update.message.reply_text("فرمت: انتقال 1000 (با ریپلای)")
         return
 
-    if data.startswith("pm:"):
-        try:
-            if int(data.split(":")[-1]) != user.id:
-                await q.answer("برای تو نیست", show_alert=True)
-                return
-        except Exception:
-            pass
+    if low.startswith("واریز "):
+        args = text.split()
+        if len(args) == 2:
+            context.args = args[1:]
+            await admin_deposit(update, context)
+        return
 
+    if low.startswith("برداشت "):
+        args = text.split()
+        if len(args) == 2:
+            context.args = args[1:]
+            await admin_withdraw(update, context)
+        return
+
+    if low.startswith("خرید "):
+        args = text.split()
+        if len(args) == 2 and args[1].isdigit():
+            await buy_item(update, context, int(args[1]))
+        return
+
+    if low.startswith("کد "):
+        args = text.split()
+        if len(args) == 2:
+            await claim_gift(update, context, args[1].upper())
+        return
+
+    if low.startswith("مدیر ") or low.startswith("مدیر ارشد"):
+        await add_admin(update, context)
+        return
+
+    if low == "حذف مدیر":
+        await remove_admin(update, context)
+        return
+
+    if low.startswith("کدسازی "):
+        context.args = text.split()[1:]
+        await create_gift(update, context)
+        return
+
+    if low.startswith("آیتم "):
+        await add_shop_item(update, context)
+        return
+
+
+# --------------------------- HELP ---------------------------
+
+async def help_command(update, context):
+    text = (
+        "📖 <b>راهنمای کامل</b>\n\n"
+        "👤 <b>کاربری</b>\n"
+        "• پروفایل\n"
+        "• موجودی\n"
+        "• بانک\n"
+        "• بازی\n"
+        "• فروشگاه\n"
+        "• رتبه\n"
+        "• آمار\n"
+        "• تاریخچه\n\n"
+        "💸 <b>انتقال بانکی</b>\n"
+        "روی پیام گیرنده ریپلای کن:\n"
+        "<code>انتقال 1000</code>\n\n"
+        "🛒 <b>خرید</b>\n"
+        "<code>خرید 1</code>\n\n"
+        "🎁 <b>کد هدیه</b>\n"
+        "<code>کد KI4N2026</code>\n\n"
+        "👑 <b>مدیریت</b>\n"
+        "واریز و برداشت فقط با ریپلای روی کاربر انجام می‌شود.\n"
+        "مثال:\n"
+        "<code>واریز 50000</code>\n"
+        "<code>برداشت 20000</code>\n\n"
+        "🎮 بازی‌های شانس رایگان هستند و در آن‌ها شرط‌بندی یا از دست دادن پوینت وجود ندارد."
+    )
+    await update.message.reply_text(
+        text, parse_mode=ParseMode.HTML, reply_markup=back_keyboard()
+    )
+
+
+# ---------------------- CALLBACK HANDLER --------------------
+
+async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
     await q.answer()
 
-    # user: tokens
-    if data.startswith("pm:tok:"):
-        uu = get_user(user.id)
-        emoji = sget("token_emoji", "💎")
-        text = (sget("token_msg", "{emoji} موجودی توکن شما")
-                .replace("{emoji}", emoji)
-                .replace("{tokens}", str(uu["tokens"]))
-                .replace("{points}", str(uu["points"]))
-                .replace("{level}", str(uu["level"])))
+    uid = q.from_user.id
+    register_user(q.from_user)
+    data = q.data
+
+    if data == "main":
         await q.edit_message_text(
-            text,
-            reply_markup=InlineKeyboardMarkup([
-                [btn("%s %s" % (emoji, uu["tokens"]), "noop", "success")],
-                [btn("🔙", "pm:home:%s" % user.id, "primary")],
-            ]),
+            "🎮 <b>منوی اصلی</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_keyboard(uid)
         )
         return
 
-    if False and data.startswith("pm:lang:"):
-        rows = []
-        for code in enabled_langs():
-            rows.append([btn(LANGS[code], "pm:setl:%s:%s" % (code, user.id), "primary")])
-        rows.append([btn("🔙", "pm:home:%s" % user.id, "danger")])
-        await q.edit_message_text("زبان منو:", reply_markup=InlineKeyboardMarkup(rows))
+    if data == "close":
+        await q.edit_message_text("❌ منو بسته شد.")
         return
 
-    if False and data.startswith("pm:setl:"):
-        code = data.split(":")[2]
-        if code in enabled_langs():
-            with tx() as conn:
-                conn.execute("UPDATE users SET lang=? WHERE id=?", (code, user.id))
-        await q.edit_message_text("✅ زبان تنظیم شد", reply_markup=pm_kb(user.id))
-        return
-
-    if data.startswith("pm:voice:"):
-        lock = sget("gender_lock", "0") == "1"
-        rows = []
-        if lock:
-            rows.append([btn("قفل: " + voice_label(sget("locked_gender", "fa_f")), "noop", "danger")])
-        else:
-            for vid in ENGINE:
-                rows.append([btn(voice_label(vid), "pm:setv:%s:%s" % (vid, user.id), "primary")])
-        rows.append([btn("🔙", "pm:home:%s" % user.id, "danger")])
-        await q.edit_message_text("صدا:", reply_markup=InlineKeyboardMarkup(rows))
-        return
-
-    if data.startswith("pm:setv:"):
-        vid = data.split(":")[2]
-        if sget("gender_lock", "0") != "1" and vid in ENGINE:
-            with tx() as conn:
-                conn.execute("UPDATE users SET gender=? WHERE id=?", (vid, user.id))
-        await q.edit_message_text("✅ " + voice_label(vid), reply_markup=pm_kb(user.id))
-        return
-
-    if data.startswith("pm:speed:"):
-        await q.edit_message_text("سرعت:", reply_markup=InlineKeyboardMarkup([
-            [btn("🐢 آرام", "pm:sets:slow:%s" % user.id, "primary")],
-            [btn("🚶 عادی", "pm:sets:normal:%s" % user.id, "success")],
-            [btn("⚡ سریع", "pm:sets:fast:%s" % user.id, "danger")],
-            [btn("🔙", "pm:home:%s" % user.id, "danger")],
-        ]))
-        return
-
-    if data.startswith("pm:sets:"):
-        with tx() as conn:
-            conn.execute("UPDATE users SET speed=? WHERE id=?", (data.split(":")[2], user.id))
-        await q.edit_message_text("✅ سرعت ذخیره شد", reply_markup=pm_kb(user.id))
-        return
-
-    if data.startswith("pm:shop:"):
-        with tx() as conn:
-            items = conn.execute("SELECT * FROM shop WHERE active=1 ORDER BY id").fetchall()
-        if not items:
-            await q.edit_message_text("فروشگاه خالی است.", reply_markup=InlineKeyboardMarkup([[btn("🔙", "pm:home:%s" % user.id, "danger")]]))
-            return
-        rows = []
-        for it in items:
-            rows.append([btn("%s — %s⭐ → %s💎" % (it["title"], it["price_points"], it["token_amount"]),
-                             "pm:buy:%s:%s" % (it["id"], user.id), "success")])
-        rows.append([btn("🔙", "pm:home:%s" % user.id, "danger")])
-        uu = get_user(user.id)
-        await q.edit_message_text("🛒 فروشگاه\nامتیاز شما: %s" % uu["points"], reply_markup=InlineKeyboardMarkup(rows))
-        return
-
-    if data.startswith("pm:buy:"):
-        iid = int(data.split(":")[2])
-        with tx() as conn:
-            it = conn.execute("SELECT * FROM shop WHERE id=? AND active=1", (iid,)).fetchone()
-            if not it:
-                await q.answer("نامعتبر", show_alert=True)
-                return
-            uu = conn.execute("SELECT points,tokens FROM users WHERE id=?", (user.id,)).fetchone()
-            if int(uu["points"]) < int(it["price_points"]):
-                await q.answer("امتیاز کم است", show_alert=True)
-                return
-            conn.execute("UPDATE users SET points=points-?, tokens=tokens+? WHERE id=?",
-                         (int(it["price_points"]), int(it["token_amount"]), user.id))
-        await q.answer("خرید شد", show_alert=True)
-        await q.edit_message_text("✅ بسته خرید شد", reply_markup=pm_kb(user.id))
-        return
-
-    if data.startswith("pm:gamble:"):
-        with tx() as conn:
-            opts = conn.execute("SELECT * FROM gamble_opts WHERE active=1 ORDER BY id").fetchall()
-        if not opts:
-            await q.edit_message_text("قمار فعال نیست.", reply_markup=InlineKeyboardMarkup([[btn("🔙", "pm:home:%s" % user.id, "danger")]]))
-            return
-        rows = [[btn("%s | x%s | %s%%" % (o["title"], o["multiplier"], o["win_chance"]),
-                     "pm:gopt:%s:%s" % (o["id"], user.id), "danger")] for o in opts]
-        rows.append([btn("🔙", "pm:home:%s" % user.id, "primary")])
-        uu = get_user(user.id)
-        await q.edit_message_text("🎰 قمار توکن\nموجودی: %s\nیک ضریب را انتخاب کن سپس مبلغ را بفرست." % uu["tokens"],
-                                  reply_markup=InlineKeyboardMarkup(rows))
-        return
-
-    if data.startswith("pm:gopt:"):
-        oid = int(data.split(":")[2])
-        set_st(c, "gamble_bet", {"opt_id": oid})
-        await q.edit_message_text("مبلغ شرط را به عدد بفرست:")
-        return
-
-    if data.startswith("pm:ref:"):
-        me = await c.bot.get_me()
-        await q.edit_message_text("لینک:\n" + mono("https://t.me/%s?start=ref%s" % (me.username, user.id)),
-                                  parse_mode="HTML", reply_markup=pm_kb(user.id))
-        return
-
-    if data.startswith("pm:gift:"):
-        set_st(c, "gift")
-        await q.edit_message_text("کد هدیه را بفرست:")
-        return
-
-    if data.startswith("pm:help:"):
-        h = (sget("help_text") or "").strip() or "در گپ یا پیوی: -متن"
-        await q.edit_message_text(h, reply_markup=pm_kb(user.id))
-        return
-
-    if data.startswith("pm:home:"):
-        await q.edit_message_text("منو:", reply_markup=pm_kb(user.id))
-        return
-
-    if data == "noop":
-        return
-
-    if data.startswith("g:cancel:"):
-        uid = int(data.split(":")[2])
-        if user.id != uid:
-            await q.answer("برای تو نیست", show_alert=True)
-            return
-        await q.edit_message_text("قمار لغو شد.")
-        return
-
-    if data.startswith("g:run:"):
-        parts = data.split(":")
-        opt_id, amount, uid = int(parts[2]), int(parts[3]), int(parts[4])
-        await run_gamble_animation(q, c, opt_id, amount, uid)
-        return
-
-
-    # admin
-    if data.startswith("a:") and not is_admin(user.id):
-        await q.answer("نه", show_alert=True)
-        return
-
-    if data == "a:settings":
-        set_st(c, "a_set")
-        keys = ("daily_tokens", "token_cost", "max_chars", "spam_sec", "points_per_voice", "ref_tokens", "gender_lock", "locked_gender")
-        cur = "\n".join(mono("%s %s" % (k, sget(k))) for k in keys)
+    if data == "menu_profile":
         await q.edit_message_text(
-            SETTINGS_HELP + "\n\nمقادیر فعلی:\n" + cur + "\n\nمثال: " + mono("spam_sec 8"),
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[btn("🔙", "a:home", "danger")]]),
+            await show_profile(update, uid),
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_keyboard()
         )
         return
 
-    if False and data == "a:langs":
-        rows = []
-        for code, label in LANGS.items():
-            on = sget("lang_" + code, "1") == "1"
-            rows.append([btn(("%s %s" % ("🟢" if on else "🔴", label)), "a:ltog:%s" % code, "success" if on else "danger")])
-        rows.append([btn("🔙", "a:home", "primary")])
-        await q.edit_message_text("قفل/آزاد زبان‌ها:", reply_markup=InlineKeyboardMarkup(rows))
-        return
-
-    if False and data.startswith("a:ltog:"):
-        code = data.split(":")[2]
-        cur = sget("lang_" + code, "1")
-        sset("lang_" + code, "0" if cur == "1" else "1")
-        await q.edit_message_text("تغییر کرد", reply_markup=admin_kb())
-        return
-
-    if data == "a:shop":
-        set_st(c, "a_shop")
-        with tx() as conn:
-            items = conn.execute("SELECT * FROM shop ORDER BY id").fetchall()
-        lines = ["فروشگاه — برای افزودن بفرست:", mono("عنوان توکن امتیاز"), "\n"]
-        for it in items:
-            lines.append("#%s %s | %s💎 / %s⭐" % (it["id"], it["title"], it["token_amount"], it["price_points"]))
-        lines.append("\nحذف: " + mono("del آیدی"))
-        await q.edit_message_text("\n".join(lines), parse_mode="HTML",
-                                  reply_markup=InlineKeyboardMarkup([[btn("🔙", "a:home", "danger")]]))
-        return
-
-    if data == "a:gamble":
-        set_st(c, "a_gamble")
-        with tx() as conn:
-            opts = conn.execute("SELECT * FROM gamble_opts ORDER BY id").fetchall()
-        lines = ["قمار — افزودن:", mono("عنوان ضریب_برد شانس"), "مثال: " + mono("ریسک 2.5 40"), "\nضریب برد در برد؛ باخت = از دست دادن مبلغ (x-1)\n"]
-        for o in opts:
-            lines.append("#%s %s x%s %s%%" % (o["id"], o["title"], o["multiplier"], o["win_chance"]))
-        lines.append("\nحذف: " + mono("del آیدی"))
-        await q.edit_message_text("\n".join(lines), parse_mode="HTML",
-                                  reply_markup=InlineKeyboardMarkup([[btn("🔙", "a:home", "danger")]]))
-        return
-
-    if data == "a:mass":
-        set_st(c, "a_mass")
-        await q.edit_message_text("تعداد توکن همگانی را بفرست (عدد):",
-                                  reply_markup=InlineKeyboardMarkup([[btn("🔙", "a:home", "danger")]]))
-        return
-
-    if data == "a:caption":
-        set_st(c, "a_cap")
+    if data == "menu_bank":
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📜 تاریخچه", callback_data="bank_history")],
+            [InlineKeyboardButton("🔙 بازگشت", callback_data="main")],
+        ])
         await q.edit_message_text(
-            "📝 قالب کپشن ویس\n\n" + VARS_HELP + "\n\nفعلی:\n" + mono(sget("caption", "")) + "\n\nقالب جدید را بفرست.",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[btn("🔙", "a:home", "danger")]]),
+            await bank_text(uid),
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb
         )
         return
 
-    if data == "a:cstyle":
-        styles = ["none", "bold", "italic", "mono", "spoiler", "quote", "underline", "strike", "fancy", "boldu", "italicu"]
-        rows = [[btn(s, "a:cs:%s" % s, "primary")] for s in styles]
-        rows.append([btn("🔙", "a:home", "danger")])
-        await q.edit_message_text("استایل کپشن فعلی: %s" % sget("caption_style", "none"), reply_markup=InlineKeyboardMarkup(rows))
-        return
-
-    if data.startswith("a:cs:"):
-        sset("caption_style", data.split(":")[2])
-        await q.edit_message_text("✅ استایل: " + sget("caption_style"), reply_markup=admin_kb())
-        return
-
-    if data == "a:temoji":
-        set_st(c, "a_temoji")
-        await q.edit_message_text("ایموجی توکن را بفرست. فعلی: " + sget("token_emoji", "💎"),
-                                  reply_markup=InlineKeyboardMarkup([[btn("🔙", "a:home", "danger")]]))
-        return
-
-    if data == "a:tmsg":
-        set_st(c, "a_tmsg")
-        await q.edit_message_text("قالب پیام توکن ({emoji} {tokens} {points} {level})\nفعلی:\n" + sget("token_msg", ""),
-                                  reply_markup=InlineKeyboardMarkup([[btn("🔙", "a:home", "danger")]]))
-        return
-
-    if data == "a:vnames":
-        set_st(c, "a_vname")
-        await q.edit_message_text("فرمت: fa_f اسم\n" + "\n".join("%s = %s" % (k, voice_label(k)) for k in ENGINE),
-                                  reply_markup=InlineKeyboardMarkup([[btn("🔙", "a:home", "danger")]]))
-        return
-
-    if data == "a:welmenu":
-        await q.edit_message_text("خوش‌آمد/لفت:", reply_markup=InlineKeyboardMarkup([
-            [btn("خوش‌آمد " + ("🟢" if sget("welcome_enabled") == "1" else "🔴"), "a:wtog", "success")],
-            [btn("لفت " + ("🟢" if sget("leave_enabled") == "1" else "🔴"), "a:ltog2", "success")],
-            [btn("متن خوش‌آمد", "a:weltxt", "primary"), btn("متن لفت", "a:leavetxt", "primary")],
-            [btn("مدیا لفت", "a:leavemedia", "primary")],
-            [btn("🔙", "a:home", "danger")],
-        ]))
-        return
-
-    if data == "a:wtog":
-        sset("welcome_enabled", "0" if sget("welcome_enabled") == "1" else "1")
-        await q.edit_message_text("OK", reply_markup=admin_kb())
-        return
-    if data == "a:ltog2":
-        sset("leave_enabled", "0" if sget("leave_enabled") == "1" else "1")
-        await q.edit_message_text("OK", reply_markup=admin_kb())
-        return
-    if data == "a:weltxt":
-        set_st(c, "a_weltxt")
-        await q.edit_message_text("متن خوش‌آمد را بفرست:\n" + VARS_HELP + "\n\nفعلی:\n" + sget("member_welcome", ""),
-                                  parse_mode="HTML",
-                                  reply_markup=InlineKeyboardMarkup([[btn("🔙", "a:home", "danger")]]))
-        return
-    if data == "a:leavetxt":
-        set_st(c, "a_leavetxt")
-        await q.edit_message_text("متن لفت را بفرست:\n" + VARS_HELP + "\n\nفعلی:\n" + sget("member_leave", ""),
-                                  parse_mode="HTML",
-                                  reply_markup=InlineKeyboardMarkup([[btn("🔙", "a:home", "danger")]]))
-        return
-    if data == "a:welmedia":
-        set_st(c, "a_welmedia")
-        await q.edit_message_text("عکس یا گیف خوش‌آمد را بفرست\n" + VARS_HELP, parse_mode="HTML",
-                                  reply_markup=InlineKeyboardMarkup([[btn("🔙", "a:home", "danger")]]))
-        return
-    if data == "a:leavemedia":
-        set_st(c, "a_leavemedia")
-        await q.edit_message_text("عکس یا گیف لفت را بفرست", reply_markup=InlineKeyboardMarkup([[btn("🔙", "a:home", "danger")]]))
-        return
-
-    if data == "a:stick":
-        set_st(c, "a_stick")
+    if data == "bank_history":
         await q.edit_message_text(
-            "استیکر تایمر\nبازه: " + mono("10m") + " یا " + mono("1h") + " یا " + mono("0") + " خاموش\n"
-            "chat_id گپ را هم می‌توانی بفرستی\n"
-            "استیکر را فوروارد/بفرست تا ذخیره شود\nفعلی interval=%s chat=%s" % (sget("sticker_interval"), sget("sticker_chat_id")),
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[btn("🔙", "a:home", "danger")]]),
+            await transaction_history(uid),
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_keyboard()
         )
         return
 
-    if data == "a:human":
-        set_st(c, "a_human")
-        on = sget("human_enabled", "1") == "1"
+    if data == "menu_games":
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🎲 تاس روزانه", callback_data="game_dice")],
+            [InlineKeyboardButton("🎡 چرخ شانس", callback_data="game_wheel")],
+            [InlineKeyboardButton("🎁 جعبه شانس", callback_data="game_box")],
+            [InlineKeyboardButton("🔙 بازگشت", callback_data="main")],
+        ])
         await q.edit_message_text(
-            "حرف انسانی: %s\nفرمت افزودن:\n%s\nحذف: del آیدی\nخاموش/روشن: on / off" % (
-                "روشن" if on else "خاموش", mono("کلیدواژه|متن جواب")),
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[btn("🔙", "a:home", "danger")]]),
+            "🎮 <b>بازی‌ها</b>\n\n"
+            "هر بازی روزی یک‌بار قابل استفاده است و جایزه رایگان می‌دهد.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb
         )
         return
 
-    if data == "a:groups":
-        set_st(c, "a_grp")
-        await q.edit_message_text("آیدی گپ برای افزودن/حذف یا /addgroup در گپ",
-                                  reply_markup=InlineKeyboardMarkup([[btn("🔙", "a:home", "danger")]]))
-        return
-    if data == "a:gift":
-        set_st(c, "a_gift")
-        await q.edit_message_text(mono("کد مبلغ تعداد روز"), parse_mode="HTML",
-                                  reply_markup=InlineKeyboardMarkup([[btn("🔙", "a:home", "danger")]]))
-        return
-    if data == "a:addtok":
-        set_st(c, "a_addtok")
-        await q.edit_message_text(mono("آیدی تعداد"), parse_mode="HTML",
-                                  reply_markup=InlineKeyboardMarkup([[btn("🔙", "a:home", "danger")]]))
-        return
-    if data == "a:block":
-        set_st(c, "a_block")
-        await q.edit_message_text("آیدی بلاک:", reply_markup=InlineKeyboardMarkup([[btn("🔙", "a:home", "danger")]]))
-        return
-    if data == "a:adm":
-        set_st(c, "a_adm")
-        await q.edit_message_text("ادمین + آیدی / ادمین - آیدی", reply_markup=InlineKeyboardMarkup([[btn("🔙", "a:home", "danger")]]))
-        return
-    if data == "a:stats":
-        with tx() as conn:
-            uc = conn.execute("SELECT COUNT(*) c FROM users").fetchone()["c"]
-            vt = conn.execute("SELECT COALESCE(SUM(voices_total),0) s FROM users").fetchone()["s"]
-            tt = conn.execute("SELECT COALESCE(SUM(tokens),0) s FROM users").fetchone()["s"]
-        await q.edit_message_text("کاربران: %s\nویس: %s\nتوکن کل: %s" % (uc, vt, tt), reply_markup=admin_kb())
+    if data.startswith("game_"):
+        game = data.replace("game_", "", 1)
+        result = await play_lucky(update, context, game)
+        await q.edit_message_text(
+            result,
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_keyboard()
+        )
         return
 
-
-async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    if not u.message or not u.message.text:
-        return
-    user = u.effective_user
-    chat = u.effective_chat
-    text = u.message.text.strip()
-    ensure_user(user)
-    low = re.sub(r"^/", "", text).lower()
-
-    # sticker/gif convert
-    if low in ("استیکر به عکس", "sticker to photo"):
-        await convert_to_photo(u, c, "sticker")
-        return
-    if low in ("گیف به عکس", "gif to photo"):
-        await convert_to_photo(u, c, "gif")
+    if data == "menu_shop":
+        await q.edit_message_text(
+            await shop_text(),
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_keyboard()
+        )
         return
 
-    if low in ("راهنما", "help"):
-        await cmd_help(u, c)
+    if data == "menu_gift":
+        await q.edit_message_text(
+            "🎁 <b>کد هدیه</b>\n\n"
+            "در گپ بنویس:\n"
+            "<code>کد CODE</code>\n\n"
+            "مثال: <code>کد KI4N2026</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_keyboard()
+        )
         return
 
-    # human talk: reply to bot
-    if u.message.reply_to_message and u.message.reply_to_message.from_user and u.message.reply_to_message.from_user.is_bot:
-        if sget("human_enabled", "1") == "1" and not text.startswith("-"):
-            with tx() as conn:
-                lines = conn.execute("SELECT * FROM human_lines").fetchall()
-            tlow = text.lower()
-            for ln in lines:
-                kw = (ln["keyword"] or "").lower()
-                if kw and kw in tlow:
-                    await do_voice(u, c, ln["answer"])
-                    return
+    if data == "menu_rank":
+        await q.edit_message_text(
+            await rank_text(),
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_keyboard()
+        )
+        return
 
-    # groups / private voice
-    if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
-        if low in ("موجودی", "توکن", "balance", "tokens"):
-            uu = get_user(user.id)
-            cost = max(1, sint("token_cost", 1))
-            can = int(uu["tokens"]) // cost
-            emoji = sget("token_emoji", "💎")
-            await u.message.reply_text(
-                "%s موجودی: *%s*\n🎙 می‌توانی حدود *%s* ویس بسازی" % (emoji, uu["tokens"], can),
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [btn("%s %s" % (emoji, uu["tokens"]), "noop", "success")],
-                ]),
-            )
+    if data == "menu_stats":
+        await q.edit_message_text(
+            await stats_text(),
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_keyboard()
+        )
+        return
+
+    if data == "menu_help":
+        # Inline equivalent of help.
+        text = (
+            "📖 <b>راهنما</b>\n\n"
+            "💰 موجودی — نمایش موجودی\n"
+            "👤 پروفایل — نمایش مشخصات\n"
+            "🎮 بازی — بازی‌های روزانه\n"
+            "🛒 فروشگاه — نمایش آیتم‌ها\n"
+            "🏆 رتبه — نمایش برترین‌ها\n"
+            "📜 تاریخچه — تراکنش‌ها\n\n"
+            "💸 انتقال فقط با ریپلای:\n"
+            "<code>انتقال 1000</code>\n\n"
+            "👑 واریز/برداشت مدیران هم فقط با ریپلای انجام می‌شود."
+        )
+        await q.edit_message_text(
+            text, parse_mode=ParseMode.HTML, reply_markup=back_keyboard()
+        )
+        return
+
+    if data == "admin_panel":
+        if not get_role(uid):
+            await q.edit_message_text("⛔ دسترسی نداری.", reply_markup=back_keyboard())
             return
-        # قمار 2500
-        mg = re.match(r"^(?:قمار|gamble)\s+([\d,]+)\s*$", text.strip(), re.I)
-        if mg:
-            amount = int(mg.group(1).replace(",", ""))
-            await start_gamble(u, c, amount)
-            return
-        if low in ("قمار", "gamble"):
-            await u.message.reply_text("فرمت:\n<code>قمار 2500</code>", parse_mode="HTML")
-            return
-        body = parse_voice_cmd(text)
-        if body:
-            await do_voice(u, c, body)
+        await q.edit_message_text(
+            "👑 <b>پنل مدیریت</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=admin_keyboard()
+        )
         return
 
-    if chat.type != ChatType.PRIVATE:
-        return
-
-    if low in ("پنل", "admin") and is_admin(user.id):
-        clear_st(c)
-        await u.message.reply_text("🎛 پنل ادمین", reply_markup=admin_kb())
-        return
-    if low in ("منو", "menu"):
-        await u.message.reply_text("منو:", reply_markup=pm_kb(user.id))
-        return
-
-    mg = re.match(r"^(?:قمار|gamble)\s+([\d,]+)\s*$", text.strip(), re.I)
-    if mg:
-        await start_gamble(u, c, int(mg.group(1).replace(",", "")))
-        return
-
-    st = get_st(c)
-
-    # gamble amount
-    if st and st["kind"] == "gamble_bet":
-        try:
-            amount = int(re.sub(r"\D", "", text) or "0")
-        except Exception:
-            amount = 0
-        if amount < 1:
-            await u.message.reply_text("مبلغ نامعتبر")
+    if data == "admin_roles":
+        if uid != OWNER_ID:
+            await q.answer("فقط مالک به مدیریت نقش‌ها دسترسی دارد.", show_alert=True)
             return
-        oid = int(st["extra"]["opt_id"])
-        with tx() as conn:
-            opt = conn.execute("SELECT * FROM gamble_opts WHERE id=? AND active=1", (oid,)).fetchone()
-            uu = conn.execute("SELECT tokens FROM users WHERE id=?", (user.id,)).fetchone()
-            if not opt:
-                clear_st(c)
-                await u.message.reply_text("گزینه نیست")
-                return
-            if int(uu["tokens"]) < amount:
-                await u.message.reply_text("توکن کم است")
-                return
-            win = random.random() * 100 < float(opt["win_chance"])
-            if win:
-                gain = int(amount * float(opt["multiplier"])) - amount
-                conn.execute("UPDATE users SET tokens=tokens+? WHERE id=?", (gain, user.id))
-                res = "برد! +%s توکن (ضریب %s)" % (gain, opt["multiplier"])
-            else:
-                conn.execute("UPDATE users SET tokens=tokens-? WHERE id=?", (amount, user.id))
-                res = "باخت! -%s توکن" % amount
-            left = conn.execute("SELECT tokens FROM users WHERE id=?", (user.id,)).fetchone()["tokens"]
-        clear_st(c)
-        await u.message.reply_text("%s\nموجودی: %s" % (res, left), reply_markup=pm_kb(user.id))
+        conn = db()
+        rows = conn.execute("SELECT * FROM admins ORDER BY role").fetchall()
+        conn.close()
+        lines = ["👑 <b>مدیران</b>\n"]
+        for r in rows:
+            lines.append(f"• <code>{r['user_id']}</code> — {role_label(r['role'])}")
+        lines.append("\nبرای افزودن مدیر، روی پیام او ریپلای کن و بنویس «مدیر اقتصاد».")
+        await q.edit_message_text(
+            "\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=back_keyboard()
+        )
         return
 
-    if st and st["kind"] == "gift":
-        code = text.strip().upper()
-        with tx() as conn:
-            g = conn.execute("SELECT * FROM gift_codes WHERE code=? AND active=1", (code,)).fetchone()
-            if not g or int(g["uses_left"]) < 1:
-                await u.message.reply_text("نامعتبر")
-                clear_st(c)
-                return
-            if g["expires"] and float(g["expires"]) < time.time():
-                await u.message.reply_text("منقضی")
-                clear_st(c)
-                return
-            if conn.execute("SELECT 1 FROM gift_uses WHERE code=? AND user_id=?", (code, user.id)).fetchone():
-                await u.message.reply_text("قبلاً استفاده شده")
-                clear_st(c)
-                return
-            conn.execute("UPDATE gift_codes SET uses_left=uses_left-1 WHERE code=?", (code,))
-            conn.execute("INSERT INTO gift_uses(code,user_id) VALUES (?,?)", (code, user.id))
-            conn.execute("UPDATE users SET tokens=tokens+? WHERE id=?", (int(g["amount"]), user.id))
-        clear_st(c)
-        await u.message.reply_text("✅ +%s" % g["amount"])
+    if data == "admin_economy":
+        if not can_manage(uid, {"senior", "economy"}):
+            await q.answer("دسترسی نداری.", show_alert=True)
+            return
+        await q.edit_message_text(
+            "💰 <b>مدیریت اقتصاد</b>\n\n"
+            "واریز/برداشت فقط با ریپلای:\n"
+            "<code>واریز 50000</code>\n"
+            "<code>برداشت 20000</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_keyboard()
+        )
         return
 
-    if st and is_admin(user.id):
-        kind = st["kind"]
-        if kind == "a_set":
-            m = re.match(r"(\w+)\s+(.+)", text)
-            if m:
-                sset(m.group(1), m.group(2).strip())
-                clear_st(c)
-                await u.message.reply_text("OK", reply_markup=admin_kb())
+    if data == "admin_rewards":
+        if not can_manage(uid, {"senior", "rewards"}):
+            await q.answer("دسترسی نداری.", show_alert=True)
             return
-        if kind == "a_shop":
-            if text.lower().startswith("del "):
-                with tx() as conn:
-                    conn.execute("DELETE FROM shop WHERE id=?", (int(text.split()[1]),))
-                clear_st(c)
-                await u.message.reply_text("حذف شد", reply_markup=admin_kb())
-                return
-            parts = text.rsplit(None, 2)
-            if len(parts) == 3:
-                title, tok, price = parts[0], int(parts[1]), int(parts[2])
-                with tx() as conn:
-                    conn.execute("INSERT INTO shop(title,token_amount,price_points,active) VALUES (?,?,?,1)", (title, tok, price))
-                clear_st(c)
-                await u.message.reply_text("بسته اضافه شد", reply_markup=admin_kb())
-            return
-        if kind == "a_gamble":
-            if text.lower().startswith("del "):
-                with tx() as conn:
-                    conn.execute("DELETE FROM gamble_opts WHERE id=?", (int(text.split()[1]),))
-                clear_st(c)
-                await u.message.reply_text("حذف", reply_markup=admin_kb())
-                return
-            parts = text.rsplit(None, 2)
-            if len(parts) == 3:
-                title, mul, chance = parts[0], float(parts[1]), float(parts[2])
-                with tx() as conn:
-                    conn.execute("INSERT INTO gamble_opts(title,multiplier,win_chance,active) VALUES (?,?,?,1)", (title, mul, chance))
-                clear_st(c)
-                await u.message.reply_text("ثبت شد", reply_markup=admin_kb())
-            return
-        if kind == "a_mass":
-            try:
-                amt = int(text.strip())
-            except ValueError:
-                await u.message.reply_text("عدد")
-                return
-            with tx() as conn:
-                conn.execute("UPDATE users SET tokens=tokens+?", (amt,))
-                n = conn.execute("SELECT COUNT(*) c FROM users").fetchone()["c"]
-            clear_st(c)
-            await u.message.reply_text("به %s کاربر +%s توکن" % (n, amt), reply_markup=admin_kb())
-            return
-        if kind == "a_cap":
-            sset("caption", text)
-            clear_st(c)
-            await u.message.reply_text("کپشن OK", reply_markup=admin_kb())
-            return
-        if kind == "a_temoji":
-            sset("token_emoji", text.strip()[:8])
-            clear_st(c)
-            await u.message.reply_text("OK", reply_markup=admin_kb())
-            return
-        if kind == "a_tmsg":
-            sset("token_msg", text)
-            clear_st(c)
-            await u.message.reply_text("OK", reply_markup=admin_kb())
-            return
-        if kind == "a_vname":
-            parts = text.split(None, 1)
-            if len(parts) == 2 and parts[0] in ENGINE:
-                sset("voice_" + parts[0], parts[1][:40])
-                clear_st(c)
-                await u.message.reply_text("OK", reply_markup=admin_kb())
-            return
-        if kind == "a_weltxt":
-            sset("member_welcome", text)
-            clear_st(c)
-            await u.message.reply_text("OK", reply_markup=admin_kb())
-            return
-        if kind == "a_leavetxt":
-            sset("member_leave", text)
-            clear_st(c)
-            await u.message.reply_text("OK", reply_markup=admin_kb())
-            return
-        if kind == "a_stick":
-            t = text.strip().lower()
-            if re.match(r"^\d+[mh]$", t) or t == "0":
-                sset("sticker_interval", t)
-                clear_st(c)
-                await u.message.reply_text("بازه: " + t, reply_markup=admin_kb())
-                return
-            try:
-                cid = int(text.strip())
-                sset("sticker_chat_id", str(cid))
-                clear_st(c)
-                await u.message.reply_text("chat_id ذخیره شد", reply_markup=admin_kb())
-                return
-            except ValueError:
-                await u.message.reply_text("استیکر بفرست یا 10m / 1h / chat_id")
-                return
-        if kind == "a_human":
-            if text.lower() in ("on", "off"):
-                sset("human_enabled", "1" if text.lower() == "on" else "0")
-                clear_st(c)
-                await u.message.reply_text("OK", reply_markup=admin_kb())
-                return
-            if text.lower().startswith("del "):
-                with tx() as conn:
-                    conn.execute("DELETE FROM human_lines WHERE id=?", (int(text.split()[1]),))
-                clear_st(c)
-                await u.message.reply_text("حذف", reply_markup=admin_kb())
-                return
-            if "|" in text:
-                kw, ans = text.split("|", 1)
-                with tx() as conn:
-                    conn.execute("INSERT INTO human_lines(keyword,answer) VALUES (?,?)", (kw.strip(), ans.strip()))
-                clear_st(c)
-                await u.message.reply_text("اضافه شد", reply_markup=admin_kb())
-            return
-        if kind == "a_grp":
-            try:
-                cid = int(text.strip())
-            except ValueError:
-                return
-            with tx() as conn:
-                if conn.execute("SELECT 1 FROM groups WHERE chat_id=?", (cid,)).fetchone():
-                    conn.execute("DELETE FROM groups WHERE chat_id=?", (cid,))
-                    await u.message.reply_text("حذف", reply_markup=admin_kb())
-                else:
-                    conn.execute("INSERT INTO groups(chat_id,title,active) VALUES (?,?,1)", (cid, str(cid)))
-                    await u.message.reply_text("اضافه", reply_markup=admin_kb())
-            clear_st(c)
-            return
-        if kind == "a_gift":
-            parts = text.split()
-            if len(parts) >= 4:
-                code, amount, uses, days = parts[0].upper(), int(parts[1]), int(parts[2]), int(parts[3])
-                only = int(parts[4]) if len(parts) >= 5 else None
-                with tx() as conn:
-                    conn.execute(
-                        "INSERT OR REPLACE INTO gift_codes(code,amount,uses_left,expires,only_chat_id,active) VALUES (?,?,?,?,?,1)",
-                        (code, amount, uses, time.time() + days * 86400, only),
-                    )
-                clear_st(c)
-                await u.message.reply_text("کد OK", reply_markup=admin_kb())
-            return
-        if kind == "a_addtok":
-            parts = text.split()
-            if len(parts) >= 2:
-                tid, amt = int(parts[0]), int(parts[1])
-                ensure_user(type("U", (), {"id": tid, "username": "", "full_name": str(tid), "is_bot": False})())
-                with tx() as conn:
-                    conn.execute("UPDATE users SET tokens=tokens+? WHERE id=?", (amt, tid))
-                    new_bal = conn.execute("SELECT tokens FROM users WHERE id=?", (tid,)).fetchone()["tokens"]
-                clear_st(c)
-                await u.message.reply_text("OK", reply_markup=admin_kb())
-                # پیام به کاربر
-                try:
-                    emoji = sget("token_emoji", "💎")
-                    admin_mention = mention_html(user)
-                    await c.bot.send_message(
-                        tid,
-                        "✅ %s توکن از طرف %s واریز شد" % (amt, admin_mention),
-                        parse_mode="HTML",
-                        reply_markup=InlineKeyboardMarkup([
-                            [btn("%s %s" % (emoji, new_bal), "pm:tok:%s" % tid, "success")],
-                        ]),
-                    )
-                except Exception:
-                    pass
-            return
-        if kind == "a_block":
-            tid = int(re.sub(r"\D", "", text) or "0")
-            ensure_user(type("U", (), {"id": tid, "username": "", "full_name": str(tid), "is_bot": False})())
-            with tx() as conn:
-                cur = conn.execute("SELECT blocked FROM users WHERE id=?", (tid,)).fetchone()
-                conn.execute("UPDATE users SET blocked=? WHERE id=?", (0 if cur and cur["blocked"] else 1, tid))
-            clear_st(c)
-            await u.message.reply_text("OK", reply_markup=admin_kb())
-            return
-        if kind == "a_adm":
-            m = re.match(r"ادمین\s*([+-])\s*(\d+)", text)
-            if m:
-                with tx() as conn:
-                    if m.group(1) == "+":
-                        conn.execute("INSERT OR IGNORE INTO admins(user_id) VALUES (?)", (int(m.group(2)),))
-                    elif user.id == ADMIN_ID:
-                        conn.execute("DELETE FROM admins WHERE user_id=?", (int(m.group(2)),))
-                clear_st(c)
-                await u.message.reply_text("OK", reply_markup=admin_kb())
-            return
-
-    body = parse_voice_cmd(text)
-    if body:
-        await do_voice(u, c, body)
-
-
-async def on_media(u, c):
-    if not u.message or not is_admin(u.effective_user.id):
+        await q.edit_message_text(
+            "🎁 <b>مدیریت جوایز</b>\n\n"
+            "ساخت کد:\n"
+            "<code>کدسازی CODE AMOUNT MAX_USES</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_keyboard()
+        )
         return
-    if u.effective_chat.type != ChatType.PRIVATE:
+
+    if data == "admin_shop":
+        if not can_manage(uid, {"senior", "shop"}):
+            await q.answer("دسترسی نداری.", show_alert=True)
+            return
+        await q.edit_message_text(
+            "🛒 <b>مدیریت فروشگاه</b>\n\n"
+            "افزودن آیتم:\n"
+            "<code>آیتم نام | قیمت | موجودی | توضیحات</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_keyboard()
+        )
         return
-    st = get_st(c)
-    if not st:
+
+    if data == "admin_game":
+        if not can_manage(uid, {"senior", "game"}):
+            await q.answer("دسترسی نداری.", show_alert=True)
+            return
+        await q.edit_message_text(
+            "🎮 <b>مدیریت بازی</b>\n\n"
+            "بازی‌های شانس فعلی رایگان و بدون شرط‌بندی هستند.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_keyboard()
+        )
         return
-    if st["kind"] in ("a_welmedia", "a_leavemedia"):
-        prefix = "welcome" if st["kind"] == "a_welmedia" else "leave"
-        if u.message.photo:
-            sset(prefix + "_media_type", "photo")
-            sset(prefix + "_media_id", u.message.photo[-1].file_id)
-            clear_st(c)
-            await u.message.reply_text("عکس ذخیره شد", reply_markup=admin_kb())
-        elif u.message.animation:
-            sset(prefix + "_media_type", "animation")
-            sset(prefix + "_media_id", u.message.animation.file_id)
-            clear_st(c)
-            await u.message.reply_text("گیف ذخیره شد", reply_markup=admin_kb())
+
+    if data == "admin_stats":
+        if not can_manage(uid, {"senior", "stats"}):
+            await q.answer("دسترسی نداری.", show_alert=True)
+            return
+        await q.edit_message_text(
+            await stats_text(),
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_keyboard()
+        )
         return
-    if st["kind"] == "a_stick" and u.message.sticker:
-        with tx() as conn:
-            conn.execute("INSERT INTO stickers(file_id,chat_id,active) VALUES (?,?,1)",
-                         (u.message.sticker.file_id, sint("sticker_chat_id", 0)))
-        await u.message.reply_text("استیکر ذخیره شد", reply_markup=admin_kb())
-        clear_st(c)
 
 
-async def on_new_member(u, c):
-    if sget("welcome_enabled", "1") != "1":
-        return
-    chat = u.effective_chat
-    if not u.message or not u.message.new_chat_members:
-        return
-    tpl = sget("member_welcome", "سلام {mention}")
-    mtype, mid = sget("welcome_media_type") or "", sget("welcome_media_id") or ""
-    for mem in u.message.new_chat_members:
-        if mem.is_bot:
-            continue
-        ensure_user(mem)
-        text = render_tpl(tpl, mem, chat_title=chat.title or "")
-        try:
-            if mtype == "photo" and mid:
-                await c.bot.send_photo(chat.id, mid, caption=text, parse_mode="HTML")
-            elif mtype == "animation" and mid:
-                await c.bot.send_animation(chat.id, mid, caption=text, parse_mode="HTML")
-            else:
-                await c.bot.send_message(chat.id, text, parse_mode="HTML")
-        except Exception:
-            pass
+# -------------------------- COMMANDS ------------------------
+
+async def cmd_start(update, context):
+    await start(update, context)
 
 
-async def on_left_member(u, c):
-    if sget("leave_enabled", "1") != "1":
-        return
-    if not u.message or not u.message.left_chat_member:
-        return
-    mem = u.message.left_chat_member
-    if mem.is_bot:
-        return
-    text = render_tpl(sget("member_leave", "خداحافظ {name}"), mem, chat_title=u.effective_chat.title or "")
-    mtype, mid = (sget("leave_media_type") or "").strip(), (sget("leave_media_id") or "").strip()
-    try:
-        if mtype == "photo" and mid:
-            await c.bot.send_photo(u.effective_chat.id, mid, caption=text, parse_mode="HTML")
-        elif mtype == "animation" and mid:
-            await c.bot.send_animation(u.effective_chat.id, mid, caption=text, parse_mode="HTML")
-        else:
-            await c.bot.send_message(u.effective_chat.id, text, parse_mode="HTML")
-    except Exception:
-        pass
+async def cmd_help(update, context):
+    await help_command(update, context)
 
 
-async def cmd_addgroup(u, c):
-    if not is_admin(u.effective_user.id):
-        return
-    chat = u.effective_chat
-    if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
-        return
-    with tx() as conn:
-        conn.execute("INSERT OR REPLACE INTO groups(chat_id,title,active) VALUES (?,?,1)", (chat.id, chat.title or str(chat.id)))
-    await u.message.reply_text("گپ اضافه شد")
+async def cmd_panel(update, context):
+    await admin_panel(update, context)
 
 
-async def open_admin(u, c):
-    if not is_admin(u.effective_user.id) or u.effective_chat.type != ChatType.PRIVATE:
-        return
-    clear_st(c)
-    await u.message.reply_text("🎛 پنل ادمین", reply_markup=admin_kb())
+async def cmd_games(update, context):
+    await games_menu(update, context)
 
 
-def parse_interval(s):
-    s = (s or "0").strip().lower()
-    if s == "0":
-        return 0
-    m = re.match(r"^(\d+)([mh])$", s)
-    if not m:
-        return 0
-    n = int(m.group(1))
-    return n * 60 if m.group(2) == "m" else n * 3600
-
-
-async def sticker_loop(app):
-    await asyncio_sleep_job(app)
-
-
-async def asyncio_sleep_job(app):
-    import asyncio
-    while True:
-        try:
-            sec = parse_interval(sget("sticker_interval", "0"))
-            chat_id = sint("sticker_chat_id", 0)
-            if sec > 0 and chat_id:
-                with tx() as conn:
-                    rows = conn.execute("SELECT file_id FROM stickers WHERE active=1").fetchall()
-                if rows:
-                    fid = random.choice(rows)["file_id"]
-                    try:
-                        await app.bot.send_sticker(chat_id, fid)
-                    except Exception:
-                        log.exception("sticker send")
-                await asyncio.sleep(sec)
-            else:
-                await asyncio.sleep(30)
-        except Exception:
-            log.exception("sticker loop")
-            import asyncio
-            await asyncio.sleep(30)
-
-
-async def post_init(app):
-    try:
-        await app.bot.delete_webhook(drop_pending_updates=True)
-    except Exception:
-        pass
-    me = await app.bot.get_me()
-    log.info("bot @%s", me.username)
-    import asyncio
-    asyncio.create_task(asyncio_sleep_job(app))
-
-
-def main():
-    init_db()
-    req = HTTPXRequest(connect_timeout=60.0, read_timeout=90.0, write_timeout=90.0, pool_timeout=60.0)
-    app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .request(req)
-        .get_updates_request(req)
-        .post_init(post_init)
-        .build()
+async def cmd_profile(update, context):
+    register_user(update.effective_user)
+    await update.message.reply_text(
+        await show_profile(update, update.effective_user.id),
+        parse_mode=ParseMode.HTML
     )
 
-    async def safe_text(update, context):
-        try:
-            await on_text(update, context)
-        except Exception as e:
-            log.exception("text")
-            try:
-                await update.effective_message.reply_text("⚠️ " + str(e)[:120])
-            except Exception:
-                pass
 
-    async def safe_cb(update, context):
-        try:
-            await on_cb(update, context)
-        except Exception as e:
-            log.exception("cb")
-            try:
-                await update.callback_query.answer(str(e)[:100], show_alert=True)
-            except Exception:
-                pass
+async def cmd_balance(update, context):
+    register_user(update.effective_user)
+    await update.message.reply_text(
+        await bank_text(update.effective_user.id),
+        parse_mode=ParseMode.HTML
+    )
 
+
+async def cmd_transfer(update, context):
+    await transfer_reply(update, context)
+
+
+async def cmd_deposit(update, context):
+    await admin_deposit(update, context)
+
+
+async def cmd_withdraw(update, context):
+    await admin_withdraw(update, context)
+
+
+# ---------------------------- MAIN --------------------------
+
+def main():
+    if BOT_TOKEN == "PASTE_YOUR_BOT_TOKEN_HERE":
+        print("\n[ERROR] BOT_TOKEN را داخل bot.py وارد کن.\n")
+        return
+
+    init_db()
+
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    # Slash commands
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("admin", open_admin))
-    app.add_handler(CommandHandler("addgroup", cmd_addgroup))
-    app.add_handler(CallbackQueryHandler(safe_cb))
-    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_member))
-    app.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, on_left_member))
-    app.add_handler(MessageHandler(filters.PHOTO | filters.ANIMATION | filters.Sticker.ALL, on_media))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, safe_text))
-    log.info("up")
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True, bootstrap_retries=10)
+    app.add_handler(CommandHandler("panel", cmd_panel))
+    app.add_handler(CommandHandler("games", cmd_games))
+    app.add_handler(CommandHandler("profile", cmd_profile))
+    app.add_handler(CommandHandler("balance", cmd_balance))
+    app.add_handler(CommandHandler("transfer", cmd_transfer))
+    app.add_handler(CommandHandler("deposit", cmd_deposit))
+    app.add_handler(CommandHandler("withdraw", cmd_withdraw))
+
+    # Inline buttons
+    app.add_handler(CallbackQueryHandler(callbacks))
+
+    # Persian text commands
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_commands))
+
+    print("====================================")
+    print("🎮 Game Bot is running...")
+    print("📁 Database:", DB_FILE)
+    print("====================================")
+
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
